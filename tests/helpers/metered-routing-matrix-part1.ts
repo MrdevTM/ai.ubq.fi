@@ -831,7 +831,7 @@ export const runMeteredPaidFallbackMatrixPart1 = async (t: Deno.TestContext): Pr
       }
     });
 
-    await t.step("Surplus network ambiguity falls through to OpenLux delivery", async () => {
+    await t.step("Surplus network ambiguity fails closed on Surplus and retains the spend cap", async () => {
       const previousMeteredApiKey = Deno.env.get("METERED_API_KEY");
       const previousSurplusApiKey = Deno.env.get("SURPLUS_API_KEY");
       try {
@@ -930,12 +930,13 @@ export const runMeteredPaidFallbackMatrixPart1 = async (t: Deno.TestContext): Pr
                       }),
                       { keyId, kernelRepo: null, kernelOrg: null, requestId, startedAtMs: Date.now() }
                     );
-              // A Surplus transport failure is transient: the request falls
-              // through to OpenLux instead of surfacing a Surplus-shaped 502.
-              assert.equal(response.status, 200, suffix);
-              assert.equal(response.headers.get("x-uos-upstream"), "metered", suffix);
+              // A Surplus transport failure is not an authoritative capacity
+              // signal: the request fails closed on Surplus instead of
+              // advancing to OpenLux, and the ambiguous exposure stays pending.
+              assert.equal(response.status, 502, suffix);
+              assert.equal(response.headers.get("x-uos-upstream"), "surplus", suffix);
               assert.equal(surplusAttempts, 1, suffix);
-              assert.equal(meteredAttempts, 1, suffix);
+              assert.equal(meteredAttempts, 0, suffix);
               assert.ok(codexRequestHeaders.length > 0, suffix);
               for (const headers of codexRequestHeaders) {
                 const sessionIdentity = headers.get("conversation_id");
@@ -952,10 +953,16 @@ export const runMeteredPaidFallbackMatrixPart1 = async (t: Deno.TestContext): Pr
               for (const header of codexSessionHeaders) {
                 assert.equal(paidRequest.headers.has(header), false, `${suffix}:${header}`);
               }
-              await response.text();
-              const stored = await waitForPaidFallbackTerminal(keyId, requestId, "completed");
-              assert.equal(stored.provider, "metered", suffix);
+              const payload = (await response.json()) as {
+                error?: { type?: unknown; code?: unknown };
+              };
+              assert.equal(payload.error?.type, "server_error", suffix);
+              assert.equal(payload.error.code, "surplus_upstream_unreachable", suffix);
+              const stored = await waitForPaidFallbackTerminal(keyId, requestId, "ambiguous");
+              assert.equal(stored.provider, "surplus", suffix);
               assert.equal(stored.dispatch_state, "dispatched", suffix);
+              assert.equal(stored.provider_request_id, null, suffix);
+              assert.equal(stored.billing_state, "pending", suffix);
             }
           );
         }

@@ -366,8 +366,13 @@ const resolvePaidProviderAttemptFailure = async (
   // retained as the responder instead of being marked terminal here; a failure
   // before transport keeps the previously retained responder.
   const attempted = dispatchState.transportStarted ? ({ provider, requestId: null } as const) : null;
+  // An attempt that reached transport is an ambiguous, potentially billable
+  // exposure. Retrying after it would let a later tier's success settle the
+  // shared reservation and release this exposure's spend cap, so only a
+  // provably undispatched attempt may fall through, and the classification
+  // admits only an authoritative upstream capacity signal.
   return {
-    retry: isIntermediatePaidProviderAttempt(providerIndex, paidProviders.length, status),
+    retry: attempted === null && isIntermediatePaidProviderAttempt(providerIndex, paidProviders.length, status),
     providerError: error,
     responding: attempted ?? responding,
   };
@@ -427,8 +432,9 @@ type PaidProviderAttemptResult = Readonly<{
 
 /**
  * Runs one paid-tier transport under its own bounded first-headers deadline and
- * classifies the outcome. The deadline releases a stalled tier to the next one
- * instead of holding the shared 30-minute stream deadline, and its timer is
+ * classifies the outcome. The deadline fails a stalled tier closed at a bounded
+ * first-headers budget instead of holding the shared 30-minute stream deadline;
+ * it never turns a stall into a signal that advances the waterfall. Its timer is
  * cleared as soon as the attempt settles so a delivered response body is never
  * tied to it.
  */
@@ -515,9 +521,9 @@ const runPaidProviderAttempts = async (
         // delivered to the client is known. The paid-fallback ledger has one
         // terminal provider/request-id pair; recording this intermediate
         // attempt would pin reconciliation to the failed provider and leave a
-        // later successful provider unbillable. A transient failure after
-        // transport is still retained as the responder so a request that ends
-        // in failure settles as exactly one ambiguous terminal pair.
+        // later successful provider unbillable. An authoritative capacity
+        // refusal is still retained as the responder so a request that ends in
+        // failure settles as exactly one terminal provider pair.
         responding = { provider, requestId: normalizeProviderRequestId(attempt.candidate.request_id) };
         cancelResponseBody(attempt.candidate.response);
         continue;

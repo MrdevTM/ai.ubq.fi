@@ -33,6 +33,7 @@ import {
   AES_GCM_IV_BYTES,
   ENVELOPE_VERSION,
   MAX_REPLAY_CIPHERTEXT_BYTES,
+  MAX_REPLAY_METADATA_BYTES,
   REPLAY_KEY_BYTES,
   REPLAY_PLAINTEXT_VERSION,
   SENTINEL_REPLAY_CHUNK_PREFIX,
@@ -40,6 +41,7 @@ import {
   SENTINEL_REPLAY_MANIFEST_PREFIX,
   SENTINEL_REPLAY_STATUS_TTL_MS,
   SENTINEL_REPLAY_TTL_MS,
+  TEXT_ENCODER,
   cloneBytes,
   concatBytes,
   randomBytes,
@@ -60,6 +62,8 @@ import {
   ciphertextDigest,
   decodeSentinelReplayKey,
   dedupeManifestKey,
+  dedupeRecordFor,
+  dedupeWinnerIdentity,
   downstreamObservation,
   encodePlaintext,
   encryptionAdditionalData,
@@ -74,6 +78,21 @@ import {
   splitChunks,
 } from "./replay-envelope.ts";
 import { decryptExportedSentinelReplay, getChunks, isSentinelReplayManifest, manifestMatchesKey } from "./replay-read.ts";
+import { sentinelReplayStoredCharge } from "./replay-limits.ts";
+import {
+  abandonSentinelReplayAccounting,
+  admitSentinelReplayStatusMetadata,
+  advanceSentinelReplayStagingFence,
+  prepareSentinelReplayPublication,
+  reserveSentinelReplayCapacity,
+} from "./replay-retention.ts";
+import {
+  SENTINEL_REPLAY_STAGING_BATCH_CHUNKS,
+  SENTINEL_REPLAY_STORAGE_FULL_REASON,
+  sentinelReplayStatusMetadataBytes,
+  type SentinelReplayAccountingRow,
+  type SentinelReplayPublication,
+} from "./replay-retention-schema.ts";
 
 const bindWinnerIndexEvidence = async (
   kv: Deno.Kv,
@@ -242,12 +261,23 @@ const captureStatusRow = (
   return row;
 };
 
-/** Best-effort per-request status write; never replaces the caller's outcome. */
+/**
+ * Bounded per-request status write; never replaces the caller's outcome. The row
+ * is admitted through the capture-owned metadata bound (a CAS on the ledger's
+ * status_records/metadata_bytes counters, pruning the oldest rows first), so
+ * status/tombstone metadata can never grow without bound. A refusal to admit
+ * drops this best-effort row instead of exceeding the bound.
+ */
 export const writeSentinelReplayCaptureStatus = async (kv: Deno.Kv, row: SentinelReplayCaptureStatusRow): Promise<void> => {
   if (!isSentinelReplayCaptureStatusRow(row)) throw new Error("Sentinel replay capture status is invalid");
   // The row outlives its payload so `expired` stays reportable; this is bounded
   // non-sensitive status metadata, never captured request or response content.
-  await kv.set(requestStatusKey(row.request_id), row, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS });
+  await admitSentinelReplayStatusMetadata(kv, {
+    key: requestStatusKey(row.request_id),
+    row,
+    now_ms: Date.now(),
+    ttl_ms: SENTINEL_REPLAY_STATUS_TTL_MS,
+  });
 };
 
 /**
@@ -290,15 +320,18 @@ const replayStoreOperation = (
   manifest: SentinelReplayManifest,
   fingerprint: string,
   now: number,
-  status: Readonly<{ requestId: string; captureStatus: "ready" | "incomplete" }>
+  status: Readonly<{ requestId: string; captureStatus: "ready" | "incomplete" }>,
+  publication: SentinelReplayPublication
 ): Deno.AtomicOperation => {
   let operation = dependencies.kv
     .atomic()
     .check({ key: dedupeKey, versionstamp: null })
-    .set(dedupeKey, { manifest_key: manifestKey }, { expireIn: SENTINEL_REPLAY_TTL_MS })
+    .set(dedupeKey, dedupeRecordFor(manifestKey, manifest), { expireIn: SENTINEL_REPLAY_TTL_MS })
     .set(manifestKey, manifest, { expireIn: SENTINEL_REPLAY_TTL_MS })
+    // The accounted key IS the written key: the publication status_key names the
+    // exact row whose replaced bytes the ledger delta already subtracted.
     .set(
-      requestStatusKey(status.requestId),
+      publication.status_key,
       captureStatusRow({
         requestId: status.requestId,
         status: status.captureStatus,
@@ -309,7 +342,16 @@ const replayStoreOperation = (
         expiresAtMs: manifest.expires_at_ms,
       }),
       { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS }
-    );
+    )
+    // The budget transition and the accounting-row publish commit with the
+    // manifest, so no manifest can ever be visible before it is accounted. The
+    // accounting row's exact versionstamp pins state==="reserved", this writer's
+    // fence and a still-unexpired row; the ledger versionstamp pins the counters.
+    .check({ key: publication.ledger_key, versionstamp: publication.ledger_versionstamp })
+    .check({ key: publication.accounting_key, versionstamp: publication.accounting_versionstamp })
+    .check({ key: publication.status_key, versionstamp: publication.status_versionstamp })
+    .set(publication.ledger_key, publication.ledger)
+    .set(publication.accounting_key, publication.accounting);
   if (dependencies.incidentEvent) {
     const readyEvent = readySentinelIncidentFailureEvent(dependencies.incidentEvent, now, {
       status: "stored",
@@ -366,7 +408,18 @@ const readIncidentIndexEntry = async (
   return entry.value === null ? null : { key: indexKey, entry };
 };
 
-/** Writes the chunks, then commits the envelope with a bounded CAS retry loop. */
+/**
+ * Write the chunks in bounded, fence-guarded batches, then commit the envelope
+ * with a bounded CAS retry loop.
+ *
+ * FENCED STAGING: before each batch of at most
+ * SENTINEL_REPLAY_STAGING_BATCH_CHUNKS chunks, one atomic commit checks the
+ * accounting row's exact versionstamp and requires state==="reserved",
+ * fence===this writer's fence and an unexpired row, incrementing `stage`. Only
+ * after that commit succeeds may one chunk transaction check its committed
+ * versionstamp and write the batch. Revoke or release changes that row, so a
+ * paused writer cannot append chunks after cleanup has released its charge.
+ */
 const storeReplayEnvelope = async (
   context: Readonly<{
     dependencies: PersistDependencies;
@@ -383,6 +436,9 @@ const storeReplayEnvelope = async (
     expiresAtMs: number;
     requestId: string;
     captureStatus: "ready" | "incomplete";
+    accounting: SentinelReplayAccountingRow;
+    accountingKey: Deno.KvKey;
+    actualCharge: number;
   }>
 ): Promise<SentinelReplayPersistResult> => {
   const { dependencies, chunks, dedupeKey, manifestKey, manifest, indexKey, indexFingerprint, captureId, evidenceDigest, now, expiresAtMs } = context;
@@ -390,21 +446,71 @@ const storeReplayEnvelope = async (
   const cleanupChunks = async (): Promise<void> => {
     await Promise.all(chunks.map((_chunk, index) => dependencies.kv.delete([...SENTINEL_REPLAY_CHUNK_PREFIX, captureId, index])));
   };
+  const abandon = async (): Promise<void> => {
+    await cleanupChunks().catch(() => {});
+    await abandonSentinelReplayAccounting(dependencies.kv, context.accounting, context.accountingKey, { now_ms: context.now }).catch(() => {});
+  };
   try {
-    await Promise.all(
-      chunks.map((chunk, index) =>
-        dependencies.kv.set([...SENTINEL_REPLAY_CHUNK_PREFIX, captureId, index], chunk, {
-          expireIn: SENTINEL_REPLAY_TTL_MS,
-        })
-      )
-    );
+    for (let offset = 0; offset < chunks.length; offset += SENTINEL_REPLAY_STAGING_BATCH_CHUNKS) {
+      const fence = await advanceSentinelReplayStagingFence(dependencies.kv, {
+        accounting_key: context.accountingKey,
+        fence: context.accounting.fence,
+        now_ms: context.now,
+        budget_bytes: dependencies.budgetBytes,
+      });
+      if (!fence.ok) {
+        // The fence commit failed: write nothing further and abandon instead of
+        // staging bytes a reaper has already fenced off.
+        await abandon();
+        return { status: "incomplete", reason: SENTINEL_REPLAY_STORAGE_FULL_REASON };
+      }
+      const batch = chunks.slice(offset, offset + SENTINEL_REPLAY_STAGING_BATCH_CHUNKS);
+      const operation = batch.reduce(
+        (atomic, chunk, index) => atomic.set([...SENTINEL_REPLAY_CHUNK_PREFIX, captureId, offset + index], chunk, { expireIn: SENTINEL_REPLAY_TTL_MS }),
+        dependencies.kv.atomic().check({ key: context.accountingKey, versionstamp: fence.versionstamp })
+      );
+      if (!(await operation.commit()).ok) {
+        await abandon();
+        return { status: "incomplete", reason: SENTINEL_REPLAY_STORAGE_FULL_REASON };
+      }
+    }
     let committed: Deno.KvCommitResult | Deno.KvCommitError | null = null;
     for (let attempt = 0; attempt < SENTINEL_INCIDENT_INDEX_MAX_CAS_ATTEMPTS; attempt += 1) {
-      const indexRow = await readIncidentIndexEntry(dependencies.kv, indexKey);
-      let operation = replayStoreOperation(dependencies, dedupeKey, manifestKey, manifest, fingerprint, now, {
+      // Fresh ledger and accounting row on every attempt: a revoked, expired or
+      // already-published row can never publish unaccounted bytes.
+      const statusRow = captureStatusRow({
         requestId: context.requestId,
-        captureStatus: context.captureStatus,
+        status: context.captureStatus,
+        reason: null,
+        capturedAtMs: manifest.captured_at_ms,
+        manifestKey,
+        fingerprint,
+        expiresAtMs: manifest.expires_at_ms,
       });
+      const publication = await prepareSentinelReplayPublication(dependencies.kv, context.accounting, context.accountingKey, context.actualCharge, {
+        now_ms: context.now,
+        status_key: requestStatusKey(context.requestId),
+        status_bytes: sentinelReplayStatusMetadataBytes(statusRow),
+        budget_bytes: dependencies.budgetBytes,
+      });
+      if (!publication) {
+        await abandon();
+        return { status: "incomplete", reason: SENTINEL_REPLAY_STORAGE_FULL_REASON };
+      }
+      const indexRow = await readIncidentIndexEntry(dependencies.kv, indexKey);
+      let operation = replayStoreOperation(
+        dependencies,
+        dedupeKey,
+        manifestKey,
+        manifest,
+        fingerprint,
+        now,
+        {
+          requestId: context.requestId,
+          captureStatus: context.captureStatus,
+        },
+        publication
+      );
       if (indexRow !== null) {
         operation = withIncidentIndexEvidence(operation, indexRow, {
           gitSha: context.gitSha,
@@ -420,10 +526,17 @@ const storeReplayEnvelope = async (
       committed = await operation.commit();
       if (committed.ok) return { status: "stored", manifest, manifest_key: manifestKey };
     }
-    await cleanupChunks().catch(() => {});
+    await abandon();
     const winningDedupe = await dependencies.kv.get(dedupeKey);
     const winningManifestKey = dedupeManifestKey(winningDedupe.value);
     if (!winningManifestKey) throw new Error("Sentinel replay dedupe winner is unavailable");
+    const winner = await dependencies.kv.get<SentinelReplayManifest>(winningManifestKey);
+    if (!isSentinelReplayManifest(winner.value)) {
+      // The winner vanished (evicted or expired) between the CAS races; the
+      // caller's fresh capture is the only evidence and cannot be reported as
+      // a duplicate of nothing.
+      return { status: "incomplete", reason: SENTINEL_REPLAY_STORAGE_FULL_REASON };
+    }
     return await completeDuplicateCapture(
       dependencies,
       {
@@ -433,15 +546,75 @@ const storeReplayEnvelope = async (
         indexFingerprint,
         requestId: context.requestId,
         captureStatus: context.captureStatus,
-        capturedAtMs: manifest.captured_at_ms,
-        expiresAtMs,
+        capturedAtMs: winner.value.captured_at_ms,
+        expiresAtMs: winner.value.expires_at_ms,
       },
       now
     );
   } catch (error) {
-    await cleanupChunks().catch(() => {});
+    await abandon();
     throw error;
   }
+};
+
+/** Everything the duplicate/stale branch needs that is not already in the dedupe record. */
+type ExistingDedupeContext = Readonly<{
+  dedupeKey: Deno.KvKey;
+  fingerprint: string;
+  indexKey: Deno.KvKey | null;
+  indexFingerprint: string | null;
+  requestId: string;
+  captureStatus: "ready" | "incomplete";
+  now: number;
+}>;
+
+/**
+ * Resolve an already-present dedupe row before storing a new capture.
+ *
+ * A dedupe row ALWAYS means this request is a duplicate: the row names the
+ * winning manifest, and the duplicate must inherit that winner's exact identity
+ * and expiry rather than inventing a newer now + TTL window. It is never cleared
+ * here. A winner whose evidence is already gone either fails closed inside
+ * `completeDuplicateCapture` (when a recorded observation still references it,
+ * so a fresh capture would silently replace evidence) or reports `duplicate`
+ * with nothing bound (when nothing was ever observed to attach to). Eviction and
+ * expiry remove their own dedupe row by CAS, so a re-capture after real
+ * retention still stores. Returns null only when there is no row to resolve.
+ */
+const resolveExistingDedupe = async (
+  dependencies: PersistDependencies,
+  existingDedupe: Deno.KvEntryMaybe<unknown>,
+  context: ExistingDedupeContext
+): Promise<SentinelReplayPersistResult | null> => {
+  if (existingDedupe.value === null) return null;
+  const manifestKey = dedupeManifestKey(existingDedupe.value);
+  if (!manifestKey) throw new Error("Sentinel replay dedupe record is invalid");
+  const identity = dedupeWinnerIdentity(existingDedupe.value);
+  let capturedAtMs = identity?.capturedAtMs ?? context.now;
+  let expiresAtMs = identity?.expiresAtMs ?? context.now + SENTINEL_REPLAY_TTL_MS;
+  if (identity === null) {
+    // Legacy dedupe rows predate the recorded identity, so the winner manifest is
+    // the only remaining source for its real timestamp and expiry.
+    const winnerEntry = await dependencies.kv.get<SentinelReplayManifest>(manifestKey);
+    if (isSentinelReplayManifest(winnerEntry.value)) {
+      capturedAtMs = winnerEntry.value.captured_at_ms;
+      expiresAtMs = winnerEntry.value.expires_at_ms;
+    }
+  }
+  return await completeDuplicateCapture(
+    dependencies,
+    {
+      fingerprint: context.fingerprint,
+      manifestKey,
+      indexKey: context.indexKey,
+      indexFingerprint: context.indexFingerprint,
+      requestId: context.requestId,
+      captureStatus: context.captureStatus,
+      capturedAtMs,
+      expiresAtMs,
+    },
+    context.now
+  );
 };
 
 export const persistEncryptedSentinelReplay = async (
@@ -475,25 +648,16 @@ export const persistEncryptedSentinelReplay = async (
     const dedupeKey = [...SENTINEL_REPLAY_DEDUPE_PREFIX, fingerprint] as const;
     const indexFingerprint = await resolveIndexFingerprint(input, clientObservation);
     const indexKey: Deno.KvKey | null = indexFingerprint === null ? null : [...SENTINEL_INCIDENT_INDEX_PREFIX, indexFingerprint];
-    const existingDedupe = await dependencies.kv.get(dedupeKey);
-    if (existingDedupe.value !== null) {
-      const manifestKey = dedupeManifestKey(existingDedupe.value);
-      if (!manifestKey) throw new Error("Sentinel replay dedupe record is invalid");
-      return await completeDuplicateCapture(
-        dependencies,
-        {
-          fingerprint,
-          manifestKey,
-          indexKey,
-          indexFingerprint,
-          requestId: input.request_id,
-          captureStatus: unavailable.length === 0 ? "ready" : "incomplete",
-          capturedAtMs: now,
-          expiresAtMs: now + SENTINEL_REPLAY_TTL_MS,
-        },
-        now
-      );
-    }
+    const duplicate = await resolveExistingDedupe(dependencies, await dependencies.kv.get(dedupeKey), {
+      dedupeKey,
+      fingerprint,
+      indexKey,
+      indexFingerprint,
+      requestId: input.request_id,
+      captureStatus: unavailable.length === 0 ? "ready" : "incomplete",
+      now,
+    });
+    if (duplicate !== null) return duplicate;
 
     const captureId = dependencies.randomUuid?.() ?? crypto.randomUUID();
     const iv = dependencies.randomBytes?.(AES_GCM_IV_BYTES) ?? randomBytes(AES_GCM_IV_BYTES);
@@ -520,48 +684,75 @@ export const persistEncryptedSentinelReplay = async (
       body_bytes: bodySnapshot.byteLength,
       downstream: downstreamObservation(clientObservation),
     };
-    const encrypted = await encryptReplayPlaintext(metadata, bodySnapshot, iv, dependencies.keyBytes, fingerprint);
+    const metadataJsonBytes = TEXT_ENCODER.encode(JSON.stringify(metadata)).byteLength;
+    if (metadataJsonBytes > MAX_REPLAY_METADATA_BYTES) throw new Error("Sentinel replay metadata is too large");
+    // Reserve the encoded envelope capacity BEFORE any chunk is written. A
+    // refusal is a normal bounded outcome, never an unaccounted store.
+    const admission = await reserveSentinelReplayCapacity(dependencies.kv, {
+      capture_id: captureId,
+      request_id: input.request_id,
+      fingerprint,
+      plaintext_bytes: 4 + metadataJsonBytes + bodySnapshot.byteLength,
+      metadata_bytes: metadataJsonBytes,
+      now_ms: now,
+      budget_bytes: dependencies.budgetBytes,
+    });
+    if (!admission.ok) return { status: "incomplete", reason: admission.reason };
+    const accounting = admission.accounting;
+    const accountingKey = admission.accounting_key;
     try {
-      const chunks = splitChunks(encrypted);
-      const expiresAtMs = now + SENTINEL_REPLAY_TTL_MS;
-      const manifest: SentinelReplayManifest = {
-        version: ENVELOPE_VERSION,
-        capture_id: captureId,
-        fingerprint,
-        case_group_digest: caseGroupDigest,
-        captured_at_ms: now,
-        expires_at_ms: expiresAtMs,
-        algorithm: "AES-256-GCM",
-        compression: "gzip",
-        iv: base64UrlEncode(iv),
-        chunk_count: chunks.length,
-        ciphertext_bytes: encrypted.byteLength,
-      };
-
-      const manifestKey = [...SENTINEL_REPLAY_MANIFEST_PREFIX, now, fingerprint, captureId] as const;
-      const evidenceDigest = await ciphertextDigest(encrypted);
+      const encrypted = await encryptReplayPlaintext(metadata, bodySnapshot, iv, dependencies.keyBytes, fingerprint);
       try {
-        return await storeReplayEnvelope({
-          dependencies,
-          gitSha: input.git_sha,
-          chunks,
-          dedupeKey,
-          manifestKey,
-          manifest,
-          indexKey,
-          indexFingerprint,
-          captureId,
-          evidenceDigest,
-          now,
-          expiresAtMs,
-          requestId: input.request_id,
-          captureStatus: unavailable.length === 0 ? "ready" : "incomplete",
-        });
+        const chunks = splitChunks(encrypted);
+        const expiresAtMs = now + SENTINEL_REPLAY_TTL_MS;
+        const actualCharge = sentinelReplayStoredCharge(encrypted.byteLength, metadataJsonBytes);
+        const manifest: SentinelReplayManifest = {
+          version: ENVELOPE_VERSION,
+          capture_id: captureId,
+          fingerprint,
+          case_group_digest: caseGroupDigest,
+          captured_at_ms: now,
+          expires_at_ms: expiresAtMs,
+          algorithm: "AES-256-GCM",
+          compression: "gzip",
+          iv: base64UrlEncode(iv),
+          chunk_count: chunks.length,
+          ciphertext_bytes: encrypted.byteLength,
+          stored_bytes: actualCharge,
+          request_id: input.request_id,
+        };
+
+        const manifestKey = [...SENTINEL_REPLAY_MANIFEST_PREFIX, now, fingerprint, captureId] as const;
+        const evidenceDigest = await ciphertextDigest(encrypted);
+        try {
+          return await storeReplayEnvelope({
+            dependencies,
+            gitSha: input.git_sha,
+            chunks,
+            dedupeKey,
+            manifestKey,
+            manifest,
+            indexKey,
+            indexFingerprint,
+            captureId,
+            evidenceDigest,
+            now,
+            expiresAtMs,
+            requestId: input.request_id,
+            captureStatus: unavailable.length === 0 ? "ready" : "incomplete",
+            accounting,
+            accountingKey,
+            actualCharge,
+          });
+        } finally {
+          for (const chunk of chunks) chunk.fill(0);
+        }
       } finally {
-        for (const chunk of chunks) chunk.fill(0);
+        encrypted.fill(0);
       }
-    } finally {
-      encrypted.fill(0);
+    } catch (error) {
+      await abandonSentinelReplayAccounting(dependencies.kv, accounting, accountingKey, { now_ms: now }).catch(() => {});
+      throw error;
     }
   } finally {
     bodySnapshot.fill(0);
@@ -655,7 +846,13 @@ export const persistSentinelReplayFromEnvironment = async (
       return { status: "disabled", reason: "key_missing" };
     }
     try {
-      return await persistEncryptedSentinelReplay(input, observation, { kv, keyBytes, now: () => now, incidentEvent }, resolvedClientObservation);
+      const result = await persistEncryptedSentinelReplay(input, observation, { kv, keyBytes, now: () => now, incidentEvent }, resolvedClientObservation);
+      if (result.status === "incomplete") {
+        // Retention refused the capture without growing above budget: make the
+        // skip visible on its request instead of looking like an empty history.
+        await recordStatus("disabled", result.reason, now);
+      }
+      return result;
     } catch (error) {
       try {
         await completeReplayIncidentEvent(kv, incidentEvent, Date.now(), { status: "unavailable" });

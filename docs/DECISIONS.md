@@ -6,6 +6,104 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## Analytics drops the Quota forecast card and the Metered capacity panels - 2026-10-03
+
+The admin Analytics view no longer renders the "Quota forecast" (quota runway) card, and the Provider analytics card
+renders only the two Codex pool accounts: the "Metered 2 refill" chart series and legend entry, the "Metered 2" and
+"Metered 1" (surplus) capacity rows, the metered staleness caption note, and the client-side quota-projection fetch,
+snapshot-cache restore, visible-poll refresh, and app-resume refresh are removed. The quota-projection HTTP endpoints
+and `src/quota-projection.ts` remain for operator and backfill use, and the Metered wallet/paid-fallback surfaces in the
+Defaults and Providers views are unchanged. This supersedes the 2026-10-02 "Admin Analytics quota panels refresh on a
+visible poll and on app resume" decision only where it named the quota runway panel; provider health and provider
+capacity keep the 30-second visible poll and the resume refresh.
+
+Reason: the owner reported that the quota forecast and Metered 1/2 "never showed any useful info" and asked for their
+removal from Analytics (2026-10-03).
+
+Reversal risk: restoring the card re-adds the fetch, cache restore, and resume hook; the removed refill series was
+Analytics' only rendering of the Metered wallet refill cycle, so metered wallet state is now observable only in the
+Defaults metered-quota panel.
+
+## Normal capacity reads revalidate Codex quota on a 30-second freshness window - 2026-10-02
+
+`GET /admin/providers/capacity` serves the persisted snapshot only while it is younger than
+`PROVIDER_CAPACITY_READ_FRESH_MS` (30 s, matching the Analytics visible poll) and otherwise awaits the existing
+lease-guarded `refreshProviderCapacity()` probe before responding. Concurrent stale reads coalesce through the same
+lease and its bounded cold wait, so one refresh serves them all and no request stacks a duplicate upstream call.
+`?refresh=live` keeps its documented force-probe semantics. Durable history keeps its fifteen-minute bucket:
+`PROVIDER_CAPACITY_HISTORY_BUCKET_MS` is unchanged and a same-bucket refresh overwrites that bucket's point rather than
+adding one. A refresh that throws keeps the last known persisted snapshot; a refresh that reaches upstream but fails
+leaves the affected source unavailable instead of reporting a fabricated percentage.
+
+Reason: the default read was persisted-only, so the Analytics quota cards could show a fifteen-minute-bucket-old Codex
+percentage, or an unbounded older one on a quiet gateway, while the client already polled every 30 seconds. The
+displayed value therefore did not change even though the poll and render path were correct.
+
+Reversal risk: restoring the persisted-only default read brings back the stale display; shortening the window below the
+poll cadence only repeats upstream probes, and making the read await an unbounded probe would reintroduce the latency
+the persisted-only boundary avoided. The probe itself stays read-only: usage reads with existing credentials, no OAuth
+refresh, inference, account, provider-selection, or quota-accounting change.
+
+## The Mac gateway delegates a shared CLI credential lineage to native Codex - 2026-10-02
+
+Only exact account and credential equality binds the local CLI file account to a durable `native_owner` in its KV pool
+entry. The gateway then requests refresh from the existing native daemon, verifies its `initialize.codexHome` and
+ChatGPT identity, and adopts the same-account persisted generation with pool CAS; it never writes `auth.json` or
+performs its own OAuth for that owner. Uploaded sibling accounts retain their existing refresh path. Upload and repair
+cannot erase the binding or replace it with stale credentials.
+
+A changed generation requires a usable access token and nonregressing access expiry. When two native rotations share a
+JWT expiry, the native owner's persisted `last_refresh` orders them, including its submillisecond precision. This
+metadata never bootstraps ownership, and filesystem mtime never selects a credential source. Missing or mismatched
+files, daemon failures and inconclusive replies refuse gateway refresh with local owner errors; they do not establish
+current-credential invalidity or quota exhaustion.
+
+The observed CLI sessions share one native daemon, whose in-process semaphore serializes refreshes. Independent native
+processes have no cross-process mutex; guarded reload and reuse recovery remain necessary. This change preserves CLI
+sign-in and sync and does not repair an external stale sync writer or change VPS credentials, service permissions or
+configuration.
+
+Status: focused synthetic ownership, existing auth regressions and concurrent native CLI/gateway loopback acceptance
+passed. The native proof used strict HTTPS and a task-owned test CA; no real credentials were refreshed by this work.
+
+## `/v1/live` calls are bound to the authenticated gateway principal that created them - 2026-10-02
+
+Call creation resolves the authenticated principal (`resolveIdempotencyPrincipal`, e.g. `api-key:<key_id>`) and persists
+it alongside the account in the `codex_live_calls` v1 mapping; the sideband join must present the same principal. A join
+by a different valid principal, and a legacy mapping that records no principal at all, are both refused with 403 before
+the WebSocket upgrade, with no permissive compatibility fallback; a reconnect by the creating principal still upgrades
+and rejoins on the mapped upstream account. The mapping TTL is unchanged at one hour.
+
+Reason: `/v1/live` authenticated the request but bound the call only to the upstream account, so any valid gateway
+principal that learned a call id could attach to another principal's call and use the creator's upstream credentials.
+
+Status: implemented and locally tested (focused loopback HTTP/WebSocket regression and changed-file lint, receipts
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/58ac6b41-8949-40a6-9eff-46f2de4d9bcf` and
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/e08bfb68-25ca-48fd-ab60-3be8a56082aa`); not deployed.
+
+Reversal risk: dropping the principal comparison restores cross-principal sideband attachment and creator-credential
+use; treating an absent `principal_id` as authorized would reopen it for every mapping written before this change, and
+extending the TTL would lengthen that window.
+
+## Admin Analytics quota panels refresh on a visible poll and on app resume - 2026-10-02
+
+The admin console's Analytics quota panels (provider health, provider capacity, and the quota runway) keep the existing
+30-second visible poll, and `bindForegroundRefresh` now also refreshes them immediately when a resume is observed:
+window `focus`, `visibilitychange` to visible, or a bfcache `pageshow` (`event.persisted === true`; the first load's
+`pageshow` is ignored). The helper coalesces those events into one scheduled refresh and each loader returns early while
+its own request is in flight, so focusing a window, returning to the tab, and restoring from bfcache cannot stack
+duplicate requests or timers. The quota-projection request keeps its 30-day window and the capacity endpoint keeps
+serving the persisted snapshot, so this client lifecycle change adds no upstream polling: the metered quota snapshot
+still refreshes upstream only at its own `METERED_QUOTA_FRESH_MS` (5 minute) boundary.
+
+Reason: Analytics is the authenticated default view, but the foreground-refresh binding only refreshed the Defaults
+view, so an app resumed from background or bfcache kept showing a stale quota until the next visible poll tick, which
+mobile background timer suspension can delay indefinitely, or until a full reload.
+
+Reversal risk: removing the resume hook restores the stale-after-resume display; removing the `pageshow` initial-load
+guard refreshes on every ordinary page load; adding a second interval instead of reusing the existing poll duplicates
+requests.
+
 ## Codex model availability follows the per-account pool - 2026-10-02
 
 The Codex-native catalog `GET /v1/models?client_version=X.Y.Z` and the normalized `["ubq_ai","codex_models"]` snapshot
@@ -60,6 +158,18 @@ the Codex request.
 Reversal risk: widening the drop to every reasoning item without `encrypted_content` would discard items a `store: true`
 client can legitimately replay; matching ids by a loose `resp_` substring would rewrite genuine ids, so only the
 producer's exact `<kind>_...` shapes are recognized.
+
+## Public models use the enabled set for every provider - 2026-10-02
+
+Apply the operator whitelist to every `/uos/models/catalog` row, including OpenRouter.
+
+`/models` renders this feed. An empty or absent whitelist keeps the existing no-filter behavior.
+
+Admin discovery, `/v1/models`, and `/uos/models/capabilities` retain their existing contracts.
+
+Reason: disabled OpenRouter rows were appended after filtering and appeared on the public page.
+
+Reversal risk: bypassing the filter again makes disabled models visible.
 
 ## The Codex-native catalog honors the operator whitelist for every assembled provider - 2026-10-02
 
@@ -262,6 +372,52 @@ releases/391 MB to 5 releases/47 MB) with `.data/current` and the live `git sha`
 prunes on its next `deno task deploy:vps`. The separate duplication in `.codex-worktrees` (about 90,000 TypeScript
 files, mostly `tools/node_modules` materialized per worktree by `scripts/_bootstrap.sh`) is acknowledged and remains
 unaddressed by this decision.
+
+## Capture storage is bounded per host with oldest-first eviction - 2026-09-22
+
+The owner authorized capturing private request contents and deleting the oldest capture-owned records when storage
+grows, around a 1 GiB per-host budget. Each host therefore keeps one fixed 1 GiB budget for capture-owned encoded KV
+payload (base64-expanded ciphertext chunks plus metadata/status/dedupe/index row overhead) plus in-flight charges, with
+a hard record-count bound. **Durable per-capture accounting rows are the source of truth** and the ledger is derived
+cached state: admission, publication, release, eviction, payload expiry and status admit/prune change a charge in the
+same `kv.atomic()` commit as its row, checking both exact versionstamps. Accounting rows are timestamp-first keyed (the
+oldest-first index), carry no KV TTL, and stop existing only through the atomic commit that deletes them and decrements
+the ledger. Bootstrap materializes each missing legacy accounting row together with its ledger charge; cleanup of a
+manifest that predates request ownership retains only its fingerprint tombstone rather than inventing an owner status.
+
+Admission reserves in durable KV before any chunk is written. A fence-advance commit precedes each batch, and one atomic
+chunk transaction checks its committed accounting-row versionstamp before writing at most twelve 48 KiB chunks (576 KiB
+payload plus bounded keys/check overhead, below the 800 KiB atomic limit). Revoke or release changes that row, so a
+paused transaction cannot append after capacity was reclaimed. Publish transitions `reserved -> stored` together with
+the manifest, dedupe, request status, incident evidence and ledger; a refused admission is skipped with a visible
+`storage_full` status instead of storing unaccounted data. Eviction claims a victim by CAS before deleting anything,
+releases the charge only once its chunk prefix is provably empty, and CAS-deletes the dedupe row only when it still
+references that victim's manifest key. TTL expiry is a separate reclamation path reporting `expired`/`payload_expired`
+with no `evicted_*` increment. Capture-owned status and tombstone rows are bounded by a fixed 64 MiB reserve inside the
+1 GiB (payload admissions may use at most `budget - 64 MiB`) and a 50,000-row bound, pruned oldest-first; a pruned
+lookup reports `status_not_retained`. Native metadata TTL deletion is not an atomic ledger update: maintenance and
+metadata pressure reconstruct those derived counters only after a complete bounded strong scan of both prefixes and a
+CAS on the ledger version captured before scanning. Concurrent accounted mutations invalidate the scan; TTL deletion
+during scanning can leave a conservative overcount until a later pass, without incrementing pruning history.
+Pre-existing captures are counted by a resumable bootstrap that sweeps every capture-owned prefix, counts scanned
+entries and fails closed on a corrupt in-scope row or an unreadable ledger, never assuming zero.
+
+The budget deliberately does not bound the shared SQLite database, its WAL, reusable allocated pages, other namespaces,
+the incident index namespace in `src/sentinel/incident-outbox.ts` (separate incident bookkeeping whose capture reference
+rows are TTL-bound to evidence expiry), or auth/quota/usage state, and eviction never touches them. Host text logs are
+separate: the Mac gateway's launchd `mac.stdout.log`/`mac.stderr.log` sizes are reported stat-only as `null` when
+unmeasured, with an independent 1 GiB warning, and no rotation or truncation is performed by this feature. The 32 MiB
+request and 4 MiB/4,096-chunk/8-attempt trace ceilings are unchanged; one derived limit module now feeds serialization,
+encryption, export/decode and the offline reader so the previous mismatched 256 KiB metadata cap and reader bound cannot
+disagree. The admin error-history panel shows usage, cap, eviction and skip notices from the existing capture-retention
+status.
+
+Reversal risk: reverting to unbounded growth, counting raw ciphertext instead of the encoded payload, publishing a
+manifest before its budget transition, letting an expired lease free budget while an unfenced writer can still append
+chunks, making the ledger authoritative instead of the rows, applying a ledger delta in a commit separate from its row
+change, releasing a charge before the chunk prefix is provably empty, evicting without a claim CAS, or letting
+capture-owned status metadata grow without bound would each restore silent unbounded growth, double-charge capacity or
+lose accounting.
 
 ## Gateway reliability program: finite admission, terminal parity, deadlines, optional analytics - 2026-09-22
 

@@ -139,15 +139,29 @@ export const readOpenRouterApiKey = (): string | null => {
  * One System One decision call. The body is forwarded verbatim (`model`,
  * `state`, `questions`); the answer shape belongs to the caller, which also
  * owns bounds on the questions it sends.
+ *
+ * Dispatch hooks follow the shared OpenRouter dispatcher: the API-key
+ * reservation commits before transport and the hook call sits outside the
+ * transport catch, so a quota refusal stays itself instead of being reported
+ * as an unreachable upstream.
  */
 export const fetchOpenRouterSystemOne = async (input: {
   body: Readonly<Record<string, unknown>>;
   apiKey?: string | null;
   fetcher?: OpenRouterFetch;
   timeoutMs?: number;
+  hooks?: OpenRouterDispatchHooks;
 }): Promise<Record<string, unknown>> => {
   const apiKey = input.apiKey === undefined ? readOpenRouterApiKey() : input.apiKey;
   if (!apiKey) throw new OpenRouterError("openrouter_api_key_missing", 503);
+  const signal = AbortSignal.timeout(input.timeoutMs ?? OPENROUTER_FETCH_TIMEOUT_MS);
+  const dispatch = input.hooks?.beforeDispatch ? await input.hooks.beforeDispatch() : undefined;
+  if (signal.aborted) {
+    await dispatch?.cancelBeforeTransport();
+    throw new DOMException("Aborted", "AbortError");
+  }
+  dispatch?.markTransportStarted();
+  input.hooks?.onDispatch?.();
   const fetcher = input.fetcher ?? fetch;
   let response: Response;
   try {
@@ -159,11 +173,12 @@ export const fetchOpenRouterSystemOne = async (input: {
         "content-type": "application/json",
       },
       body: JSON.stringify(input.body),
-      signal: AbortSignal.timeout(input.timeoutMs ?? OPENROUTER_FETCH_TIMEOUT_MS),
+      signal,
     });
   } catch {
     throw new OpenRouterError("openrouter_upstream_unreachable", 502);
   }
+  input.hooks?.onHeaders?.();
   if (!response.ok) {
     const status = response.status === 429 || response.status === 400 ? response.status : 502;
     throw new OpenRouterError("openrouter_upstream_error", status, response.status);

@@ -377,19 +377,19 @@ export const resolvePaidRoutingState = (
 const isAuthoritativeCapacityStatus = (status: number | null): boolean => status === 402 || status === 429;
 
 /**
- * A paid-tier attempt may only fall through to the next enabled paid tier when
- * it produced no usable answer for the client:
- * - 402 and 429 are the authoritative capacity signals.
- * - A missing status is a transport failure or this attempt's own first-headers
- *   deadline, and any 5xx is an upstream fault; both are transient and must not
- *   consume the request while a cheaper tier is still available.
- * Every other status, including a definitive 400, is the provider's answer and
- * stays delivered as the final response.
+ * The provider fallback chain is ordered by cost and may advance only after an
+ * authoritative upstream quota or capacity signal, so 402 and 429 are the only
+ * statuses that hand the request to the next enabled paid tier. A missing
+ * status (transport failure or this attempt's own first-headers deadline), a
+ * network or read error, and any 5xx are transient faults, not quota
+ * exhaustion: they stay on the tier that failed instead of spending a later
+ * tier. A local API-key quota rejection never reaches this classification; it
+ * is an admission/dispatch guard, not an upstream capacity signal. Every other
+ * status, including a definitive 400, is the provider's answer and stays
+ * delivered as the final response.
  */
-const isTransientPaidProviderStatus = (status: number | null): boolean => isAuthoritativeCapacityStatus(status) || status === null || status >= 500;
-
 export const isIntermediatePaidProviderAttempt = (providerIndex: number, providerCount: number, status: number | null): boolean =>
-  providerIndex < providerCount - 1 && isTransientPaidProviderStatus(status);
+  providerIndex < providerCount - 1 && isAuthoritativeCapacityStatus(status);
 
 export const paidFallbackAbortReason = (fallbackSignal: AbortSignal | undefined): Error =>
   fallbackSignal?.reason instanceof Error ? fallbackSignal.reason : new DOMException("The request was aborted.", "AbortError");
@@ -504,6 +504,7 @@ export const loadPaidResponsesCatalogs = async (
   // discovery is only needed before dispatch when the model is not in the
   // Codex roster; known Codex models can use the historical Metered path and
   // refresh paid catalogs after a fallback-triggering primary response.
+  const codexEnabled = isProviderEnabled("codex", selection);
   let [meteredCatalog, surplusCatalog] = await Promise.all([fetchMeteredModels({ cachedOnly: true }), fetchSurplusModels({ cachedOnly: true })]);
   if (
     !codexModelKnown &&
@@ -511,7 +512,26 @@ export const loadPaidResponsesCatalogs = async (
   ) {
     [meteredCatalog, surplusCatalog] = await refreshPaidCatalogs(meteredCatalog, surplusCatalog, options.signal);
   }
-  const routing = resolvePaidRoutingState({ meteredCatalog, surplusCatalog, codexModelKnown, endpointType, requestUsesTools, model: options.model, selection });
+  const resolveRouting = () =>
+    resolvePaidRoutingState({ meteredCatalog, surplusCatalog, codexModelKnown, endpointType, requestUsesTools, model: options.model, selection });
+  let routing = resolveRouting();
+  // With the Codex tier switched off, the enabled paid catalogs are the only
+  // routing evidence left, so a cold enabled catalog must be discovered before
+  // this request can be rejected as provider_disabled: the cold snapshot cannot
+  // prove that the enabled provider is unable to serve a Codex-known model.
+  // Only enabled providers are discovered, a switched-off tier is never probed,
+  // and an already-routable paid provider keeps the cached-first path.
+  if (codexModelKnown && !codexEnabled && !routing.paidProviders.length) {
+    [meteredCatalog, surplusCatalog] = await Promise.all([
+      paidCatalogNeedsRefresh(meteredCatalog, METERED_MODELS_CACHE_TTL_MS) && isProviderEnabled("openlux", selection)
+        ? fetchMeteredModels({ signal: options.signal })
+        : Promise.resolve(meteredCatalog),
+      paidCatalogNeedsRefresh(surplusCatalog, SURPLUS_MODELS_CACHE_TTL_MS) && isProviderEnabled("surplus", selection)
+        ? fetchSurplusModels({ signal: options.signal })
+        : Promise.resolve(surplusCatalog),
+    ]);
+    routing = resolveRouting();
+  }
   if (routing.paidProviders.length) refreshStalePaidCatalogsInBackground(meteredCatalog, surplusCatalog);
   return { codexModelKnown, endpointType, requestUsesTools, meteredCatalog, surplusCatalog, selection, routing };
 };

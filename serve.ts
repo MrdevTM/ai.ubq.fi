@@ -2,6 +2,7 @@
 
 import { config } from "./src/config.ts";
 import { getKv } from "./src/kv.ts";
+import { migrateLegacyCodexResetOptOut } from "./src/codex/reset-settings.ts";
 import { configureAdminAuthForListener, configureAdminAuthPeerForRequest, parseServeRuntimeOptions } from "./src/auth/local-admin.ts";
 import { ensureLocalDevelopmentApiKey } from "./src/auth/local-development-key.ts";
 import { closeOptionalPromptCacheAnalytics, optionalPromptCacheAnalyticsSnapshot, prunePromptCacheAnalytics } from "./src/cache/prompt-analytics.ts";
@@ -156,6 +157,32 @@ if (runtimeOptions.disableAdminAuth) {
     console.warn("[ai.ubq.fi] Local development key provisioning failed:", error instanceof Error ? error.message : String(error));
   }
 }
+
+/**
+ * One bounded, idempotent pass materializes a persisted global banked-reset
+ * opt-out into per-subscription settings for the accounts in the current strong
+ * auth-pool snapshot. It is deliberately not awaited: the read path enforces the
+ * same opt-out and retries the same completion, whose single atomic commit is
+ * conditional on that snapshot, so a slow or unavailable KV cannot delay
+ * listener startup. An empty pool or a concurrent pool change leaves the marker
+ * unset and the next guarded read resumes; the legacy key is never deleted.
+ */
+const migrateCodexResetSettings = async (): Promise<void> => {
+  try {
+    const kv = await getKv();
+    if (!kv) return;
+    const status = await migrateLegacyCodexResetOptOut(kv);
+    if (status === "pending") {
+      console.warn(
+        "[ai.ubq.fi] Codex reset-settings migration waits for a configured account pool and an unchanged snapshot; the persisted global opt-out stays in force."
+      );
+    }
+  } catch (error) {
+    console.warn("[ai.ubq.fi] Codex reset-settings migration failed:", error instanceof Error ? error.message : String(error));
+  }
+};
+
+void migrateCodexResetSettings();
 
 const server: Deno.ServeDefaultExport = runtimeOptions.disableAdminAuth
   ? {

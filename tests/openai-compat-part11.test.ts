@@ -1045,9 +1045,52 @@ Deno.test("openai: an empty provider selection keeps Codex as the primary provid
   }
 });
 
-/** Seeds both paid catalogs for the model the fallthrough fixtures route. */
+Deno.test("openai: a switched-off DeepSeek provider is not dispatched on the Responses route", async () => {
+  const originalApiKey = Deno.env.get("DEEPSEEK_API_KEY");
+  const originalOpenRouterApiKey = Deno.env.get("OPENROUTER_API_KEY");
+  Deno.env.set("DEEPSEEK_API_KEY", "deepseek-test-key");
+  // The following sibling branch resolves OpenRouter's catalogue before it
+  // consults the selection; without a key it answers not-served without a fetch.
+  Deno.env.delete("OPENROUTER_API_KEY");
+  resetMeteredModelsCacheForTest();
+  resetSurplusModelsCacheForTest();
+  try {
+    await withDiscoveryKeys(null, async () => {
+      await withProviderSelection(["cerebras"], async () => {
+        // Both transports take the same gate before transport selection, so one
+        // loop covers the buffered and streamed branches without extra nesting.
+        for (const stream of [false, true]) {
+          const dispatched: string[] = [];
+          const response = await withFetchMock(
+            (url) => {
+              dispatched.push(url);
+              throw new Error(`a switched-off DeepSeek provider must not be dispatched to: ${url}`);
+            },
+            () => handleResponses(deepSeekResponsesRequest({ model: DEEPSEEK_FLASH_MODEL, input: "hi", stream }))
+          );
+          assert.deepEqual(dispatched, [], `stream=${stream}: the DeepSeek upstream must not be reached`);
+          assert.equal(response.headers.get("x-uos-upstream"), null, `stream=${stream}: the ordinary availability path answers, not the DeepSeek handler`);
+          assert.equal(response.status, 404);
+          const payload = (await response.json()) as { error?: { code?: unknown; param?: unknown } };
+          assert.ok(payload.error, `stream=${stream}: a terminal availability error must carry an error body`);
+          assert.equal(payload.error.code, "model_not_found");
+          assert.equal(payload.error.param, "model");
+        }
+      });
+    });
+  } finally {
+    resetMeteredModelsCacheForTest();
+    resetSurplusModelsCacheForTest();
+    if (originalApiKey === undefined) Deno.env.delete("DEEPSEEK_API_KEY");
+    else Deno.env.set("DEEPSEEK_API_KEY", originalApiKey);
+    if (originalOpenRouterApiKey === undefined) Deno.env.delete("OPENROUTER_API_KEY");
+    else Deno.env.set("OPENROUTER_API_KEY", originalOpenRouterApiKey);
+  }
+});
 
-Deno.test("openai: transient first-tier paid failures fall through to OpenLux", async (t) => {
+/** Seeds both paid catalogs for the model the paid-attempt fixtures route. */
+
+Deno.test("openai: non-capacity first-tier paid failures fail closed on Surplus", async (t) => {
   const originalMeteredApiKey = Deno.env.get("METERED_API_KEY");
   const originalSurplusApiKey = Deno.env.get("SURPLUS_API_KEY");
   const previousAtomicObserver = atomicCommitObservation.observer;
@@ -1116,19 +1159,27 @@ Deno.test("openai: transient first-tier paid failures fall through to OpenLux", 
       };
     };
 
-    await t.step("a Surplus transport failure hands the request to OpenLux", async () => {
+    await t.step("a Surplus transport failure fails closed without trying OpenLux", async () => {
       const result = await runPaidAttempt("transport-failure", () => {
         throw new TypeError("network connection reset before response headers");
       });
-      assert.equal(result.status, 200);
-      assert.equal(result.upstream, "metered");
+      assert.equal(result.status, 502);
+      assert.equal(result.upstream, "surplus");
       assert.equal(result.surplusCalls, 1);
-      assert.equal(result.meteredCalls, 1);
-      const stored = await waitForPaidFallbackTerminal(result.keyId, result.requestId, "completed");
-      assert.equal(stored.provider, "metered");
+      assert.equal(result.meteredCalls, 0);
+      // The original Surplus transport detail is preserved, and the attempt
+      // that reached transport stays a pending ambiguous exposure.
+      const payload = JSON.parse(result.body) as { error?: { type?: unknown; code?: unknown } };
+      assert.equal(payload.error?.type, "server_error");
+      assert.equal(payload.error.code, "surplus_upstream_unreachable");
+      const stored = await waitForPaidFallbackTerminal(result.keyId, result.requestId, "ambiguous");
+      assert.equal(stored.provider, "surplus");
+      assert.equal(stored.dispatch_state, "dispatched");
+      assert.equal(stored.provider_request_id, null);
+      assert.equal(stored.billing_state, "pending");
     });
 
-    await t.step("a Surplus 5xx hands the request to OpenLux", async () => {
+    await t.step("a Surplus 5xx stays delivered and never tries OpenLux", async () => {
       const result = await runPaidAttempt(
         "upstream-5xx",
         () =>
@@ -1137,24 +1188,34 @@ Deno.test("openai: transient first-tier paid failures fall through to OpenLux", 
             headers: { "Content-Type": "application/json" },
           })
       );
-      assert.equal(result.status, 200);
-      assert.equal(result.upstream, "metered");
+      assert.equal(result.status, 503);
+      assert.equal(result.upstream, "surplus");
       assert.equal(result.surplusCalls, 1);
-      assert.equal(result.meteredCalls, 1);
-      const stored = await waitForPaidFallbackTerminal(result.keyId, result.requestId, "completed");
-      assert.equal(stored.provider, "metered");
+      assert.equal(result.meteredCalls, 0);
+      const payload = JSON.parse(result.body) as { error?: { type?: unknown; code?: unknown } };
+      const error = payload.error ?? {};
+      assert.equal(error.type, "server_error");
+      assert.equal(error.code, "surplus_server_error");
+      const stored = await waitForPaidFallbackTerminal(result.keyId, result.requestId, "failed");
+      assert.equal(stored.provider, "surplus");
     });
 
-    await t.step("a stalled first tier releases the request at the bounded first-headers deadline", async () => {
+    await t.step("a stalled Surplus attempt fails closed at the bounded first-headers deadline", async () => {
       setPaidProviderFirstHeadersDeadlineMsForTest(30);
       try {
         const result = await runPaidAttempt("stalled-headers", (signal) => rejectOnAbort(signal ?? new AbortController().signal));
-        assert.equal(result.status, 200);
-        assert.equal(result.upstream, "metered");
+        assert.equal(result.status, 504);
+        assert.equal(result.upstream, "surplus");
         assert.equal(result.surplusCalls, 1);
-        assert.equal(result.meteredCalls, 1);
-        const stored = await waitForPaidFallbackTerminal(result.keyId, result.requestId, "completed");
-        assert.equal(stored.provider, "metered");
+        assert.equal(result.meteredCalls, 0);
+        const payload = JSON.parse(result.body) as { error?: { type?: unknown; code?: unknown } };
+        assert.equal(payload.error?.type, "server_error");
+        assert.equal(payload.error.code, "gateway_timeout");
+        const stored = await waitForPaidFallbackTerminal(result.keyId, result.requestId, "ambiguous");
+        assert.equal(stored.provider, "surplus");
+        assert.equal(stored.dispatch_state, "dispatched");
+        assert.equal(stored.provider_request_id, null);
+        assert.equal(stored.billing_state, "pending");
       } finally {
         setPaidProviderFirstHeadersDeadlineMsForTest(null);
       }
@@ -1181,7 +1242,7 @@ Deno.test("openai: transient first-tier paid failures fall through to OpenLux", 
       assert.equal(stored.provider, "surplus");
     });
 
-    await t.step("every fallthrough reservation records exactly one terminal provider pair", () => {
+    await t.step("every failed paid reservation records exactly one terminal provider pair", () => {
       for (const keyId of keyIds) {
         const terminalWrites = atomicWritesForKey(atomicCommits, paidRequestKeyFor(keyId, `request-${keyId}`)).filter((operation) => {
           const value = operation.value;

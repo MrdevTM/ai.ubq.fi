@@ -1,5 +1,10 @@
 import { apiKeyIdKey, MICROCREDITS_PER_CREDIT, PAID_FALLBACK_NO_LIMIT } from "../api-keys.ts";
-import { admitPaidFallbackV3, releasePaidFallbackBeforeProviderFetchV3, updatePaidFallbackRequestV3 } from "./ledger-admission.ts";
+import {
+  admitPaidFallbackV3,
+  type PaidFallbackAdmissionBlockedReason,
+  releasePaidFallbackBeforeProviderFetchV3,
+  updatePaidFallbackRequestV3,
+} from "./ledger-admission.ts";
 import { markPaidFallbackTerminalV3, reconcileDuePaidFallbacksV3 } from "./ledger-backfill.ts";
 import { settlePaidFallbackUsageV3 } from "./ledger-settlement.ts";
 import { loadFullCodexModelsSnapshot } from "../codex/index.ts";
@@ -221,6 +226,21 @@ const advanceUsageWindow = (resetAtMs: number, windowMs: number, nowMs: number):
   return initialStart + (elapsedWindows + 1) * windowMs;
 };
 
+/**
+ * Whether a blocked admission may be retried with another attempt. A due
+ * pending settlement can free the reserved exposure that blocked this
+ * admission, so it is reconciled here through the existing due gate instead of
+ * leaving a deferred reservation stranded until another terminal event happens.
+ * The caller's attempt cap keeps a genuinely unresolved window fail-closed.
+ */
+const retryBlockedPaidFallbackAdmission = async (reason: PaidFallbackAdmissionBlockedReason, attempt: number): Promise<boolean> => {
+  if (attempt >= 2) return false;
+  if (reason === "concurrent_update") return true;
+  if (reason !== "limit_exceeded") return false;
+  await reconcileDuePaidFallbacksV3(Date.now()).catch(() => {});
+  return true;
+};
+
 export const reservePaidFallback = async (
   input: Readonly<{
     keyId: string;
@@ -264,7 +284,7 @@ export const reservePaidFallback = async (
       dispatchIntent: true,
     });
     if (admitted.kind === "reserved") return { kind: "reserved", reservation: admitted.reservation };
-    if (admitted.reason === "concurrent_update" && attempt < 2) continue;
+    if (await retryBlockedPaidFallbackAdmission(admitted.reason, attempt)) continue;
     return { kind: "blocked", reason: admitted.reason, reset_at_ms: windowResetAtMs };
   }
   return { kind: "blocked", reason: "concurrent_update", reset_at_ms: null };

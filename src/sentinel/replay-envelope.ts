@@ -10,6 +10,7 @@ import type {
   SentinelReplayDownstream,
   SentinelReplayPlaintext,
   SentinelReplaySettings,
+  SentinelReplayManifest,
   SentinelReplayUnavailableReason,
 } from "./replay-model.ts";
 import {
@@ -390,6 +391,19 @@ const dedupeManifestKey = (value: unknown): Deno.KvKey | null => {
   return value.manifest_key as Deno.KvKey;
 };
 
+/** The durable dedupe row now carries the winning manifest's real identity and expiry. */
+const dedupeRecordFor = (manifestKey: Deno.KvKey, manifest: SentinelReplayManifest): Readonly<Record<string, unknown>> => ({
+  manifest_key: manifestKey,
+  captured_at_ms: manifest.captured_at_ms,
+  expires_at_ms: manifest.expires_at_ms,
+});
+
+/** Winner identity from a dedupe row; legacy rows (no expiry) return null and require a manifest read. */
+const dedupeWinnerIdentity = (value: unknown): Readonly<{ capturedAtMs: number; expiresAtMs: number }> | null =>
+  isRecord(value) && Number.isSafeInteger(value.captured_at_ms) && Number.isSafeInteger(value.expires_at_ms)
+    ? { capturedAtMs: value.captured_at_ms as number, expiresAtMs: value.expires_at_ms as number }
+    : null;
+
 const ciphertextDigest = async (bytes: Uint8Array<ArrayBuffer>): Promise<string> => encodeHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
 
 /**
@@ -408,6 +422,8 @@ export {
   ciphertextDigest,
   decodePlaintext,
   dedupeManifestKey,
+  dedupeRecordFor,
+  dedupeWinnerIdentity,
   downstreamObservation,
   encodePlaintext,
   encryptionAdditionalData,

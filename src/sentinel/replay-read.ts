@@ -30,6 +30,13 @@ import {
 } from "./replay-model.ts";
 import { isSentinelReplayCaptureStatusRow, isSentinelReplayRequestId, sentinelFailureSignature } from "./replay-observation.ts";
 import { decodePlaintext, encryptionAdditionalData, fingerprintParts, gunzip, hmacHex, importAesKey } from "./replay-envelope.ts";
+import {
+  readSentinelReplayLedgerSnapshot,
+  SENTINEL_REPLAY_EVICTION_REASON,
+  SENTINEL_REPLAY_EXPIRED_REASON,
+  SENTINEL_REPLAY_STATUS_NOT_RETAINED,
+  sentinelReplayEvictionKey,
+} from "./replay-retention-schema.ts";
 
 const decodedIvIsValid = (value: string): boolean => {
   if (value.length < 16 || value.length > 24 || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
@@ -69,7 +76,9 @@ export const isSentinelReplayManifest = (value: unknown): value is SentinelRepla
     typeof value.ciphertext_bytes !== "number" ||
     !Number.isSafeInteger(value.ciphertext_bytes) ||
     value.ciphertext_bytes < 16 ||
-    value.ciphertext_bytes > MAX_REPLAY_CIPHERTEXT_BYTES
+    value.ciphertext_bytes > MAX_REPLAY_CIPHERTEXT_BYTES ||
+    (value.stored_bytes !== undefined && (typeof value.stored_bytes !== "number" || !Number.isSafeInteger(value.stored_bytes) || value.stored_bytes <= 0)) ||
+    (value.request_id !== undefined && !isSentinelReplayRequestId(value.request_id))
   )
     return false;
   const minimumBytes = (value.chunk_count - 1) * SENTINEL_REPLAY_CHUNK_BYTES + 1;
@@ -220,19 +229,24 @@ export const listEncryptedSentinelIncidentReplays = async (
 };
 
 /**
- * Read the capture status for one request id. `expired` is derived at read
- * time from the stored expiry; a request with no row is `unknown`, never a
- * silent empty history.
+ * Read the capture status for one request id. `expired` is derived at read time
+ * from the stored expiry. A request with no row is `unknown` while every
+ * capture-owned status row is still retained; once bounded pruning has removed
+ * any status/tombstone row, a missing lookup is reported as the distinct
+ * `status_not_retained` instead of inventing `evicted`/`expired`/`ready`,
+ * because the store can no longer prove the row never existed.
  */
 export const readSentinelReplayCaptureStatus = async (kv: Deno.Kv, requestId: string, nowMs: number = Date.now()): Promise<SentinelReplayCaptureStatusRow> => {
   if (!isSentinelReplayRequestId(requestId)) throw new Error("Sentinel replay request ID is invalid");
   const entry = await kv.get<SentinelReplayCaptureStatusRow>(requestStatusKey(requestId));
   if (entry.value === null) {
+    const ledger = await readSentinelReplayLedgerSnapshot(kv).catch(() => null);
+    const pruned = (ledger?.ledger.status_pruned_records ?? 0) > 0;
     return {
       version: 1,
       request_id: requestId,
-      status: "unknown",
-      reason: "no_capture_record",
+      status: pruned ? "status_not_retained" : "unknown",
+      reason: pruned ? SENTINEL_REPLAY_STATUS_NOT_RETAINED : "no_capture_record",
       captured_at_ms: nowMs,
       manifest_key: null,
       fingerprint: null,
@@ -249,9 +263,10 @@ export const readSentinelReplayCaptureStatus = async (kv: Deno.Kv, requestId: st
 /** Export the capture a request id points at, if its manifest is still present. */
 export const listEncryptedSentinelReplaysByRequestId = async (
   kv: Deno.Kv,
-  requestId: string
+  requestId: string,
+  nowMs: number = Date.now()
 ): Promise<Readonly<{ captures: ExportedSentinelReplayCapture[]; status: SentinelReplayCaptureStatusRow }>> => {
-  const status = await readSentinelReplayCaptureStatus(kv, requestId);
+  const status = await readSentinelReplayCaptureStatus(kv, requestId, nowMs);
   if (status.manifest_key === null || status.fingerprint === null) return { captures: [], status };
   const manifestEntry = await kv.get<SentinelReplayManifest>(status.manifest_key);
   if (
@@ -260,6 +275,16 @@ export const listEncryptedSentinelReplaysByRequestId = async (
     manifestEntry.value.fingerprint !== status.fingerprint ||
     !manifestMatchesKey(status.manifest_key, manifestEntry.value)
   ) {
+    // A missing manifest is either a retention eviction or a TTL/expiry race.
+    // The bounded eviction tombstone distinguishes them truthfully; absence of
+    // a tombstone keeps the existing expired classification.
+    const tombstone = await kv.get(sentinelReplayEvictionKey(status.fingerprint));
+    if (isRecord(tombstone.value) && tombstone.value.reason === SENTINEL_REPLAY_EVICTION_REASON) {
+      return { captures: [], status: { ...status, status: "evicted", reason: SENTINEL_REPLAY_EVICTION_REASON } };
+    }
+    if (isRecord(tombstone.value) && tombstone.value.reason === SENTINEL_REPLAY_EXPIRED_REASON) {
+      return { captures: [], status: { ...status, status: "expired", reason: SENTINEL_REPLAY_EXPIRED_REASON } };
+    }
     return { captures: [], status: { ...status, status: "expired", reason: "manifest_unavailable" } };
   }
   const chunks = await getChunks(kv, manifestEntry.value);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import type { WebSocket as UpstreamClient } from "ws";
 import { CountingKv } from "./helpers/counting-kv.ts";
+import { CODEX_REFRESH_TOKEN_URL } from "../src/codex/auth.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, CodexAuthState } from "../src/types.ts";
 import { sha256Base64Url } from "../src/utils.ts";
 
@@ -23,7 +24,14 @@ Object.defineProperty(process, "env", {
 });
 
 const ACCOUNT_A = "live-sideband-http-account-a";
+const GONE_ACCOUNT = "live-sideband-http-account-gone";
+const KEY_ID = "live-sideband-http-key";
+const KEY_ID_B = "live-sideband-http-key-b";
+/** The principal the fixture's first API key resolves to; the mapping records it. */
+const PRINCIPAL = `api-key:${KEY_ID}`;
 const CALL_ID = "rtc_live_sideband_http";
+const LEGACY_CALL_ID = "rtc_live_sideband_legacy";
+const GONE_ACCOUNT_CALL_ID = "rtc_live_sideband_gone_account";
 const UNKNOWN_CALL_ID = "rtc_live_sideband_unknown";
 const CLIENT_FRAME = JSON.stringify({ type: "input_audio.append", audio: "AAAA" });
 const UPSTREAM_FRAME = JSON.stringify({ type: "output_audio.delta", audio: "BBBB" });
@@ -35,7 +43,34 @@ const codexAccount = (accountId: string, nowMs: number): CodexAuthState => ({
   updated_at_ms: nowMs,
 });
 
-const seedApiKey = async (kv: CountingKv, token: string, nowMs: number): Promise<void> => {
+const encodeBase64Url = (value: unknown): string =>
+  btoa(JSON.stringify(value))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/={1,2}$/u, "");
+
+/** A decodable JWT-shaped token; only `exp` matters to the refresh decision. */
+const jwtLike = (payload: unknown): string => `${encodeBase64Url({ alg: "none" })}.${encodeBase64Url(payload)}.signature`;
+
+/** A credential whose JWT expiry is already past, so the coordinated path must refresh it. */
+const expiredCodexAccount = (accountId: string): CodexAuthState => ({
+  account_id: accountId,
+  access_token: jwtLike({ exp: Math.floor((Date.now() - 60_000) / 1_000) }),
+  refresh_token: `${accountId}-refresh-token`,
+  updated_at_ms: Date.now(),
+});
+
+/** The synthetic credential pair each controlled refresh answer carries a unique index in. */
+const REFRESH_ACCESS_TOKEN = "live-sideband-refreshed-access-token";
+const REFRESH_REFRESH_TOKEN = "live-sideband-refreshed-refresh-token";
+
+type RefreshCall = Readonly<{ url: string; refreshToken: string | null; index: number }>;
+
+type RefreshResponder = (call: RefreshCall) => Response;
+
+type SidebandFixtureOptions = Readonly<{ accounts?: readonly CodexAuthState[] }>;
+
+const seedApiKey = async (kv: CountingKv, keyId: string, name: string, token: string, nowMs: number): Promise<void> => {
   const tokenHash = await sha256Base64Url(token);
   const commonPolicy = {
     expires_at_ms: -1,
@@ -52,8 +87,8 @@ const seedApiKey = async (kv: CountingKv, token: string, nowMs: number): Promise
     paid_fallback_reservation_request_id: null,
   } satisfies Omit<ApiKeyHashRecord, "id">;
   const keyRecord: ApiKeyRecord = {
-    id: "live-sideband-http-key",
-    name: "Live sideband HTTP key",
+    id: keyId,
+    name,
     prefix: token.slice(0, 10),
     hash: tokenHash,
     created_at_ms: nowMs,
@@ -78,13 +113,17 @@ type UpstreamSideband = {
 type SidebandFixture = {
   readonly kv: CountingKv;
   readonly token: string;
+  readonly tokenB: string;
   readonly gatewayWsBaseUrl: string;
   readonly upstreamSidebands: UpstreamSideband[];
-  waitForUpstreamSideband: () => Promise<UpstreamSideband>;
+  readonly refreshCalls: RefreshCall[];
+  waitForUpstreamSideband: (index?: number) => Promise<UpstreamSideband>;
+  setRefreshResponder: (responder: RefreshResponder) => void;
+  setAuthPool: (accounts: readonly CodexAuthState[]) => Promise<void>;
   close: () => Promise<void>;
 };
 
-const startSidebandFixture = async (): Promise<SidebandFixture> => {
+const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promise<SidebandFixture> => {
   const { setKvForTest } = await import("../src/kv.ts");
   const { resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
   const { resetCodexAccountRoutingForTest } = await import("../src/codex/account-routing.ts");
@@ -96,6 +135,9 @@ const startSidebandFixture = async (): Promise<SidebandFixture> => {
   const kv = new CountingKv();
   const upstreamSidebands: UpstreamSideband[] = [];
   const openSidebands: WebSocket[] = [];
+  const refreshCalls: RefreshCall[] = [];
+  let activeRefreshResponder: RefreshResponder = (call) =>
+    Response.json({ access_token: `${REFRESH_ACCESS_TOKEN}-${call.index}`, refresh_token: `${REFRESH_REFRESH_TOKEN}-${call.index}` });
   const originalDeployFlag = config.isDeploy;
   const originalInfo = console.info;
   const originalWarn = console.warn;
@@ -110,10 +152,49 @@ const startSidebandFixture = async (): Promise<SidebandFixture> => {
   (config as { isDeploy: boolean }).isDeploy = true;
 
   const now = Date.now();
-  await kv.set(["ubq_ai", "codex_auth"], { accounts: [codexAccount(ACCOUNT_A, now)], updated_at_ms: now });
-  await kv.set(["uos_ai", "codex_live_calls", "v1", CALL_ID], { account_id: ACCOUNT_A, created_at_ms: now }, { expireIn: 60 * 60_000 });
+  const accounts = options.accounts ?? [codexAccount(ACCOUNT_A, now)];
+  await kv.set(["ubq_ai", "codex_auth"], { accounts, updated_at_ms: now });
+  await kv.set(
+    ["uos_ai", "codex_live_calls", "v1", CALL_ID],
+    { account_id: ACCOUNT_A, principal_id: PRINCIPAL, created_at_ms: now },
+    { expireIn: 60 * 60_000 }
+  );
+  // A record written before principal binding: no `principal_id`, so no join
+  // can ever be authorized against it.
+  await kv.set(["uos_ai", "codex_live_calls", "v1", LEGACY_CALL_ID], { account_id: ACCOUNT_A, created_at_ms: now }, { expireIn: 60 * 60_000 });
+  // A mapping whose account left the pool: the join must fail closed.
+  await kv.set(
+    ["uos_ai", "codex_live_calls", "v1", GONE_ACCOUNT_CALL_ID],
+    { account_id: GONE_ACCOUNT, principal_id: PRINCIPAL, created_at_ms: now },
+    { expireIn: 60 * 60_000 }
+  );
   const token = `u_${"d".repeat(64)}`;
-  await seedApiKey(kv, token, now);
+  const tokenB = `u_${"e".repeat(64)}`;
+  await seedApiKey(kv, KEY_ID, "Live sideband HTTP key", token, now);
+  await seedApiKey(kv, KEY_ID_B, "Live sideband HTTP key B", tokenB, now);
+
+  // The refresh URL is a module constant, so the fixture redirects that exact
+  // URL to a real loopback endpoint; no production refresh code or upstream
+  // auth server is involved.
+  const refreshServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, async (request) => {
+    const body = JSON.parse(await request.text()) as Record<string, unknown>;
+    const call: RefreshCall = {
+      url: request.url,
+      refreshToken: typeof body.refresh_token === "string" ? body.refresh_token : null,
+      index: refreshCalls.length + 1,
+    };
+    refreshCalls.push(call);
+    return activeRefreshResponder(call);
+  });
+  const refreshEndpointUrl = `http://127.0.0.1:${(refreshServer.addr as Deno.NetAddr).port}/oauth/token`;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    let target: string;
+    if (typeof input === "string") target = input;
+    else if (input instanceof URL) target = input.href;
+    else target = input.url;
+    return originalFetch(target === CODEX_REFRESH_TOKEN_URL ? refreshEndpointUrl : input, init);
+  };
 
   const upstreamServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, (request) => {
     const url = new URL(request.url);
@@ -149,15 +230,23 @@ const startSidebandFixture = async (): Promise<SidebandFixture> => {
   return {
     kv,
     token,
+    tokenB,
     gatewayWsBaseUrl: `ws://127.0.0.1:${(gatewayServer.addr as Deno.NetAddr).port}/v1/live`,
     upstreamSidebands,
-    waitForUpstreamSideband: async () => {
+    refreshCalls,
+    waitForUpstreamSideband: async (index = 0) => {
       for (let attempt = 0; attempt < 200; attempt += 1) {
-        const sideband = upstreamSidebands.at(0);
+        const sideband = upstreamSidebands.at(index);
         if (sideband !== undefined) return sideband;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       throw new Error("the gateway never dialed the upstream sideband");
+    },
+    setRefreshResponder: (next) => {
+      activeRefreshResponder = next;
+    },
+    setAuthPool: async (nextAccounts) => {
+      await kv.set(["ubq_ai", "codex_auth"], { accounts: nextAccounts, updated_at_ms: Date.now() });
     },
     close: async () => {
       for (const socket of openSidebands) {
@@ -170,12 +259,14 @@ const startSidebandFixture = async (): Promise<SidebandFixture> => {
       console.info = originalInfo;
       console.warn = originalWarn;
       (config as { isDeploy: boolean }).isDeploy = originalDeployFlag;
+      globalThis.fetch = originalFetch;
       setLiveUpstreamBasesForTest({ callsBaseUrl: null, sidebandBaseUrl: null });
       setKvForTest(null);
       resetCodexAuthCacheForTest();
       resetCodexAccountRoutingForTest();
       await gatewayServer.shutdown();
       await upstreamServer.shutdown();
+      await refreshServer.shutdown();
     },
   };
 };
@@ -443,6 +534,159 @@ Deno.test({
     try {
       await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${UNKNOWN_CALL_ID}`, { authorization: `Bearer ${fixture.token}` }, 404);
       assert.equal(fixture.upstreamSidebands.length, 0);
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> answers 403 for a different valid principal without dialing upstream",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.tokenB}` }, 403);
+      assert.equal(fixture.upstreamSidebands.length, 0, "an unauthorized principal never reaches the upstream");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> fails closed for a mapping with no recorded principal",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${LEGACY_CALL_ID}`, { authorization: `Bearer ${fixture.token}` }, 403);
+      assert.equal(fixture.upstreamSidebands.length, 0, "a legacy mapping is never joined on an unproven principal");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> lets the creating principal reconnect on the same upstream account",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      const first = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+      const firstUpstream = await fixture.waitForUpstreamSideband(0);
+      assert.equal(firstUpstream.headers.get("authorization"), `Bearer ${ACCOUNT_A}-access-token`);
+      assert.equal(firstUpstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+
+      const firstClosed = nextClose(first);
+      first.close(1000, "reconnect");
+      await firstClosed;
+
+      const second = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+      try {
+        const secondUpstream = await fixture.waitForUpstreamSideband(1);
+        assert.equal(secondUpstream.path, `/v1/live/${CALL_ID}`);
+        assert.equal(secondUpstream.headers.get("authorization"), `Bearer ${ACCOUNT_A}-access-token`, "the reconnect maps the same upstream account");
+        assert.equal(secondUpstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+      } finally {
+        second.terminate();
+      }
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> refreshes the mapped account's expired token before dialing upstream",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture({ accounts: [expiredCodexAccount(ACCOUNT_A)] });
+    const client = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+    try {
+      const upstream = await fixture.waitForUpstreamSideband();
+      assert.equal(
+        upstream.headers.get("authorization"),
+        `Bearer ${REFRESH_ACCESS_TOKEN}-1`,
+        "the handshake carries the refreshed credential instead of the expired cached bearer"
+      );
+      assert.equal(upstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+      assert.equal(fixture.refreshCalls.length, 1, "the expired mapped account is refreshed exactly once");
+      assert.equal(fixture.refreshCalls[0]?.refreshToken, `${ACCOUNT_A}-refresh-token`, "the refresh re-read the mapped account by identity");
+
+      const storedPool = fixture.kv.entries.get(JSON.stringify(["ubq_ai", "codex_auth"]))?.value as { accounts?: CodexAuthState[] } | undefined;
+      const refreshed = storedPool?.accounts?.find((account) => account.account_id === ACCOUNT_A);
+      assert.equal(refreshed?.access_token, `${REFRESH_ACCESS_TOKEN}-1`, "the rotated credential is persisted under the same account identity");
+      assert.equal(refreshed.refresh_token, `${REFRESH_REFRESH_TOKEN}-1`);
+
+      const mapping = fixture.kv.entries.get(JSON.stringify(["uos_ai", "codex_live_calls", "v1", CALL_ID]))?.value;
+      assert.equal((mapping as { account_id?: unknown } | undefined)?.account_id, ACCOUNT_A, "the call keeps its mapped account identity");
+      assert.equal((mapping as { principal_id?: unknown } | undefined)?.principal_id, PRINCIPAL, "the creator-principal binding is preserved");
+    } finally {
+      client.terminate();
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> refreshes again on reconnect when the mapped credential expired again",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture({ accounts: [expiredCodexAccount(ACCOUNT_A)] });
+    try {
+      const first = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+      const firstUpstream = await fixture.waitForUpstreamSideband(0);
+      assert.equal(firstUpstream.headers.get("authorization"), `Bearer ${REFRESH_ACCESS_TOKEN}-1`);
+
+      const firstClosed = nextClose(first);
+      first.close(1000, "reconnect");
+      await firstClosed;
+      assert.equal(fixture.refreshCalls.length, 1);
+
+      // The credential expires again before the sideband reconnects, so the
+      // reconnect must run the coordinated path rather than reuse the previous
+      // in-memory bearer.
+      await fixture.setAuthPool([expiredCodexAccount(ACCOUNT_A)]);
+
+      const second = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+      try {
+        const secondUpstream = await fixture.waitForUpstreamSideband(1);
+        assert.equal(secondUpstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+        assert.equal(secondUpstream.headers.get("authorization"), `Bearer ${REFRESH_ACCESS_TOKEN}-2`, "the reconnect dispatches a newly refreshed credential");
+        assert.equal(fixture.refreshCalls.length, 2, "the reconnect refreshed the expired mapped account again");
+        assert.equal(fixture.refreshCalls[1]?.refreshToken, `${ACCOUNT_A}-refresh-token`);
+      } finally {
+        second.terminate();
+      }
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> answers 404 when the mapped account is no longer configured",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${GONE_ACCOUNT_CALL_ID}`, { authorization: `Bearer ${fixture.token}` }, 404);
+      assert.equal(fixture.upstreamSidebands.length, 0, "a disappeared mapped account never reaches the upstream");
+      assert.equal(fixture.refreshCalls.length, 0);
     } finally {
       await fixture.close();
     }

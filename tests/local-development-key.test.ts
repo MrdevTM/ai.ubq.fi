@@ -81,11 +81,12 @@ denoWithKv.openKv = () => Promise.resolve(memoryKv as unknown as Deno.Kv);
 const { API_KEY_NO_EXPIRATION_MS, API_KEY_NO_USAGE_LIMIT, PAID_FALLBACK_NO_LIMIT, apiKeyHashKey, apiKeyIdKey } = await import("../src/api-keys.ts");
 const { apiKeyUsageV3WindowKey } = await import("../src/api-key-policy.ts");
 const { hasStrictPaidFallbackKeyPolicy } = await import("../src/paid-fallback/index.ts");
-const { LOCAL_DEVELOPMENT_KEY_ID, ensureLocalDevelopmentApiKey, resolveLocalDevelopmentApiKeyPolicy } = await import("../src/auth/local-development-key.ts");
+const { LOCAL_DEVELOPMENT_KEY_ID, ensureLocalDevelopmentApiKey, resolveLocalDevelopmentApiKeyPolicy, setLocalDevelopmentPricingDeadlineMsForTest } =
+  await import("../src/auth/local-development-key.ts");
 const { configureAdminAuthForListener, configureAdminAuthPeerForRequest, configureMacLocalAdminAuthBypassForListener } =
   await import("../src/auth/local-admin.ts");
-const { authenticateClient } = await import("../src/auth/index.ts");
-const { getKv } = await import("../src/kv.ts");
+const { authenticateClient, handleV1Auth } = await import("../src/auth/index.ts");
+const { getKv, setKvForTest } = await import("../src/kv.ts");
 const kvEntry = await getKv();
 assert.ok(kvEntry);
 
@@ -163,6 +164,146 @@ Deno.test("local development key provisioning reports an unavailable pricing sna
     const idEntry = await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID));
     assert.equal(idEntry.value, null);
   });
+});
+
+Deno.test("local development key provisioning bounds a pricing initializer that never settles", async () => {
+  await withPaidProviderKey(async () => {
+    const isolated = new MemoryKv();
+    let entered = 0;
+    const enteredSignals: AbortSignal[] = [];
+    let resolvePricing: (value: Awaited<ReturnType<LocalDevelopmentPricingInitializer>>) => void = () => {};
+    const pendingPricing = new Promise<Awaited<ReturnType<LocalDevelopmentPricingInitializer>>>((resolve) => {
+      resolvePricing = resolve;
+    });
+    setLocalDevelopmentPricingDeadlineMsForTest(1_000);
+    try {
+      const startedAt = performance.now();
+      const status = await ensureLocalDevelopmentApiKey(isolated as unknown as Deno.Kv, {
+        initializePolicy: (signal) => {
+          entered += 1;
+          if (signal) enteredSignals.push(signal);
+          return pendingPricing;
+        },
+      });
+      const elapsedMs = performance.now() - startedAt;
+      // Entry proves the fixed deadline ended the wait rather than a skipped initializer.
+      assert.equal(entered, 1);
+      assert.equal(status, "unavailable");
+      assert.ok(elapsedMs >= 750, `provisioning must wait for the deadline (${Math.round(elapsedMs)}ms)`);
+      assert.ok(elapsedMs < 10_000, `provisioning must stay bounded (${Math.round(elapsedMs)}ms)`);
+      // The abandoned attempt is still handed a cooperative abort at the deadline.
+      // Read through the array: a `let` assigned only inside the initializer stays
+      // narrowed to its null initializer under control-flow analysis.
+      const enteredSignal = enteredSignals.at(0);
+      assert.equal(enteredSignal?.aborted, true);
+      assert.equal(enteredSignal.reason.name, "TimeoutError");
+      assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+      // A late result from the abandoned attempt must never publish a key.
+      resolvePricing(pricing);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+    } finally {
+      setLocalDevelopmentPricingDeadlineMsForTest(null);
+    }
+  });
+});
+
+Deno.test("local development key provisioning keeps a normal pricing initialization inside the deadline", async () => {
+  await withPaidProviderKey(async () => {
+    const isolated = new MemoryKv();
+    setLocalDevelopmentPricingDeadlineMsForTest(1_000);
+    try {
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated as unknown as Deno.Kv, { initializePolicy }), "created");
+      const record = (await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value as Record<string, unknown> | null;
+      assert.ok(record);
+      assert.deepEqual(record.paid_fallback_model_ids, pricing.paid_fallback_model_ids);
+      assert.equal(record.paid_fallback_pricing_checked_at_ms, pricing.paid_fallback_pricing_checked_at_ms);
+    } finally {
+      setLocalDevelopmentPricingDeadlineMsForTest(null);
+    }
+  });
+});
+
+Deno.test("local development key provisioning discards a cancelled pricing snapshot", async () => {
+  await withPaidProviderKey(async () => {
+    const isolated = new MemoryKv();
+    const controller = new AbortController();
+    let entered = 0;
+    let resolvePricing: (value: Awaited<ReturnType<LocalDevelopmentPricingInitializer>>) => void = () => {};
+    const pendingPricing = new Promise<Awaited<ReturnType<LocalDevelopmentPricingInitializer>>>((resolve) => {
+      resolvePricing = resolve;
+    });
+    const attempt = ensureLocalDevelopmentApiKey(isolated as unknown as Deno.Kv, {
+      signal: controller.signal,
+      initializePolicy: () => {
+        entered += 1;
+        return pendingPricing;
+      },
+    });
+    controller.abort(new DOMException("cancelled", "AbortError"));
+    assert.equal(await attempt, "unavailable");
+    assert.equal(entered, 1);
+    resolvePricing(pricing);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+  });
+});
+
+Deno.test("the hostname-only legacy fallback never attaches the paid local development key", async () => {
+  // Control: the paid principal exists, so a hostname-only decision would
+  // attach it. The checked bypass is active with a loopback peer bound, exactly
+  // as the loopback development server configures them.
+  assert.ok(await resolveLocalDevelopmentApiKeyPolicy(memoryKv as unknown as Deno.Kv));
+  configureAdminAuthForListener(enabledOptions, loopbackAddress);
+  configureAdminAuthPeerForRequest(loopbackAddress);
+  const legacyRequest = (headers?: HeadersInit) => new Request("http://127.0.0.1/v1/chat/completions", { method: "POST", headers });
+
+  try {
+    // A mismatching Origin fails the peer/origin-checked path, leaving only the
+    // legacy hostname fallback: it must stay policy-free.
+    const crossOriginAuth = await authenticateClient(legacyRequest({ origin: "https://attacker.example" }));
+    if (!crossOriginAuth.ok) throw new Error("The legacy fallback still authenticates loopback hostname requests");
+    assert.equal(crossOriginAuth.method.kind, "disabled");
+
+    const whoami = await handleV1Auth(legacyRequest({ origin: "https://attacker.example" }));
+    assert.equal(whoami.status, 200);
+    const body = await whoami.json();
+    assert.equal(body.auth.mode, "disabled");
+    assert.equal(body.auth.method.kind, "disabled");
+    assert.equal(body.auth.is_admin, false);
+    assert.equal(body.auth.is_super_admin, false);
+    assert.equal("key" in body.auth.method, false);
+
+    // The same loopback hostname with a matching Origin passes the checked
+    // bypass and still receives the paid local principal.
+    const sameOriginAuth = await authenticateClient(legacyRequest({ origin: "http://127.0.0.1", "sec-fetch-site": "same-origin" }));
+    if (!sameOriginAuth.ok) throw new Error("Same-origin loopback requests authenticate without a credential");
+    if (sameOriginAuth.method.kind !== "kv_api_key") throw new Error("Expected the checked loopback paid principal");
+    assert.equal(sameOriginAuth.method.key_id, LOCAL_DEVELOPMENT_KEY_ID);
+    assert.equal(sameOriginAuth.method.policy.paid_fallback_enabled, true);
+  } finally {
+    configureAdminAuthForListener(disabledOptions, loopbackAddress);
+    configureAdminAuthPeerForRequest(null);
+  }
+});
+
+Deno.test("the hostname-only legacy fallback stays policy-free without a local development key", async () => {
+  const isolated = new MemoryKv();
+  try {
+    setKvForTest(isolated as unknown as Deno.Kv);
+    assert.equal(await resolveLocalDevelopmentApiKeyPolicy(isolated as unknown as Deno.Kv), null);
+    configureAdminAuthForListener(enabledOptions, loopbackAddress);
+    configureAdminAuthPeerForRequest(loopbackAddress);
+    const auth = await authenticateClient(
+      new Request("http://127.0.0.1/v1/chat/completions", { method: "POST", headers: { origin: "https://attacker.example" } })
+    );
+    if (!auth.ok) throw new Error("The legacy fallback still authenticates loopback hostname requests");
+    assert.equal(auth.method.kind, "disabled");
+  } finally {
+    configureAdminAuthForListener(disabledOptions, loopbackAddress);
+    configureAdminAuthPeerForRequest(null);
+    setKvForTest(memoryKv as unknown as Deno.Kv);
+  }
 });
 
 Deno.test("the loopback bypass authenticates as the unlimited local development key", async () => {

@@ -103,6 +103,69 @@ Deno.test("redactBriefText recognizes quoted JSON credential keys and real GitHu
   assert.match(result.text, /\[redacted\]/);
 });
 
+Deno.test("redactBriefText consumes a YAML single-quoted scalar across a doubled quote", () => {
+  // YAML escapes a quote inside a single-quoted scalar by doubling it; a match
+  // that stops at the first closing quote leaves the credential tail behind.
+  const head = "zqalpha-zqbravo";
+  const tail = "zqcharlie-zqdelta";
+  const result = redactBriefText(`client_secret: '${head}''${tail}'`);
+  assert.equal(result.text, "[redacted]", "the whole scalar, doubled quote included, must collapse to one marker");
+  assert.equal(result.redactions, 1);
+  for (const fragment of [...head.split("-"), ...tail.split("-")]) {
+    assert.equal(result.text.includes(fragment), false, `${fragment} must be redacted`);
+  }
+});
+
+Deno.test("redactBriefText consumes every supported single-quoted credential form", () => {
+  const head = "zqalpha-zqbravo";
+  const tail = "zqcharlie-zqdelta";
+  const forms = [
+    ["plain whitespace", `client_secret: '${head} ${tail}'`],
+    ["YAML doubled quote", `client_secret: '${head}''${tail}'`],
+    ["one literal backslash before a doubled pair", `client_secret: '${head}\\''${tail}'`],
+    ["two literal backslashes before a doubled pair", `client_secret: '${head}\\\\''${tail}'`],
+    ["literal backslash before the closing quote", `client_secret: '${head}\\'`],
+    ["pre-existing backslash-escaped quote", `client_secret: '${head}\\'${tail}'`],
+    ["multiline scalar", `client_secret: '${head}\n${tail}'`],
+  ];
+  for (const [form, text] of forms) {
+    const result = redactBriefText(text);
+    assert.equal(result.text, "[redacted]", `${form}: the whole scalar must collapse to one marker`);
+    assert.equal(result.redactions, 1, `${form}: one assignment is one redaction`);
+    for (const fragment of [...head.split("-"), ...tail.split("-")]) {
+      assert.equal(result.text.includes(fragment), false, `${form}: ${fragment} must be redacted`);
+    }
+  }
+});
+
+Deno.test("redactBriefText redacts adjacent assignments without trading a key for a secret tail", () => {
+  const head = "zqalpha-zqbravo";
+  const tail = "zqcharlie-zqdelta";
+  // A value ending in a literal backslash must not consume the next assignment's
+  // key while leaving that assignment's whitespace-bearing value in the clear.
+  const trailing = redactBriefText(`client_secret: '${head}\\'\nsudo_password: '${tail}'`);
+  assert.equal(trailing.text, "[redacted]", "the ambiguous scalar and the assignment that follows it must both collapse");
+  const trailingMixed = redactBriefText(`client_secret: '${head}\\'\naccess_token: "${tail} ${head}"`);
+  assert.equal(trailingMixed.text.includes("zq"), false, "a double-quoted neighbour may not leave its value in the clear");
+  const doubledNeighbour = redactBriefText(`client_secret: '${head}''${tail}'\nsudo_password: '${head}'`);
+  assert.equal(doubledNeighbour.text, "[redacted]\n[redacted]", "a terminated scalar and its neighbour stay separate redactions");
+  const mixedLine = redactBriefText(`client_secret: '${head}' sudo_password: "${tail}" access_token: '${head} ${tail}'`);
+  assert.equal(mixedLine.text, "[redacted] [redacted] [redacted]", "mixed quote forms on one line each collapse on their own");
+});
+
+Deno.test("redactBriefText does not expose the tail of an unterminated single-quoted scalar", () => {
+  const head = "zqalpha-zqbravo";
+  const cases = [
+    ["clipped before any closing quote", `client_secret: '${head} ${head}`],
+    ["clipped after a literal backslash", `client_secret: '${head}\\`],
+  ];
+  for (const [form, text] of cases) {
+    const result = redactBriefText(text);
+    assert.equal(result.text, "[redacted]", `${form}: an unterminated scalar is redacted through the end of the text`);
+    assert.equal(result.redactions, 1, `${form}: one assignment is one redaction`);
+  }
+});
+
 Deno.test("the brief's Cerebras payload carries no quoted-JSON or GitHub credential canaries", async () => {
   const classicTokens = [
     "ghp_syntheticcanary0000000000000011",
@@ -118,11 +181,17 @@ Deno.test("the brief's Cerebras payload carries no quoted-JSON or GitHub credent
     secret: 'zqvenus zqdelta "zqecho" \\ zqfoxtrot',
   };
   const singleQuotedValue = "zqterra zqgolf zqhotel zqindia";
-  const credentialValues = [...Object.values(quotedCredentials), singleQuotedValue];
-  const whitespaceCanaries = [quotedCredentials.password, quotedCredentials.secret, singleQuotedValue];
+  // YAML escapes a quote inside a single-quoted scalar by doubling it, and a
+  // literal backslash immediately before that pair stays ordinary YAML content.
+  const doubledQuotedValue = "zquniform''zqvictor zqwhiskey";
+  const backslashDoubledValue = "zqxray\\''zqyankee zqzulu";
+  const credentialValues = [...Object.values(quotedCredentials), singleQuotedValue, doubledQuotedValue, backslashDoubledValue];
+  const whitespaceCanaries = [quotedCredentials.password, quotedCredentials.secret, singleQuotedValue, doubledQuotedValue, backslashDoubledValue];
   const secretFragments = whitespaceCanaries.flatMap((value) => value.split(/[^A-Za-z0-9]+/)).filter((fragment) => fragment.length > 0);
   const injectedSecretCount = classicTokens.length + 2 + credentialValues.length;
   const quoted = `credentials:\n${JSON.stringify(quotedCredentials, null, 1)}\nclient_secret: '${singleQuotedValue}'`;
+  const doubledQuotedLine = `sudo_password: '${doubledQuotedValue}'`;
+  const backslashDoubledLine = `client_secret_rotation: '${backslashDoubledValue}'`;
   const straddling = `${"A".repeat(1_180)}ghp_syntheticcanary0000000000000016${"Z".repeat(200)}`;
   const context = await collectWith({
     read: threadRead,
@@ -132,7 +201,11 @@ Deno.test("the brief's Cerebras payload carries no quoted-JSON or GitHub credent
         id: "turn-credentials",
         status: "completed",
         items: [
-          { type: "userMessage", id: "u1", content: [{ type: "text", text: `${quoted}\nprogress: the panel renders again` }] },
+          {
+            type: "userMessage",
+            id: "u1",
+            content: [{ type: "text", text: `${quoted}\n${doubledQuotedLine}\n${backslashDoubledLine}\nprogress: the panel renders again` }],
+          },
           { type: "agentMessage", id: "a1", text: `Rotated ${classicTokens.join(", ")} and ${fineGrained}; deno task test passed` },
           { type: "agentMessage", id: "a2", text: straddling },
         ],

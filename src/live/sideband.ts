@@ -5,7 +5,8 @@
 // `new Response(...)` wrapper drops the socket associated with the 101.
 
 import type WebSocket from "ws";
-import { getAuthPoolEntry } from "../codex/auth.ts";
+import { CodexError, getAuthPoolEntry } from "../codex/auth.ts";
+import { getCurrentAccountEntry, getValidAuth } from "../codex/auth-refresh.ts";
 import { openaiError } from "../http.ts";
 import { isRecord } from "../utils.ts";
 import {
@@ -15,7 +16,7 @@ import {
   LIVE_SIDEBAND_PREOPEN_MAX_FRAMES,
   liveSidebandUpstreamHeaders,
   liveSidebandUrl,
-  readLiveCallAccountId,
+  readLiveCallMapping,
 } from "./upstream.ts";
 
 type DownstreamSocket = ReturnType<typeof Deno.upgradeWebSocket>["socket"];
@@ -217,33 +218,64 @@ const bridgeLiveSideband = async (input: LiveSidebandBridge): Promise<void> => {
 
 type LiveCallAccountToken = Readonly<{ ok: true; accessToken: string }> | Readonly<{ ok: false; response: Response }>;
 
-/** The mapped account's current token; a missing account fails closed. */
+const liveCallMissingAccountResponse = (): Response => openaiError(404, "The realtime call's account is no longer configured.", "invalid_request_error");
+
+const liveCallAuthUnavailableResponse = (): Response =>
+  openaiError(503, "Codex auth pool is temporarily unavailable; retry the request.", "codex_auth_missing");
+
+/**
+ * The mapped account's current token. A missing account stays a 404 before the
+ * upgrade, while an unreadable pool or an unrefreshable credential is a
+ * retryable 5xx. The account is re-read by identity and passed through the same
+ * coordinated refresh ordinary inference uses, so a sideband join or reconnect
+ * never dials upstream with an expired cached bearer.
+ */
 const liveCallAccountToken = async (accountId: string): Promise<LiveCallAccountToken> => {
   try {
-    const pool = (await getAuthPoolEntry(true, true)).pool;
-    const account = pool.accounts.find((candidate) => candidate.account_id === accountId);
-    if (!account) return { ok: false, response: openaiError(404, "The realtime call's account is no longer configured.", "invalid_request_error") };
-    return { ok: true, accessToken: account.access_token };
+    const poolEntry = await getAuthPoolEntry(true, true);
+    if (!poolEntry.pool.accounts.some((candidate) => candidate.account_id === accountId)) {
+      return { ok: false, response: liveCallMissingAccountResponse() };
+    }
   } catch {
-    return { ok: false, response: openaiError(503, "Codex auth pool is temporarily unavailable; retry the request.", "codex_auth_missing") };
+    return { ok: false, response: liveCallAuthUnavailableResponse() };
+  }
+  try {
+    const current = await getCurrentAccountEntry(accountId, true);
+    const auth = await getValidAuth(current);
+    return { ok: true, accessToken: auth.access_token };
+  } catch (error) {
+    if (error instanceof CodexError && error.code === "codex_auth_missing") return { ok: false, response: liveCallMissingAccountResponse() };
+    if (error instanceof CodexError) {
+      const status = error.status >= 400 && error.status <= 599 ? error.status : 503;
+      return { ok: false, response: openaiError(status, error.message, error.code) };
+    }
+    return { ok: false, response: liveCallAuthUnavailableResponse() };
   }
 };
 
 /**
  * Joins one call's sideband.
  *
- * A call id with no durable mapping is answered with 404 *before* upgrading:
- * the mapping is the gateway's only routing signal for the upstream account,
- * and the Codex client stops reconnecting on 404/410 exactly as it would for a
- * finished upstream call.
+ * The durable mapping binds the call to the account and gateway principal that
+ * created it. A call id with no mapping is answered with 404 *before*
+ * upgrading: the mapping is the gateway's only routing signal for the upstream
+ * account, and the Codex client stops reconnecting on 404/410 exactly as it
+ * would for a finished upstream call. A join from any other principal - or a
+ * legacy record with no recorded principal, which can never be authorized - is
+ * refused with 403 *before* the upgrade, deliberately without a permissive
+ * compatibility fallback.
  */
-export const handleLiveSideband = async (req: Request, callId: string): Promise<Response> => {
-  const accountId = await readLiveCallAccountId(callId);
-  if (accountId === null) {
+export const handleLiveSideband = async (req: Request, callId: string, principal: string): Promise<Response> => {
+  const mapping = await readLiveCallMapping(callId);
+  if (mapping === null) {
     logLiveSideband("rejected", { call_id: callId, reason: "unknown_call" });
     return openaiError(404, "Unknown realtime call.", "invalid_request_error");
   }
-  const account = await liveCallAccountToken(accountId);
+  if (mapping.principalId === null || mapping.principalId !== principal) {
+    logLiveSideband("rejected", { call_id: callId, reason: mapping.principalId === null ? "principal_missing" : "principal_mismatch" });
+    return openaiError(403, "The realtime call was not created by this gateway principal.", "forbidden");
+  }
+  const account = await liveCallAccountToken(mapping.accountId);
   if (!account.ok) {
     logLiveSideband("rejected", { call_id: callId, reason: "account_unavailable" });
     return account.response;
@@ -253,6 +285,6 @@ export const handleLiveSideband = async (req: Request, callId: string): Promise<
   }
 
   const upgrade = Deno.upgradeWebSocket(req);
-  void bridgeLiveSideband({ downstream: upgrade.socket, callId, accountId, accessToken: account.accessToken });
+  void bridgeLiveSideband({ downstream: upgrade.socket, callId, accountId: mapping.accountId, accessToken: account.accessToken });
   return upgrade.response;
 };

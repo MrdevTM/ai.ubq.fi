@@ -4,7 +4,6 @@ import { config } from "../config.ts";
 import { isRecord } from "../utils.ts";
 import {
   ADDITIONAL_WINDOW_UNANCHORED_TOLERANCE_MS,
-  CODEX_SPARK_LIMIT_NAME,
   PROVIDER_CAPACITY_LAST_AVAILABLE_KEY_PREFIX,
   PROVIDER_CAPACITY_SNAPSHOT_KEY,
   PROVIDER_CAPACITY_SOURCE_STALE_MS,
@@ -117,28 +116,35 @@ const additionalRateLimitsForRouting = (
     ];
   });
 
-const isCodexSparkLimit = (limit: ProviderCapacityAdditionalRateLimit): boolean =>
-  limit.limit_name.trim().toLowerCase() === CODEX_SPARK_LIMIT_NAME.toLowerCase();
-
 /**
- * OpenAI can omit the named Spark window from one account in a pool even when
- * a reachable sibling reports it. Keep the admin snapshot's model rows
- * aligned for the account pool. Routing continues to use only the account's
- * own upstream observation, so this display projection cannot change model
- * selection or quota admission.
+ * Upstream can omit a named rate limit for one account in a pool even when a
+ * reachable sibling reports it. Mirror every named limit a reachable sibling
+ * reports onto the accounts that do not report it so the admin view shows the
+ * pool's meters for every account. This is a display-only admin alignment:
+ * routing and the stored snapshot continue to use each account's own upstream
+ * observation, so this projection cannot change model selection or quota
+ * admission.
  */
-const fillMissingCodexSparkLimitForAdmin = (sources: readonly ProviderCapacityCodexSource[]): readonly ProviderCapacityCodexSource[] => {
-  const sharedSparkLimit = sources
-    .filter((source) => source.state !== "unavailable")
-    .flatMap((source) => source.additional_rate_limits)
-    .find(isCodexSparkLimit);
-  if (!sharedSparkLimit) return sources;
+const fillMissingCodexAdditionalLimitsForAdmin = (sources: readonly ProviderCapacityCodexSource[]): readonly ProviderCapacityCodexSource[] => {
+  const candidates: ProviderCapacityAdditionalRateLimit[] = [];
+  const candidateNames = new Set<string>();
+  for (const source of sources) {
+    if (source.state === "unavailable") continue;
+    for (const limit of source.additional_rate_limits) {
+      // The first occurrence of a normalized name wins, so a later sibling's
+      // differently formatted row cannot replace the reported one.
+      const name = limit.limit_name.trim().toLowerCase();
+      if (candidateNames.has(name)) continue;
+      candidateNames.add(name);
+      candidates.push(limit);
+    }
+  }
+  if (candidates.length === 0) return sources;
   return sources.map((source) => {
-    if (source.state === "unavailable" || source.additional_rate_limits.some(isCodexSparkLimit)) return source;
-    return {
-      ...source,
-      additional_rate_limits: [...source.additional_rate_limits, sharedSparkLimit],
-    };
+    if (source.state === "unavailable") return source;
+    const reportedNames = new Set(source.additional_rate_limits.map((limit) => limit.limit_name.trim().toLowerCase()));
+    const missing = candidates.filter((limit) => !reportedNames.has(limit.limit_name.trim().toLowerCase()));
+    return missing.length === 0 ? source : { ...source, additional_rate_limits: [...source.additional_rate_limits, ...missing] };
   });
 };
 
@@ -398,7 +404,7 @@ const readStoredHistoryPoint = (value: unknown): ProviderCapacityHistoryPoint | 
 export {
   additionalRateLimitsForRouting,
   codexUsageUrl,
-  fillMissingCodexSparkLimitForAdmin,
+  fillMissingCodexAdditionalLimitsForAdmin,
   isSafeTimestamp,
   parseCodexUsage,
   providerCapacityLastAvailableKey,

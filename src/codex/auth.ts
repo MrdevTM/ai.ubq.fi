@@ -10,6 +10,7 @@ import { getKv } from "../kv.ts";
 import { recordCodexProviderHealth } from "../provider/health.ts";
 import { base64UrlDecode, decodeBase64ToString, getString, isRecord, sha256Hex } from "../utils.ts";
 import type { CodexAuthPoolState, CodexAuthState } from "../types.ts";
+import { bindNativeCodexAuthPool } from "./native-auth.ts";
 
 const CODEX_REFRESH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -66,6 +67,8 @@ export type CodexErrorCode =
   | "codex_auth_refresh_failed"
   | "refresh_token_reused"
   | "codex_auth_refresh_unreachable"
+  | "codex_auth_owner_unavailable"
+  | "codex_auth_owner_conflict"
   | "codex_upstream_unreachable"
   | "gateway_timeout";
 
@@ -104,6 +107,15 @@ export const parseCodexAuthFromAuthJson = (value: unknown): Omit<CodexAuthState,
   return { access_token: accessToken, refresh_token: refreshToken, account_id: accountId };
 };
 
+const parseNativeAuthOwner = (value: unknown): CodexAuthState["native_owner"] => {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || !getString(value.codex_home)?.startsWith("/") || !/^[a-f0-9]{64}$/.test(getString(value.generation_hash) ?? "")) {
+    throw new CodexError("Codex native credential ownership is malformed; nothing was replaced.", "codex_auth_owner_unavailable", 503);
+  }
+  const refreshedAt = getString(value.native_refreshed_at);
+  return { codex_home: String(value.codex_home), generation_hash: String(value.generation_hash), ...(refreshedAt ? { native_refreshed_at: refreshedAt } : {}) };
+};
+
 export const parseCodexAuthPool = (value: unknown): CodexAuthPoolState | null => {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null;
   if (value.accounts.length < 1 || value.accounts.length > CODEX_AUTH_POOL_MAX_ACCOUNTS) return null;
@@ -122,11 +134,13 @@ export const parseCodexAuthPool = (value: unknown): CodexAuthPoolState | null =>
       return null;
     }
     accountIds.add(accountId);
+    const owner = parseNativeAuthOwner(candidate.native_owner);
     accounts.push({
       access_token: accessToken,
       refresh_token: refreshToken,
       account_id: accountId,
       updated_at_ms: accountUpdatedAtMs,
+      ...(owner ? { native_owner: owner } : {}),
     });
   }
 
@@ -137,7 +151,16 @@ export const upsertCodexAuthAccount = (pool: CodexAuthPoolState | null, auth: Co
   const accounts = pool ? [...pool.accounts] : [];
   const matchingIndex = accounts.findIndex((candidate) => candidate.account_id === auth.account_id);
   if (matchingIndex >= 0) {
-    accounts[matchingIndex] = auth;
+    const previous = accounts[matchingIndex];
+    const sameTokens = previous.access_token === auth.access_token && previous.refresh_token === auth.refresh_token;
+    if (
+      previous.native_owner &&
+      !sameTokens &&
+      (auth.native_owner?.codex_home !== previous.native_owner.codex_home || (getJwtExpMs(auth.access_token) ?? 0) < (getJwtExpMs(previous.access_token) ?? 0))
+    ) {
+      throw new CodexError("The native Codex owner must advance this account's credentials before replacement.", "codex_auth_owner_conflict", 409);
+    }
+    accounts[matchingIndex] = previous.native_owner && sameTokens ? { ...auth, native_owner: previous.native_owner } : auth;
   } else if (accounts.length < CODEX_AUTH_POOL_MAX_ACCOUNTS) {
     accounts.push(auth);
   } else {
@@ -520,7 +543,8 @@ const loadAuthPoolEntry = async (generationAtStart: number): Promise<CodexAuthPo
     // A valid persisted pool is the authority. Local/disk seeds may bootstrap
     // an absent row or run without KV, but must never overwrite or append to
     // credentials an admin has already uploaded.
-    return loadedAuthPoolEntry(storedPool, generationAtStart, kv, entry);
+    const nativeEntry = await bindNativeCodexAuthPool({ pool: storedPool, kv, entry });
+    return loadedAuthPoolEntry(nativeEntry.pool, generationAtStart, kv, nativeEntry.entry);
   }
 
   const seed = getConfiguredCodexAuthSeed();
@@ -531,8 +555,9 @@ const loadAuthPoolEntry = async (generationAtStart: number): Promise<CodexAuthPo
     return { kv: null, entry: null, pool: cachedAuthPool };
   }
   const pool = poolFromSeed(seed);
-  await kv.set(CODEX_AUTH_POOL_KV_KEY, pool);
-  return loadedAuthPoolEntry(pool, generationAtStart, kv, null);
+  const seeded = await kv.set(CODEX_AUTH_POOL_KV_KEY, pool);
+  const nativeEntry = await bindNativeCodexAuthPool({ kv, pool, entry: { key: CODEX_AUTH_POOL_KV_KEY, value: pool, versionstamp: seeded.versionstamp } });
+  return loadedAuthPoolEntry(nativeEntry.pool, generationAtStart, kv, nativeEntry.entry);
 };
 
 const getAuthPoolEntry = async (forceKv = false, bypassInFlight = false): Promise<CodexAuthPoolEntry> => {
