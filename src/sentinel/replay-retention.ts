@@ -176,7 +176,7 @@ export const pruneCaptureOwnedStatusMetadata = async (
   if (initial.kind === "corrupt") return 0;
   const ledger = withBudget(initial.ledger, budgetBytes);
   if (ledger.status_records + extraRecords <= SENTINEL_REPLAY_MAX_STATUS_RECORDS && ledger.metadata_bytes + extraBytes <= reserve) return 0;
-  if (!(await reconcileSentinelReplayStatusMetadata(kv, budgetBytes))) return 0;
+  if ((await reconcileSentinelReplayStatusMetadata(kv, budgetBytes)) === "failed") return 0;
   let deleted = 0;
   for (const candidate of await statusCandidates(kv)) {
     if (deleted >= maxDeletes) break;

@@ -1006,18 +1006,22 @@ const capacityProviderStatus = (source, provider) => {
   const health = provider?.health ?? provider ?? null;
   const state = provider?.configured === false ? "unconfigured" : health?.state;
   const hasState = typeof state === "string" && state.trim().length > 0;
+  const quotaReachable = source.source === "codex" && source.state === "available" &&
+    health?.last_event === "reachable" && health.last_status === 200 && health.stale === false &&
+    provider?.access_token_expired === false && provider.access_token_exp_ms > Date.now();
   let badgeState = capacityBadgeState(source.state);
-  if (hasState) {
+  if (hasState && !quotaReachable) {
     badgeState = providerBadgeState(state);
     if (source.state !== "available" && badgeState === "ok") badgeState = "unknown";
   }
-  const healthLabel = hasState ? providerStateLabel({ ...health, state }) : "";
+  const healthLabel = quotaReachable ? "Reachable" : hasState ? providerStateLabel({ ...health, state }) : "";
   return {
     badgeState,
     label: healthLabel && healthLabel !== "unknown"
       ? `${healthLabel} · ${capacityStateLabel(source.state)}`
       : capacityStateLabel(source.state),
     health,
+    quotaReachable,
   };
 };
 
@@ -1037,11 +1041,13 @@ const appendCapacitySourceMeta = (row, source, provider = null) => {
     appendProviderFact(facts, "Token expires", formatDate(provider?.access_token_exp_ms));
     appendProviderFact(
       facts,
-      "Refresh",
+      "Last refresh attempt",
       health.last_refresh_succeeded === true
         ? `Succeeded · ${formatDate(health.last_refresh_at_ms)}`
         : health.last_refresh_succeeded === false
-        ? `Failed · ${formatDate(health.last_refresh_at_ms)}`
+        ? `Failed · ${formatDate(health.last_refresh_at_ms)}${
+          capacityProviderStatus(source, provider).quotaReachable ? " · Quota reads currently succeed" : ""
+        }`
         : "Not observed",
     );
   } else if (source.source === "metered") {
