@@ -2,6 +2,7 @@
 
 import { getString, isRecord } from "../utils.ts";
 import { CodexAuthPoolState, CodexAuthState } from "../types.ts";
+import { parseCodexAuthPool } from "./auth.ts";
 import {
   CodexAccountRoutingState,
   CodexActiveAccountSnapshot,
@@ -313,7 +314,6 @@ const classifyCodexRouteSelection = (
 const parseCodexAuthPoolSnapshot = (value: unknown): CodexAuthPoolState | null => {
   if (!isRecord(value) || !Array.isArray(value.accounts) || !isSafeMs(value.updated_at_ms) || value.accounts.length < 1) return null;
   const accountIds = new Set<string>();
-  const accounts: CodexAuthState[] = [];
   for (const candidate of value.accounts) {
     if (!isRecord(candidate)) return null;
     const accountId = getString(candidate.account_id);
@@ -321,9 +321,9 @@ const parseCodexAuthPoolSnapshot = (value: unknown): CodexAuthPoolState | null =
     const refreshToken = getString(candidate.refresh_token);
     if (!accountId || !accessToken || !refreshToken || !isSafeMs(candidate.updated_at_ms) || accountIds.has(accountId)) return null;
     accountIds.add(accountId);
-    accounts.push({ account_id: accountId, access_token: accessToken, refresh_token: refreshToken, updated_at_ms: candidate.updated_at_ms });
   }
-  return { accounts, updated_at_ms: value.updated_at_ms };
+  // Preserve validated ownership and the canonical maximum-pool bound.
+  return parseCodexAuthPool(value);
 };
 
 const routingStateChangedByNormalization = (durable: CodexAccountRoutingState | null, normalized: CodexAccountRoutingState): boolean => {

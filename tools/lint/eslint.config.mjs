@@ -283,6 +283,15 @@ export default tsEslint.config(
     },
   },
   {
+    // DIVERGENCE: this presenter regression executes only bounded functions
+    // from the tracked static/admin.js text in a fixture VM. No user input,
+    // application bootstrap, credentials or network enter that context.
+    // Measured 2026-10-03: the shipped status/DOM cases pass; code-eval alone
+    // flags this intentional execution. Keep the exception to this one test.
+    files: ["tests/admin-capacity-status.test.ts"],
+    rules: { "sonarjs/code-eval": "off" },
+  },
+  {
     // ---------------------------------------------------------------------
     // DELIBERATE-BY-DESIGN exemptions. These tests assert that the gateway
     // rejects or relays fake credentials, so the credential-shaped values are

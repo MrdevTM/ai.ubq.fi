@@ -6,6 +6,24 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## Analytics drops the Quota forecast card and the Metered capacity panels - 2026-10-03
+
+The admin Analytics view no longer renders the "Quota forecast" (quota runway) card, and the Provider analytics card
+renders only the two Codex pool accounts: the "Metered 2 refill" chart series and legend entry, the "Metered 2" and
+"Metered 1" (surplus) capacity rows, the metered staleness caption note, and the client-side quota-projection fetch,
+snapshot-cache restore, visible-poll refresh, and app-resume refresh are removed. The quota-projection HTTP endpoints
+and `src/quota-projection.ts` remain for operator and backfill use, and the Metered wallet/paid-fallback surfaces in the
+Defaults and Providers views are unchanged. This supersedes the 2026-10-02 "Admin Analytics quota panels refresh on a
+visible poll and on app resume" decision only where it named the quota runway panel; provider health and provider
+capacity keep the 30-second visible poll and the resume refresh.
+
+Reason: the owner reported that the quota forecast and Metered 1/2 "never showed any useful info" and asked for their
+removal from Analytics (2026-10-03).
+
+Reversal risk: restoring the card re-adds the fetch, cache restore, and resume hook; the removed refill series was
+Analytics' only rendering of the Metered wallet refill cycle, so metered wallet state is now observable only in the
+Defaults metered-quota panel.
+
 ## Normal capacity reads revalidate Codex quota on a 30-second freshness window - 2026-10-02
 
 `GET /admin/providers/capacity` serves the persisted snapshot only while it is younger than

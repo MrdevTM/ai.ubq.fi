@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import { SENTINEL_REPLAY_MAX_STATUS_RECORDS } from "../src/sentinel/replay-limits.ts";
 import { SENTINEL_REPLAY_REQUEST_PREFIX, type SentinelReplayCaptureStatusRow } from "../src/sentinel/replay-model.ts";
 import { reconcileSentinelReplayStatusMetadata } from "../src/sentinel/replay-retention-metadata.ts";
-import { admitSentinelReplayStatusMetadata, runSentinelReplayRetentionMaintenance } from "../src/sentinel/replay-retention.ts";
+import { admitSentinelReplayStatusMetadata, pruneCaptureOwnedStatusMetadata, runSentinelReplayRetentionMaintenance } from "../src/sentinel/replay-retention.ts";
 import {
   readSentinelReplayLedgerSnapshot,
+  SENTINEL_REPLAY_BUDGET_LEDGER_KEY,
   SENTINEL_REPLAY_EVICTION_PREFIX,
   SENTINEL_REPLAY_EXPIRED_REASON,
   sentinelReplayMetadataReserve,
@@ -99,6 +100,84 @@ const liveMetadata = async (kv: Deno.Kv): Promise<Readonly<{ records: number; by
   }
   return { records, bytes };
 };
+
+const seedOverCapMetadata = async (kv: Deno.Kv, budgetBytes: number): Promise<number> => {
+  await runSentinelReplayRetentionMaintenance(kv, { now_ms: NOW, budget_bytes: budgetBytes });
+  const initial = await ledgerOf(kv, budgetBytes);
+  let bytes = 0;
+  for (let start = 0; start < SENTINEL_REPLAY_MAX_STATUS_RECORDS; start += 128) {
+    const operation = kv.atomic();
+    for (let index = start; index < Math.min(start + 128, SENTINEL_REPLAY_MAX_STATUS_RECORDS); index += 1) {
+      const row = statusRow(`legacy-status-${index.toString().padStart(5, "0")}`);
+      operation.set(sentinelReplayRequestStatusKey(row.request_id), row);
+      bytes += sentinelReplayStatusMetadataBytes(row);
+    }
+    assert.equal((await operation.commit()).ok, true);
+  }
+  const tombstones = kv.atomic();
+  for (let index = 1; index <= 32; index += 1) {
+    const row = { ...tombstoneRow(index), evicted_at_ms: NOW - 1 };
+    tombstones.set([...SENTINEL_REPLAY_EVICTION_PREFIX, row.fingerprint], row);
+    bytes += sentinelReplayStatusMetadataBytes(row);
+  }
+  assert.equal((await tombstones.commit()).ok, true);
+  await kv.set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, { ...initial.ledger, status_records: SENTINEL_REPLAY_MAX_STATUS_RECORDS + 32, metadata_bytes: bytes });
+  return bytes;
+};
+
+Deno.test({
+  name: "native over-cap metadata makes bounded pruning progress without relaxing admission limits",
+  ignore: !kvAvailable,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const kv = await Deno.openKv(":memory:");
+    const budgetBytes = 1_024 * 1_024 * 1_024;
+    try {
+      const seededBytes = await seedOverCapMetadata(kv, budgetBytes);
+      assert.equal((await liveMetadata(kv)).records, SENTINEL_REPLAY_MAX_STATUS_RECORDS + 32);
+      const beforeScan = await ledgerOf(kv, budgetBytes);
+      assert.equal(await reconcileSentinelReplayStatusMetadata(kv, budgetBytes), "over_limit");
+      assert.deepEqual(await ledgerOf(kv, budgetBytes), beforeScan, "an over-cap scan checks the ledger without writing partial totals");
+      const beforeBytes = seededBytes + (await verifyOverCapCas(kv, budgetBytes));
+      let removedBytes = 0;
+      for (let pass = 0; pass < 2; pass += 1) {
+        assert.equal(await pruneCaptureOwnedStatusMetadata(kv, NOW + pass, 0, 0, 16, budgetBytes), 16);
+        for (let index = pass * 16 + 1; index <= (pass + 1) * 16; index += 1) {
+          const row = { ...tombstoneRow(index), evicted_at_ms: NOW - 1 };
+          assert.equal((await kv.get([...SENTINEL_REPLAY_EVICTION_PREFIX, row.fingerprint])).value, null);
+          removedBytes += sentinelReplayStatusMetadataBytes(row);
+        }
+        const after = await ledgerOf(kv, budgetBytes);
+        assert.equal(after.ledger.status_records, SENTINEL_REPLAY_MAX_STATUS_RECORDS + 32 - (pass + 1) * 16);
+        assert.equal(after.ledger.metadata_bytes, beforeBytes - removedBytes, "only committed row deletions change the charge, never a partial recount");
+        assert.equal(after.ledger.status_pruned_records, (pass + 1) * 16);
+      }
+      const row = statusRow("legacy-after-pruning");
+      // The 8 KiB per-row charge still exceeds the fixed 64 MiB reserve. An
+      // admission makes one more bounded deletion and keeps refusing that bound.
+      assert.equal(
+        await admitSentinelReplayStatusMetadata(kv, {
+          key: sentinelReplayRequestStatusKey(row.request_id),
+          row,
+          now_ms: NOW + 2,
+          ttl_ms: 60_000,
+          budget_bytes: budgetBytes,
+        }),
+        false
+      );
+      const after = await ledgerOf(kv, budgetBytes);
+      const expected = await liveMetadata(kv);
+      assert.equal(after.ledger.status_records, SENTINEL_REPLAY_MAX_STATUS_RECORDS - 1);
+      assert.equal(after.ledger.status_records, expected.records);
+      assert.equal(after.ledger.metadata_bytes, expected.bytes);
+      assert.equal(after.ledger.status_pruned_records, 33);
+      assert.equal((await kv.get(sentinelReplayRequestStatusKey(row.request_id))).value, null);
+    } finally {
+      kv.close();
+    }
+  },
+});
 
 const verifyMaintenanceExpiry = async (kv: Deno.Kv): Promise<void> => {
   await waitForExpiry(kv, await expiringMetadata(kv));
@@ -194,6 +273,38 @@ const observeCommits = (kv: Deno.Kv, observation: CommitObservation): Deno.Kv =>
     },
   });
 
+const verifyOverCapCas = async (kv: Deno.Kv, budgetBytes: number): Promise<number> => {
+  const before = await ledgerOf(kv, budgetBytes);
+  const row = statusRow("legacy-status-00000");
+  const key = sentinelReplayRequestStatusKey(row.request_id);
+  const entry = await kv.get(key);
+  const updated = { ...row, reason: "concurrent_metadata_fixture" };
+  const delta = sentinelReplayStatusMetadataBytes(updated) - sentinelReplayStatusMetadataBytes(row);
+  const outcomes: boolean[] = [];
+  const wrapped = observeCommits(kv, {
+    before: async () => {
+      const result = await kv
+        .atomic()
+        .check({ key: SENTINEL_REPLAY_BUDGET_LEDGER_KEY, versionstamp: before.versionstamp })
+        .check({ key, versionstamp: entry.versionstamp })
+        .set(key, updated)
+        .set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, { ...before.ledger, metadata_bytes: before.ledger.metadata_bytes + delta })
+        .commit();
+      assert.equal(result.ok, true);
+    },
+    after: (result) => {
+      outcomes.push(result.ok);
+    },
+  });
+  assert.equal(await pruneCaptureOwnedStatusMetadata(wrapped, NOW, 0, 0, 16, budgetBytes), 0);
+  assert.deepEqual(outcomes, [false], "a native ledger race also rejects an over-cap scan before pruning");
+  const after = await ledgerOf(kv, budgetBytes);
+  assert.equal(after.ledger.status_records, before.ledger.status_records);
+  assert.equal(after.ledger.metadata_bytes, before.ledger.metadata_bytes + delta);
+  assert.equal(after.ledger.status_pruned_records, 0);
+  return delta;
+};
+
 Deno.test({
   name: "a concurrent native status admission invalidates the whole metadata recount CAS",
   ignore: !kvAvailable,
@@ -212,14 +323,14 @@ Deno.test({
     });
     try {
       assert.equal(await admitStatus(kv, "before-recount"), true);
-      assert.equal(await reconcileSentinelReplayStatusMetadata(wrapped, BUDGET_BYTES), false);
+      assert.equal(await reconcileSentinelReplayStatusMetadata(wrapped, BUDGET_BYTES), "failed");
       assert.deepEqual(outcomes, [false], "the real native ledger version check rejects the stale scanned totals");
       const expected = await liveMetadata(kv);
       const after = await ledgerOf(kv);
       assert.equal(expected.records, 2);
       assert.equal(after.ledger.status_records, expected.records);
       assert.equal(after.ledger.metadata_bytes, expected.bytes);
-      assert.equal(await reconcileSentinelReplayStatusMetadata(kv, BUDGET_BYTES), true);
+      assert.equal(await reconcileSentinelReplayStatusMetadata(kv, BUDGET_BYTES), "reconciled");
     } finally {
       kv.close();
     }
@@ -242,10 +353,11 @@ async function* interruptedList(kv: Deno.Kv, selector: Deno.KvListSelector, opti
   }
 }
 
-async function* overLimitRows(limit: number) {
+async function* overLimitRows(limit: number, corruptWitness = false) {
   for (let index = 0; index < limit; index += 1) {
     const row = statusRow(`scan-bound-${index}`);
-    yield await Promise.resolve({ key: sentinelReplayRequestStatusKey(row.request_id), value: row, versionstamp: "fixture" });
+    const value = corruptWitness && index === SENTINEL_REPLAY_MAX_STATUS_RECORDS ? { ...row, request_id: "wrong-witness-owner" } : row;
+    yield await Promise.resolve({ key: sentinelReplayRequestStatusKey(row.request_id), value, versionstamp: "fixture" });
   }
 }
 
@@ -261,12 +373,14 @@ Deno.test({
       const before = await ledgerOf(kv);
       const corruptKey = sentinelReplayRequestStatusKey("wrong-key-owner");
       await kv.set(corruptKey, statusRow("different-owner"));
-      assert.equal(await reconcileSentinelReplayStatusMetadata(kv, BUDGET_BYTES), false);
+      assert.equal(await reconcileSentinelReplayStatusMetadata(kv, BUDGET_BYTES), "failed");
       assert.deepEqual(await ledgerOf(kv), before);
+      assert.equal(await pruneCaptureOwnedStatusMetadata(kv, NOW, SENTINEL_REPLAY_MAX_STATUS_RECORDS, 0, 16, BUDGET_BYTES), 0);
       await kv.delete(corruptKey);
 
       const failed = withList(kv, (selector, options) => interruptedList(kv, selector, options));
-      assert.equal(await reconcileSentinelReplayStatusMetadata(failed, BUDGET_BYTES), false);
+      assert.equal(await reconcileSentinelReplayStatusMetadata(failed, BUDGET_BYTES), "failed");
+      assert.equal(await pruneCaptureOwnedStatusMetadata(failed, NOW, SENTINEL_REPLAY_MAX_STATUS_RECORDS, 0, 16, BUDGET_BYTES), 0);
       assert.deepEqual(await ledgerOf(kv), before);
 
       const requested: Deno.KvListOptions[] = [];
@@ -274,10 +388,31 @@ Deno.test({
         requested.push(options ?? {});
         return overLimitRows(Math.min(options?.limit ?? 0, SENTINEL_REPLAY_MAX_STATUS_RECORDS + 1));
       });
-      assert.equal(await reconcileSentinelReplayStatusMetadata(overLimit, BUDGET_BYTES), false);
+      assert.equal(await reconcileSentinelReplayStatusMetadata(overLimit, BUDGET_BYTES), "over_limit");
       assert.deepEqual(await ledgerOf(kv), before);
       assert.equal(requested[0].consistency, "strong");
       assert.equal(requested[0].limit, SENTINEL_REPLAY_MAX_STATUS_RECORDS + 1);
+      const corruptWitness = withList(kv, (_selector, options) => overLimitRows(options?.limit ?? 0, true));
+      assert.equal(await reconcileSentinelReplayStatusMetadata(corruptWitness, BUDGET_BYTES), "failed");
+      assert.equal(await pruneCaptureOwnedStatusMetadata(corruptWitness, NOW, SENTINEL_REPLAY_MAX_STATUS_RECORDS, 0, 16, BUDGET_BYTES), 0);
+      assert.deepEqual(await ledgerOf(kv), before);
+      const unreadable = new Proxy(kv, {
+        get(target, property) {
+          if (property === "get") return () => Promise.reject(new Error("metadata_fixture_read_failure"));
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      assert.equal(await reconcileSentinelReplayStatusMetadata(unreadable, BUDGET_BYTES), "failed");
+      await assert.rejects(
+        pruneCaptureOwnedStatusMetadata(unreadable, NOW, SENTINEL_REPLAY_MAX_STATUS_RECORDS, 0, 16, BUDGET_BYTES),
+        /metadata_fixture_read_failure/
+      );
+      assert.deepEqual(await ledgerOf(kv), before);
+      await kv.set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, { ...before.ledger, status_records: -1 });
+      assert.equal(await reconcileSentinelReplayStatusMetadata(kv, BUDGET_BYTES), "failed");
+      assert.equal(await pruneCaptureOwnedStatusMetadata(kv, NOW, SENTINEL_REPLAY_MAX_STATUS_RECORDS, 0, 16, BUDGET_BYTES), 0);
+      assert.equal((await kv.get<{ status_records: number }>(SENTINEL_REPLAY_BUDGET_LEDGER_KEY)).value?.status_records, -1);
     } finally {
       kv.close();
     }
