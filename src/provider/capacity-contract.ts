@@ -26,7 +26,6 @@ export const PROVIDER_CAPACITY_CODEX_TIMEOUT_MS = 8_000;
 export const PROVIDER_CAPACITY_RATE_LIMIT_RESET_MIN_GAIN_PERCENTAGE_POINTS = 25;
 
 export const ADDITIONAL_WINDOW_UNANCHORED_TOLERANCE_MS = 60_000;
-export const CODEX_SPARK_LIMIT_NAME = "GPT-5.3-Codex-Spark";
 export const SHA256_HEX = /^[a-f0-9]{64}$/;
 
 export type CapacityState = "available" | "stale" | "unavailable";
