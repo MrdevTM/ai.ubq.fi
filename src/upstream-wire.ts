@@ -37,6 +37,8 @@ const REDACTED_UPSTREAM_DIAGNOSTIC_CODES = new Set<string>([
   "codex_auth_refresh_failed",
   "refresh_token_reused",
   "codex_auth_refresh_unreachable",
+  "codex_auth_owner_unavailable",
+  "codex_auth_owner_conflict",
   "codex_upstream_unreachable",
   "gateway_timeout",
   "invalid_api_key",

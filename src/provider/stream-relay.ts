@@ -242,6 +242,8 @@ export const relayChatCompletionStream = (
           return;
         }
         if (frame.kind === "done") {
+          iterator = null;
+          await frames.return();
           await finishStream(controller);
           return;
         }
@@ -557,6 +559,8 @@ export const relayResponsesStream = (
           }
           const frame = next.value;
           if (frame.kind === "done") {
+            iterator = null;
+            await frames.return();
             await finishStream(controller);
             return;
           }

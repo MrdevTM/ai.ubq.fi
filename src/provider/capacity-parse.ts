@@ -116,38 +116,6 @@ const additionalRateLimitsForRouting = (
     ];
   });
 
-/**
- * Upstream can omit a named rate limit for one account in a pool even when a
- * reachable sibling reports it. Mirror every named limit a reachable sibling
- * reports onto the accounts that do not report it so the admin view shows the
- * pool's meters for every account. This is a display-only admin alignment:
- * routing and the stored snapshot continue to use each account's own upstream
- * observation, so this projection cannot change model selection or quota
- * admission.
- */
-const fillMissingCodexAdditionalLimitsForAdmin = (sources: readonly ProviderCapacityCodexSource[]): readonly ProviderCapacityCodexSource[] => {
-  const candidates: ProviderCapacityAdditionalRateLimit[] = [];
-  const candidateNames = new Set<string>();
-  for (const source of sources) {
-    if (source.state === "unavailable") continue;
-    for (const limit of source.additional_rate_limits) {
-      // The first occurrence of a normalized name wins, so a later sibling's
-      // differently formatted row cannot replace the reported one.
-      const name = limit.limit_name.trim().toLowerCase();
-      if (candidateNames.has(name)) continue;
-      candidateNames.add(name);
-      candidates.push(limit);
-    }
-  }
-  if (candidates.length === 0) return sources;
-  return sources.map((source) => {
-    if (source.state === "unavailable") return source;
-    const reportedNames = new Set(source.additional_rate_limits.map((limit) => limit.limit_name.trim().toLowerCase()));
-    const missing = candidates.filter((limit) => !reportedNames.has(limit.limit_name.trim().toLowerCase()));
-    return missing.length === 0 ? source : { ...source, additional_rate_limits: [...source.additional_rate_limits, ...missing] };
-  });
-};
-
 const parseCodexUsage = (
   value: unknown
 ): Readonly<{
@@ -404,7 +372,6 @@ const readStoredHistoryPoint = (value: unknown): ProviderCapacityHistoryPoint | 
 export {
   additionalRateLimitsForRouting,
   codexUsageUrl,
-  fillMissingCodexAdditionalLimitsForAdmin,
   isSafeTimestamp,
   parseCodexUsage,
   providerCapacityLastAvailableKey,

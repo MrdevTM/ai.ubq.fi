@@ -159,7 +159,7 @@ const toast = (options) => showToast(options);
 toast.success = (title, options = {}) => showToast({ ...options, type: "success", title });
 toast.error = (title, options = {}) => showToast({ ...options, type: "error", title });
 toast.info = (title, options = {}) => showToast({ ...options, type: "info", title });
-toast.loading = (title, options = {}) => showToast({ ...options, type: "info", title, duration: Infinity });
+toast.loading = (title, options = {}) => showToast({ ...options, type: "info", title, duration: 0 });
 
 toast.dismiss = (handle) => handle?.dismiss?.();
 toast.dismissAll = () => {

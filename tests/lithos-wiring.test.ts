@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 
 import { LITHOS_CHAT_COMPLETIONS_URL, LITHOS_MODEL_IDS, LITHOS_RATE_LIMIT_HEADERS } from "../src/provider/lithos.ts";
-import { clearLithosFailoverWindows, lithosRateLimitSnapshot, lithosRateLimitWait } from "../src/provider/lithos-rate-limits.ts";
+import {
+  clearLithosFailoverWindows,
+  lithosFailoverTargetAt,
+  lithosOpenFailoverWindow,
+  lithosRateLimitSnapshot,
+  lithosRateLimitWait,
+} from "../src/provider/lithos-rate-limits.ts";
 import { setKvForTest } from "../src/kv.ts";
 import { handleResponses } from "../src/responses-handler.ts";
 import { handleChatCompletions } from "../src/chat/envelope.ts";
@@ -742,6 +748,48 @@ Deno.test("lithos rate-limit waits follow the vendor's own header precedence", (
   // given an invented one.
   assert.equal(wait({ "retry-after-ms": "5", "x-should-retry": "false" }), null);
   assert.equal(wait({}), null);
+});
+
+Deno.test("lithos rate-limit numeric headers reject nonfinite waits and retain finite precedence", () => {
+  const oversizedDigits = "9".repeat(309);
+  const overflowSeconds = "9".repeat(308);
+  const wait = (headers: Record<string, string>) => lithosRateLimitWait(new Headers(headers), 1_000);
+  assert.equal(Number.isFinite(Number(oversizedDigits)), false);
+  assert.equal(Number.isFinite(Number(overflowSeconds)), true);
+  assert.equal(wait({ "retry-after-ms": oversizedDigits }), null);
+  assert.equal(wait({ "retry-after": oversizedDigits }), null);
+  assert.equal(wait({ "retry-after": overflowSeconds }), null);
+  assert.equal(wait({ "x-ratelimit-reset-tokens": `${oversizedDigits}s` }), null);
+  assert.deepEqual(wait({ "retry-after-ms": oversizedDigits, "retry-after": "9", "x-ratelimit-reset-tokens": "30s" }), {
+    waitMs: 9_000,
+    source: "retry-after",
+  });
+  assert.deepEqual(wait({ "retry-after": overflowSeconds, "x-ratelimit-reset-tokens": "1.25s", "x-ratelimit-reset-requests": "750ms" }), {
+    waitMs: 1_250,
+    source: "x-ratelimit-reset-tokens",
+  });
+  assert.deepEqual(wait({ "retry-after-ms": overflowSeconds }), { waitMs: Number(overflowSeconds), source: "retry-after-ms" });
+  assert.deepEqual(wait({ "retry-after-ms": "90000", "retry-after": "120" }), { waitMs: 90_000, source: "retry-after-ms" });
+});
+
+Deno.test("lithos rate-limit numeric windows reject nonfinite deadlines and keep finite expiry", () => {
+  clearLithosFailoverWindows();
+  try {
+    for (const waitMs of [Infinity, -Infinity, NaN]) {
+      lithosOpenFailoverWindow(LITHOS_MODEL, 1_000, waitMs, LITHOS_SIBLING_MODEL);
+      assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 1_000), null);
+    }
+    lithosOpenFailoverWindow(LITHOS_MODEL, Number.MAX_VALUE, Number.MAX_VALUE, LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, Number.MAX_VALUE), null);
+
+    // Sticky routing follows a finite vendor window even beyond the inline wait cap.
+    lithosOpenFailoverWindow(LITHOS_MODEL, 1_000, 90_000, LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 1_000), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 90_999), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 91_000), null);
+  } finally {
+    clearLithosFailoverWindows();
+  }
 });
 
 Deno.test("lithos rate-limit snapshots capture the vendor's own budgets, bounded", () => {
