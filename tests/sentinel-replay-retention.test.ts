@@ -35,6 +35,8 @@ import {
 import {
   readSentinelReplayLedgerSnapshot,
   setSentinelReplayBudgetForTest,
+  sentinelReplayAccountingKey,
+  sentinelReplayManifestCharge,
   sentinelReplayRequestStatusKey,
   sentinelReplayStatusMetadataBytes,
   SENTINEL_REPLAY_ACCOUNTING_REASON,
@@ -374,12 +376,32 @@ Deno.test({
         ciphertext_bytes: 100,
       };
       await kv.set([...SENTINEL_REPLAY_MANIFEST_PREFIX, capturedAtMs, legacy.fingerprint, legacy.capture_id], legacy);
+      await kv.set([...SENTINEL_REPLAY_CHUNK_PREFIX, legacy.capture_id, 0], new Uint8Array(legacy.ciphertext_bytes));
       const retained = await runSentinelReplayRetentionMaintenance(kv, { now_ms: capturedAtMs + 1_000, budget_bytes: SENTINEL_REPLAY_BUDGET_BYTES });
       assert.equal(retained.state, "ok");
       assert.equal(retained.accounting_complete, true);
       assert.equal((retained.stored_bytes ?? 0) > 0, true, "legacy retained bytes must be accounted, not assumed zero");
       assert.equal(retained.records, 1);
       assert.equal((await firstManifestKey(kv)) !== null, true);
+      const accountingKey = sentinelReplayAccountingKey(capturedAtMs, legacy.capture_id);
+      const accounting = await kv.get<SentinelReplayAccountingRow>(accountingKey);
+      assert.equal(accounting.value?.state, "stored", "a legacy charge must have a durable owner that reclamation can select");
+      assert.equal(accounting.value.bytes, sentinelReplayManifestCharge(legacy));
+      assert.equal(accounting.value.request_id, "", "an absent legacy owner must not become an invented request id");
+      assert.equal(accounting.value.expires_at_ms, legacy.expires_at_ms);
+
+      const expired = await reclaimExpiredSentinelReplays(kv, { now_ms: legacy.expires_at_ms + 1, budget_bytes: SENTINEL_REPLAY_BUDGET_BYTES });
+      assert.equal(expired.records, 1);
+      assert.equal((await kv.get(accountingKey)).value, null);
+      assert.equal((await kv.get([...SENTINEL_REPLAY_CHUNK_PREFIX, legacy.capture_id, 0])).value, null);
+      assert.equal(await firstManifestKey(kv), null);
+      assert.equal((await kv.get(sentinelReplayRequestStatusKey(""))).value, null, "ownerless cleanup must not write an empty request status");
+      const released = await runSentinelReplayRetentionMaintenance(kv, { now_ms: legacy.expires_at_ms + 2, budget_bytes: SENTINEL_REPLAY_BUDGET_BYTES });
+      assert.equal(released.stored_bytes, 0);
+      assert.equal(released.records, 0);
+      assert.equal(released.expired_records, 1);
+      assert.equal(released.evicted_records, 0);
+      assert.equal(released.status_records, 1, "only the fingerprint tombstone is retained without a request owner");
     } finally {
       kv.close();
       setKvForTest(null);
@@ -525,7 +547,9 @@ Deno.test({
       const fence = admission.accounting.fence;
 
       const firstAdvance = await advanceSentinelReplayStagingFence(kv, { accounting_key: key, fence, now_ms: now, budget_bytes: TEST_BUDGET_BYTES });
-      assert.deepEqual(firstAdvance, { ok: true, stage: 1 });
+      assert.equal(firstAdvance.ok, true);
+      assert.equal(firstAdvance.stage, 1);
+      assert.equal(firstAdvance.versionstamp, (await kv.get(key)).versionstamp);
       await writeChunkRows(kv, "paused-writer", 2);
 
       // The reaper fences the paused writer off. One bounded pass leaves a chunk
@@ -1027,6 +1051,178 @@ Deno.test({
     } finally {
       kv.close();
       setKvForTest(null);
+    }
+  },
+});
+
+const legacyManifestFor = (index: number, capturedAtMs: number, requestId?: string): SentinelReplayManifest => ({
+  version: 1,
+  capture_id: `legacy-bootstrap-${index}`,
+  fingerprint: index.toString(16).padStart(64, "0"),
+  case_group_digest: "c".repeat(64),
+  captured_at_ms: capturedAtMs,
+  expires_at_ms: capturedAtMs + SENTINEL_REPLAY_TTL_MS,
+  algorithm: "AES-256-GCM",
+  compression: "gzip",
+  iv: base64UrlEncode(new Uint8Array(12)),
+  chunk_count: 1,
+  ciphertext_bytes: 100,
+  ...(requestId === undefined ? {} : { request_id: requestId }),
+});
+
+const legacyManifestKey = (manifest: SentinelReplayManifest): Deno.KvKey => [
+  ...SENTINEL_REPLAY_MANIFEST_PREFIX,
+  manifest.captured_at_ms,
+  manifest.fingerprint,
+  manifest.capture_id,
+];
+
+type BootstrapCommitObservation = {
+  materializes: boolean;
+  beforeCommit: () => Promise<void>;
+  afterCommit: (result: Deno.KvCommitResult | Deno.KvCommitError) => void;
+};
+
+/** Observe and interleave a real native bootstrap commit, retaining every chained operation. */
+const observedBootstrapAtomic = (operation: Deno.AtomicOperation, observation: BootstrapCommitObservation): Deno.AtomicOperation =>
+  new Proxy(operation, {
+    get(target, property) {
+      if (property === "commit") {
+        return async () => {
+          if (observation.materializes) await observation.beforeCommit();
+          const result = await target.commit();
+          if (observation.materializes) observation.afterCommit(result);
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const [key] = args;
+        if (property === "set" && Array.isArray(key) && key[3] === "accounting") observation.materializes = true;
+        return observedBootstrapAtomic(Reflect.apply(value, target, args) as Deno.AtomicOperation, observation);
+      };
+    },
+  });
+
+const observeBootstrapCommits = (
+  kv: Deno.Kv,
+  beforeCommit: () => Promise<void>,
+  afterCommit: (result: Deno.KvCommitResult | Deno.KvCommitError) => void
+): Deno.Kv =>
+  new Proxy(kv, {
+    get(target, property) {
+      if (property === "atomic") return () => observedBootstrapAtomic(target.atomic(), { materializes: false, beforeCommit, afterCommit });
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+Deno.test({
+  name: "a bootstrapped legacy capture with an owner is evicted and releases its charge once",
+  ignore: !kvAvailable,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const kv = await Deno.openKv(":memory:");
+    const now = 1_701_100_000_000;
+    const legacy = legacyManifestFor(1, now, "legacy-owned");
+    const unrelatedKey = ["uos_ai", "legacy-bootstrap-unrelated"];
+    try {
+      await kv.set(legacyManifestKey(legacy), legacy);
+      await kv.set([...SENTINEL_REPLAY_CHUNK_PREFIX, legacy.capture_id, 0], new Uint8Array(legacy.ciphertext_bytes));
+      await kv.set(unrelatedKey, { preserved: true });
+      const initial = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now + 1, budget_bytes: TEST_BUDGET_BYTES });
+      assert.equal(initial.accounting_complete, true);
+      const evicted = await evictSentinelReplays(kv, { target_bytes: 0, now_ms: now + 2, budget_bytes: TEST_BUDGET_BYTES });
+      assert.equal(evicted.records, 1);
+      const after = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now + 3, budget_bytes: TEST_BUDGET_BYTES });
+      assert.equal(after.stored_bytes, 0);
+      assert.equal(after.records, 0);
+      assert.equal(after.evicted_records, 1);
+      assert.equal((await kv.get(sentinelReplayAccountingKey(now, legacy.capture_id))).value, null);
+      assert.equal((await readSentinelReplayCaptureStatus(kv, "legacy-owned", now + 3)).status, "evicted");
+      assert.deepEqual((await kv.get(unrelatedKey)).value, { preserved: true });
+    } finally {
+      kv.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "legacy accounting materialization resumes across bootstrap batches without charging rows twice",
+  ignore: !kvAvailable,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const kv = await Deno.openKv(":memory:");
+    const now = 1_701_200_000_000;
+    const manifests = Array.from({ length: 39 }, (_, index) => legacyManifestFor(index + 1, now + index));
+    const budgetBytes = SENTINEL_REPLAY_BUDGET_BYTES;
+    try {
+      for (const manifest of manifests) await kv.set(legacyManifestKey(manifest), manifest);
+      let status = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now + 1_000, budget_bytes: budgetBytes });
+      assert.equal(status.accounting_complete, false, "one bounded pass must not claim to have swept all 39 manifests");
+      for (let pass = 0; pass < 5 && !status.accounting_complete; pass += 1) {
+        status = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now + 1_000, budget_bytes: budgetBytes });
+      }
+      assert.equal(status.accounting_complete, true);
+      assert.equal(status.records, manifests.length);
+      assert.equal(
+        status.stored_bytes,
+        manifests.reduce((sum, manifest) => sum + sentinelReplayManifestCharge(manifest), 0)
+      );
+      for (const manifest of manifests) {
+        assert.equal(
+          (await kv.get<SentinelReplayAccountingRow>(sentinelReplayAccountingKey(manifest.captured_at_ms, manifest.capture_id))).value?.state,
+          "stored"
+        );
+      }
+      const repeated = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now + 1_001, budget_bytes: budgetBytes });
+      assert.equal(repeated.stored_bytes, status.stored_bytes);
+      assert.equal(repeated.records, status.records);
+    } finally {
+      kv.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "a changed legacy manifest rejects the whole bootstrap row and ledger transaction",
+  ignore: !kvAvailable,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const kv = await Deno.openKv(":memory:");
+    const now = 1_701_300_000_000;
+    const manifest = legacyManifestFor(1, now);
+    const changed = { ...manifest, ciphertext_bytes: 101 };
+    let interleaved = false;
+    const outcomes: boolean[] = [];
+    const wrapped = observeBootstrapCommits(
+      kv,
+      async () => {
+        if (interleaved) return;
+        interleaved = true;
+        await kv.set(legacyManifestKey(manifest), changed);
+      },
+      (result) => outcomes.push(result.ok)
+    );
+    try {
+      await kv.set(legacyManifestKey(manifest), manifest);
+      const raced = await runSentinelReplayRetentionMaintenance(wrapped, { now_ms: now + 1, budget_bytes: TEST_BUDGET_BYTES });
+      assert.equal(interleaved, true, "the fixture must observe a real accounting-row materialization transaction");
+      assert.deepEqual(outcomes, [false], "the native manifest version check must reject the stale charge");
+      assert.equal(raced.accounting_complete, false);
+      assert.equal(raced.records, 0);
+      assert.equal(raced.stored_bytes, 0);
+      assert.equal((await kv.get(sentinelReplayAccountingKey(now, manifest.capture_id))).value, null);
+      const retried = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now + 2, budget_bytes: TEST_BUDGET_BYTES });
+      assert.equal(retried.accounting_complete, true);
+      assert.equal(retried.records, 1);
+      assert.equal(retried.stored_bytes, sentinelReplayManifestCharge(changed));
+    } finally {
+      kv.close();
     }
   },
 });

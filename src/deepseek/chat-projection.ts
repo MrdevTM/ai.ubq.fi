@@ -110,14 +110,20 @@ const forwardedPayloadMarker = (omittedBytes: number): string =>
 const omittedImageMarker = (bytes: number): string =>
   `[gateway: ${FORWARDED_PAYLOAD_POLICY.version} image omitted (${bytes} bytes); the model did not receive this image; this route forwards at most ${FORWARDED_PAYLOAD_POLICY.perMessageLimit} bytes per message because the provider counts forwarded payloads as text tokens]`;
 
-/** Cuts a string to a UTF-8 byte budget without splitting a surrogate pair. */
-const utf8Head = (value: string, byteBudget: number): string => {
-  let head = value.slice(0, byteBudget);
+/** Keeps every prefix cut at a complete UTF-16 code-point boundary. */
+const utf16Head = (value: string, length: number): string => {
+  let head = value.slice(0, length);
   if (head.length < value.length) {
     const last = head.charCodeAt(head.length - 1);
     if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1);
   }
-  while (head.length > 0 && forwardedByteLength(head) > byteBudget) head = head.slice(0, Math.floor(head.length * 0.9));
+  return head;
+};
+
+/** Cuts a string to a UTF-8 byte budget without splitting a surrogate pair. */
+const utf8Head = (value: string, byteBudget: number): string => {
+  let head = utf16Head(value, byteBudget);
+  while (head.length > 0 && forwardedByteLength(head) > byteBudget) head = utf16Head(head, Math.floor(head.length * 0.9));
   return head;
 };
 
@@ -159,7 +165,7 @@ const reduceForwardedPayload = (value: string, path: string, callId: string | nu
         },
       };
     }
-    head = head.slice(0, Math.floor(head.length * 0.9));
+    head = utf16Head(head, Math.floor(head.length * 0.9));
   }
 };
 
