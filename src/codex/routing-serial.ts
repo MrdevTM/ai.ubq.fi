@@ -61,7 +61,10 @@ const evaluateSerialRoutingAccounts = async (
     modelUnavailable: null,
   };
   const byAccountId = new Map<string, CodexRoutingAccountEvaluation>();
-  const unavailableAccounts = codexModelUnavailableAccounts(model);
+  const unavailableAccounts = codexModelUnavailableAccounts(
+    model,
+    pool.accounts.map((auth) => auth.account_id)
+  );
   for (const auth of pool.accounts) {
     const mapped = byId.get(auth.account_id);
     if (!mapped) continue;
