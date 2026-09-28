@@ -498,6 +498,22 @@ const usageDetailCounter = (container: unknown, key: string, ceiling: number): n
 };
 
 /**
+ * `prompt_tokens_details.cached_tokens`, or null when the provider reported no
+ * cache measurement or an impossible count. Exported so the provider adapter
+ * can reuse the exact guard `normalizeUsage` applies instead of restating it.
+ */
+export const cerebrasCachedPromptTokens = (value: Record<string, unknown>, promptTokens: number): number | null =>
+  usageDetailCounter(value.prompt_tokens_details, "cached_tokens", promptTokens);
+
+/**
+ * `completion_tokens_details.reasoning_tokens`, or null when the provider
+ * reported no reasoning measurement or an impossible count. Exported beside
+ * the cache guard so both detail counters have one definition.
+ */
+export const cerebrasReasoningTokens = (value: Record<string, unknown>, completionTokens: number): number | null =>
+  usageDetailCounter(value.completion_tokens_details, "reasoning_tokens", completionTokens);
+
+/**
  * Reduces a Cerebras usage object to the OpenAI Chat Completions usage shape
  * the Assistant consumes. The provider reports cache reads and reasoning tokens
  * as the documented nested details, so those counters are relayed under their
@@ -513,8 +529,8 @@ const normalizeUsage = (value: unknown): NormalizationResult<Record<string, unkn
   if (promptTokens === null || completionTokens === null || totalTokens === null) {
     return { ok: false, message: "Upstream usage is incomplete." };
   }
-  const cachedTokens = usageDetailCounter(value.prompt_tokens_details, "cached_tokens", promptTokens);
-  const reasoningTokens = usageDetailCounter(value.completion_tokens_details, "reasoning_tokens", completionTokens);
+  const cachedTokens = cerebrasCachedPromptTokens(value, promptTokens);
+  const reasoningTokens = cerebrasReasoningTokens(value, completionTokens);
   return {
     ok: true,
     value: {

@@ -42,7 +42,7 @@ import {
 } from "../upstream-wire.ts";
 import { parseChatStreamOptions, parseReasoningEffortField, parseStreamField } from "../request-policy.ts";
 
-const recordCerebrasResponseHealth = (status: number, providerRequestId: string | null): void => {
+export const recordCerebrasResponseHealth = (status: number, providerRequestId: string | null): void => {
   if (status === 401 || status === 403) {
     void recordCerebrasProviderHealth("auth_invalid", status, Date.now, providerRequestId);
     return;
@@ -71,6 +71,7 @@ const cerebrasTerminalTypeForError = (error: unknown, downstreamSignal: AbortSig
 };
 
 type CerebrasFailureKind =
+  | "upstream_error"
   | "upstream_http_error"
   | "upstream_unreachable"
   | "incomplete_response"
@@ -82,7 +83,7 @@ type CerebrasFailureKind =
   | "cerebras_api_key_missing"
   | "cerebras_request_invalid";
 
-const recordCerebrasFailureKind = (context: UsageContext | undefined, failureKind: CerebrasFailureKind): void => {
+export const recordCerebrasFailureKind = (context: UsageContext | undefined, failureKind: CerebrasFailureKind): void => {
   if (context?.responseTelemetry) context.responseTelemetry.failureKind = failureKind;
 };
 
@@ -106,6 +107,29 @@ const cerebrasTransportFailureKind = (error: unknown, terminalType: ResponseStre
   }
   return "upstream_unreachable";
 };
+
+/**
+ * The per-id reasoning-tier refusal for one Cerebras model, or null when the
+ * tier is acceptable.
+ *
+ * Tiers are per model, not per route: `gpt-oss-120b` cannot disable reasoning
+ * while `qwen-3.8-27b` accepts `none` and defaults to `high`. Both the Chat and
+ * the Responses handler ask this one function, so the two wires cannot drift on
+ * which tiers a model accepts, and neither restates the per-model sets.
+ *
+ * An omitted tier (`undefined`) and a non-string value are the model's own
+ * default or a shape this helper does not judge, so only an explicitly supplied
+ * string tier is validated against this model's list.
+ */
+export const cerebrasReasoningEffortRefusal = (upstreamModel: string, reasoningEffort: unknown): Response | null => {
+  if (typeof reasoningEffort !== "string") return null;
+  const levels = cerebrasProviderHint(upstreamModel).supported_reasoning_levels ?? [];
+  if (!levels.length || levels.includes(reasoningEffort)) return null;
+  return openaiError(400, `reasoning_effort '${reasoningEffort}' is not supported for ${upstreamModel}. Use ${levels.join(", ")}.`, "invalid_request_error", {
+    param: "reasoning_effort",
+  });
+};
+
 /**
  * The GPT-OSS route is deliberately separate from the Codex Responses bridge.
  * It forwards the official Chat Completions body unchanged (apart from the
@@ -129,26 +153,9 @@ const validateCerebrasChatRequestFields = (
   if (!reasoningEffort.ok) {
     return { ok: false, response: openaiError(400, reasoningEffort.message, "invalid_request_error", { param: "reasoning_effort" }) };
   }
-  // Tiers are per model, not per route: gpt-oss-120b cannot disable reasoning,
-  // while qwen-3.8-27b accepts `none` and defaults to `high`. Reject only the
-  // combination this model actually refuses.
+  const tierRefusal = cerebrasReasoningEffortRefusal(upstreamModel, reasoningEffort.value);
+  if (tierRefusal) return { ok: false, response: tierRefusal };
   const hint = cerebrasProviderHint(upstreamModel);
-  const levels = hint.supported_reasoning_levels ?? [];
-  // An omitted field (`undefined`) is the model's own default, so only an
-  // explicitly supplied tier is validated against this model's list.
-  if (typeof reasoningEffort.value === "string" && levels.length > 0 && !levels.includes(reasoningEffort.value)) {
-    return {
-      ok: false,
-      response: openaiError(
-        400,
-        `reasoning_effort '${reasoningEffort.value}' is not supported for ${upstreamModel}. Use ${levels.join(", ")}.`,
-        "invalid_request_error",
-        {
-          param: "reasoning_effort",
-        }
-      ),
-    };
-  }
   // The hint owns each model's default (gpt-oss-120b is `medium`, qwen is
   // `high`); the gateway-wide default only covers a hint that states none.
   const declaredDefault = hint.default_reasoning_effort;
@@ -171,7 +178,7 @@ const validateCerebrasChatRequestFields = (
   };
 };
 
-const respondCerebrasChatInvalidCompletion = async (
+export const respondCerebrasChatInvalidCompletion = async (
   failureKind: "invalid_json" | "invalid_completion_schema",
   upstreamStatus: number,
   providerRequestId: string | null,
@@ -187,7 +194,7 @@ const respondCerebrasChatInvalidCompletion = async (
   });
 };
 
-const readCerebrasChatCompletion = async (
+export const readCerebrasChatCompletion = async (
   bytes: Uint8Array,
   upstreamStatus: number,
   providerRequestId: string | null,
@@ -210,7 +217,11 @@ const readCerebrasChatCompletion = async (
   return { ok: true, value: normalized.value };
 };
 
-const respondCerebrasChatDispatchFailure = async (error: unknown, downstreamSignal: AbortSignal, usageContext: UsageContext | undefined): Promise<Response> => {
+export const respondCerebrasChatDispatchFailure = async (
+  error: unknown,
+  downstreamSignal: AbortSignal,
+  usageContext: UsageContext | undefined
+): Promise<Response> => {
   const terminalType = cerebrasTerminalTypeForError(error, downstreamSignal);
   recordCerebrasFailureKind(usageContext, cerebrasTransportFailureKind(error, terminalType));
   recordStreamTerminalType(usageContext, terminalType);
@@ -221,7 +232,7 @@ const respondCerebrasChatDispatchFailure = async (error: unknown, downstreamSign
   return toCerebrasErrorResponse(error);
 };
 
-const respondCerebrasChatUpstreamHttpFailure = async (
+export const respondCerebrasChatUpstreamHttpFailure = async (
   upstream: Response,
   requestSignal: AbortSignal,
   providerRequestId: string | null,
@@ -234,7 +245,7 @@ const respondCerebrasChatUpstreamHttpFailure = async (
   return await toCerebrasUpstreamErrorResponse(upstream, requestSignal);
 };
 
-const respondCerebrasChatIncompleteCapture = async (
+export const respondCerebrasChatIncompleteCapture = async (
   usageContext: UsageContext | undefined,
   downstreamSignal: AbortSignal,
   requestSignal: AbortSignal,

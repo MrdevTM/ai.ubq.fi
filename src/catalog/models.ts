@@ -6,6 +6,9 @@ import { buildRuntimeConfig, cacheRuntimeConfig, normalizeRuntimeConfig, RUNTIME
 import { getString, isRecord } from "../utils.ts";
 import { DEEPSEEK_CONTEXT_WINDOW_TOKENS, DEEPSEEK_DISPLAY_NAMES, DEEPSEEK_OFFICIAL_MODEL_IDS, readDeepSeekApiKey } from "../deepseek/index.ts";
 import { FORWARDED_PAYLOAD_POLICY } from "../deepseek/forwarded-payload-policy.ts";
+import { CEREBRAS_MODELS, readCerebrasApiKey } from "../provider/cerebras.ts";
+import { CEREBRAS_MODEL_DISPLAY_NAMES } from "../input-normalization.ts";
+import { cerebrasProviderHint } from "../request-policy.ts";
 import {
   LITHOS_CONTEXT_WINDOW_TOKENS,
   LITHOS_DEFAULT_REASONING_EFFORT,
@@ -314,6 +317,81 @@ const withLithosModels = (models: readonly Record<string, unknown>[]): Record<st
   return [...models, ...configured.filter((model) => !present.has(String(model.slug)))];
 };
 
+/**
+ * Codex catalog records for the Cerebras route.
+ *
+ * The vendor serves Chat Completions only, but the shared Responses adapter
+ * (`src/provider/cerebras-responses.ts`, under `CEREBRAS_RESPONSES_PROFILE`)
+ * serves `/v1/responses`, so both ids are advertised as Responses-capable. The
+ * tiers and the 131,072-token window are the route's own per-id declaration in
+ * `src/request-policy.ts`: `gpt-oss-120b` cannot disable reasoning, while
+ * `qwen-3.8-27b` accepts `none`. The Codex `ultra` preset is advertised by
+ * neither, and the adapter refuses it.
+ */
+const cerebrasCodexModels = (): Record<string, unknown>[] => {
+  if (!readCerebrasApiKey()) return [];
+  return CEREBRAS_MODELS.map((id) => {
+    const hint = cerebrasProviderHint(id);
+    // The route's own declaration is the window a request can use on this
+    // provider. OpenRouter enrichment is deliberately not consulted: it
+    // describes another serving of the same weights, not the Cerebras window.
+    const resolved = resolveModelMetadata(id, { provider: hint, openRouter: null });
+    return {
+      slug: id,
+      display_name: CEREBRAS_MODEL_DISPLAY_NAMES[id] ?? id,
+      description: "Cerebras API (Chat Completions) served by this gateway.",
+      owned_by: "cerebras",
+      supported_endpoint_types: ["openai-response", "openai-chat"],
+      supported_reasoning_levels: (hint.supported_reasoning_levels ?? []).map((effort) => ({
+        effort: String(effort),
+        description: codexReasoningEffortDescription(String(effort)),
+      })),
+      default_reasoning_level: resolved.default_reasoning_effort ?? "none",
+      ...(resolved.context_window_tokens === null
+        ? {}
+        : {
+            context_window: resolved.context_window_tokens,
+            max_context_window: resolved.max_context_window_tokens,
+            ...(resolved.auto_compact_token_limit_tokens === null ? {} : { auto_compact_token_limit: resolved.auto_compact_token_limit_tokens }),
+            ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+          }),
+      shell_type: "shell_command",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 1,
+      availability_nux: null,
+      upgrade: null,
+      base_instructions: "",
+      support_verbosity: false,
+      default_verbosity: null,
+      apply_patch_tool_type: null,
+      web_search_tool_type: "text",
+      truncation_policy: { mode: "tokens", limit: 10000 },
+      // Gateway extension (not an OpenAI or Codex field): the Responses adapter
+      // runs the same shared translation as the DeepSeek and LithosAI routes,
+      // so it enforces the same declared per-message forwarding limit.
+      forwarding_policy: {
+        version: FORWARDED_PAYLOAD_POLICY.version,
+        mode: FORWARDED_PAYLOAD_POLICY.mode,
+        per_message_limit: FORWARDED_PAYLOAD_POLICY.perMessageLimit,
+      },
+      supports_parallel_tool_calls: false,
+      experimental_supported_tools: [],
+    };
+  });
+};
+
+/**
+ * Appends the Cerebras ids the stored catalog does not already advertise. Both
+ * ids are appended under their own slug, so a client can select either one.
+ */
+const withCerebrasModels = (models: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
+  const configured = cerebrasCodexModels();
+  if (!configured.length) return [...models];
+  const present = new Set(models.map((model) => getString(model.slug) ?? getString(model.id) ?? ""));
+  return [...models, ...configured.filter((model) => !present.has(String(model.slug)))];
+};
+
 /** Trimmed model slugs advertised by a catalog body, in their stored order. */
 const catalogModelIds = (models: readonly unknown[]): Set<string> => {
   const ids = models
@@ -329,6 +407,7 @@ const catalogModelIds = (models: readonly unknown[]): Set<string> => {
 
 export {
   catalogModelIds,
+  cerebrasCodexModels,
   codexSnapshotRecords,
   deepSeekOfficialCodexModels,
   etagMatches,
@@ -336,6 +415,7 @@ export {
   maybeUpdateNormalizedSnapshot,
   meteredCodexModelRecord,
   uniqueResponsesModels,
+  withCerebrasModels,
   withDeepSeekOfficialModels,
   withLithosModels,
 };

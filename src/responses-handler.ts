@@ -1,11 +1,13 @@
 // Responses routing, attempts, delivery and handler, extracted from src/openai.ts.
 
 import { handleLithosResponses } from "./provider/lithos-handlers.ts";
+import { handleCerebrasResponses } from "./provider/cerebras-responses.ts";
 import { handleDeepSeekResponses } from "./deepseek/handlers.ts";
 import { markCodexResponseCompleted, markCodexResponseUpstreamError, releaseCodexResponseProbe } from "./codex/index.ts";
 import { deepSeekUpstreamModelFor } from "./deepseek/index.ts";
+import { cerebrasUpstreamModelFor } from "./provider/cerebras.ts";
 import { lithosUpstreamModelFor } from "./provider/lithos.ts";
-import { loadProviderSelectionCached } from "./provider/selection.ts";
+import { isProviderEnabled, loadProviderSelectionCached } from "./provider/selection.ts";
 import { createStreamFirstEventDeadline, createStreamSemanticDeadline, STREAM_FAILOVER_RESERVE_MS } from "./inference-deadline.ts";
 import { ResponsesStreamError, type ResponsesStreamEvent, withSseKeepalive } from "./responses-stream.ts";
 import {
@@ -785,10 +787,16 @@ const handleResponsesInternal = async (req: Request, usageContext?: UsageContext
   }
   // LithosAI has no Responses endpoint of its own, so this route is served by
   // the shared translation under the LithosAI profile rather than by a
-  // provider-side endpoint. Only an explicit LithosAI id takes this branch, so
-  // the Cerebras `unsupported_model` refusal below stays untouched.
+  // provider-side endpoint. Only an explicit LithosAI id takes this branch.
   if (requestedModel && lithosUpstreamModelFor(requestedModel)) {
     return await handleLithosResponses(req, rawRecord, requestedModel, usageContext);
+  }
+  // Cerebras ids are owned by the Cerebras route on both wires, so they are
+  // dispatched before the Codex catalog lookup exactly as the Chat Completions
+  // route dispatches them; a switched-off Cerebras provider leaves its ids to
+  // the ordinary availability check.
+  if (requestedModel && cerebrasUpstreamModelFor(requestedModel) && isProviderEnabled("cerebras", await loadProviderSelectionCached())) {
+    return await handleCerebrasResponses(req, rawRecord, requestedModel, usageContext);
   }
   const prepared = await prepareResponsesRequest(req, rawRecord, rawBody, usageContext);
   if (!prepared.ok) return prepared.response;
