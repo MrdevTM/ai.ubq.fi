@@ -11,6 +11,15 @@ import {
   readDeepSeekApiKey,
 } from "./index.ts";
 import { LITHOS_REASONING_LEVELS, lithosCachedPromptTokens, lithosReasoningTokens, lithosUpstreamModelFor, requireLithosApiKey } from "../provider/lithos.ts";
+import {
+  CEREBRAS_MODELS,
+  CerebrasError,
+  cerebrasCachedPromptTokens,
+  cerebrasReasoningTokens,
+  cerebrasUpstreamModelFor,
+  readCerebrasApiKey,
+} from "../provider/cerebras.ts";
+import { cerebrasProviderHint } from "../request-policy.ts";
 
 /**
  * Responses <-> DeepSeek Chat Completions adapter.
@@ -60,7 +69,7 @@ export const failure = (param: string, message: string, code?: string): DeepSeek
  * `invalid_request_error` rather than sending a value the provider refuses.
  */
 export type ChatOnlyResponsesProfile = Readonly<{
-  id: "deepseek" | "lithos";
+  id: "deepseek" | "lithos" | "cerebras";
   /** Human name used in client-facing error text. */
   label: string;
   /** Canonical upstream model for a client-facing id, or null when the id is not this provider's. */
@@ -152,6 +161,76 @@ export const LITHOS_RESPONSES_PROFILE: ChatOnlyResponsesProfile = {
   requireApiKey: requireLithosApiKey,
   // Usage arrives unconditionally on every streaming call and is never gated
   // on `stream_options.include_usage`, which this provider's wire does not use.
+  requiresStreamUsageOption: false,
+};
+
+/** The provider's own key check, mirroring `requireCerebrasApiKey` in `../provider/cerebras.ts`. */
+const requireCerebrasResponsesApiKey = (): void => {
+  if (!readCerebrasApiKey()) throw new CerebrasError("The requested model is not configured.", "cerebras_api_key_missing", 503);
+};
+
+/**
+ * Every tier the Cerebras route advertises for any of its ids, as a membership
+ * set. The per-id lists live with the route's hints and are enforced by the
+ * Cerebras transport, which refuses a tier the requested model does not accept;
+ * this adapter only has to stop a tier the route never advertised at all.
+ */
+const CEREBRAS_REASONING_LEVEL_SET: ReadonlySet<string> = new Set(
+  CEREBRAS_MODELS.flatMap((id) =>
+    (cerebrasProviderHint(id).supported_reasoning_levels ?? []).filter((level): level is string => typeof level === "string")
+  ).map((level) => level.trim().toLowerCase())
+);
+
+/**
+ * Projects a requested reasoning tier onto the Cerebras wire value, or null
+ * when no id on this route advertises it.
+ *
+ * The tier is sent verbatim, exactly like LithosAI: there is no advanced Codex
+ * preset to translate, and `ultra` is NOT mapped to `max` because this route
+ * refuses it. Whether the requested model itself accepts the (advertised) tier
+ * is the transport's per-id decision, so `none` reaches `gpt-oss-120b` and is
+ * refused there rather than being pre-filtered here against one model's list.
+ */
+const projectCerebrasReasoningEffort = (effort: string): string | null => {
+  const level = effort.trim().toLowerCase();
+  return CEREBRAS_REASONING_LEVEL_SET.has(level) ? level : null;
+};
+
+/**
+ * No thinking-mode `tool_choice` restriction was observed or documented on this
+ * provider, so this profile reports no conflict rather than importing DeepSeek's
+ * measured restriction. The message builder completes the profile contract; it
+ * is unreachable while this function returns null.
+ */
+const cerebrasThinkingToolChoiceConflict = (_reasoningEffort: unknown, _thinking: unknown, _toolChoice: unknown): string | null => null;
+
+const cerebrasToolChoiceThinkingConflictMessage = (conflict: string, field: string): string =>
+  `tool_choice '${conflict}' is not supported while ${field} keeps Cerebras reasoning active; set ${field} to 'none' or use tool_choice 'auto'`;
+
+/**
+ * The Cerebras profile.
+ *
+ * The usage counters are the transport's own exported guards
+ * (`cerebrasCachedPromptTokens`, `cerebrasReasoningTokens`), so the transport
+ * and this adapter cannot drift on what a readable measurement is. Only the
+ * tier predicate stays local, because it is this adapter's request-side
+ * decision and the provider's per-id enforcement stays in its own transport.
+ */
+export const CEREBRAS_RESPONSES_PROFILE: ChatOnlyResponsesProfile = {
+  id: "cerebras",
+  label: "Cerebras",
+  upstreamModelFor: cerebrasUpstreamModelFor,
+  projectReasoningEffort: projectCerebrasReasoningEffort,
+  // `length` means the same output-budget truncation DeepSeek reports, so the
+  // one shared mapping is reused rather than a second vocabulary invented.
+  finishDisposition: deepSeekFinishDisposition,
+  thinkingToolChoiceConflict: cerebrasThinkingToolChoiceConflict,
+  toolChoiceThinkingConflictMessage: cerebrasToolChoiceThinkingConflictMessage,
+  cachedPromptTokens: cerebrasCachedPromptTokens,
+  reasoningTokens: cerebrasReasoningTokens,
+  requireApiKey: requireCerebrasResponsesApiKey,
+  // This route buffers the provider's non-streaming answer and replays it, so
+  // there is no upstream stream that could carry `stream_options`.
   requiresStreamUsageOption: false,
 };
 

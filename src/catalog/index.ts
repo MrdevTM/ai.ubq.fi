@@ -29,6 +29,7 @@ import {
 } from "./store.ts";
 import {
   catalogModelIds,
+  cerebrasCodexModels,
   codexSnapshotRecords,
   deepSeekOfficialCodexModels,
   etagMatches,
@@ -36,6 +37,7 @@ import {
   maybeUpdateNormalizedSnapshot,
   meteredCodexModelRecord,
   uniqueResponsesModels,
+  withCerebrasModels,
   withDeepSeekOfficialModels,
   withLithosModels,
 } from "./models.ts";
@@ -92,6 +94,7 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   const codexEnabled = isProviderEnabled("codex", selection);
   const deepSeekEnabled = isProviderEnabled("deepseek", selection);
   const lithosEnabled = isProviderEnabled("lithos", selection);
+  const cerebrasEnabled = isProviderEnabled("cerebras", selection);
   const [metered, surplus] = await enabledPaidCatalogSources(selection);
   const nowMs = Date.now();
   if (metered) refreshExpiredModelList(nowMs, metered.updated_at_ms, METERED_MODELS_CACHE_TTL_MS, fetchMeteredModels);
@@ -99,7 +102,10 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   const paidModels = uniqueResponsesModels([...(metered?.models ?? []), ...(surplus?.models ?? [])]);
   // The stored catalog body is Codex's own, so it can only answer for a Codex
   // provider that is still switched on.
-  if (!paidModels.length && !deepSeekEnabled && !lithosEnabled && codexEnabled) return catalogOnlyResponse(catalog, req, headers);
+  // A provider that can append rows keeps the response off the stored-body
+  // short circuit, so an appended row is never dropped by answering with the
+  // catalog body alone.
+  if (!paidModels.length && !deepSeekEnabled && !lithosEnabled && !cerebrasEnabled && codexEnabled) return catalogOnlyResponse(catalog, req, headers);
   const parsed = {
     ...catalog.parsed,
     models: codexEnabled && Array.isArray(catalog.parsed.models) ? [...catalog.parsed.models] : [],
@@ -115,6 +121,7 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   // final say over every advertised model, this route included.
   parsed.models = deepSeekEnabled ? withDeepSeekOfficialModels(parsed.models) : parsed.models;
   parsed.models = lithosEnabled ? withLithosModels(parsed.models) : parsed.models;
+  parsed.models = cerebrasEnabled ? withCerebrasModels(parsed.models) : parsed.models;
   const catalogKv = await getKv();
   const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
   parsed.models = filterWhitelistedCatalogModels(parsed.models, catalogWhitelist);
@@ -133,6 +140,7 @@ const meteredCatalogResponse = async (selection: ProviderSelection | null): Prom
   const configured = [
     ...(isProviderEnabled("deepseek", selection) ? deepSeekOfficialCodexModels() : []),
     ...(isProviderEnabled("lithos", selection) ? lithosCodexModels() : []),
+    ...(isProviderEnabled("cerebras", selection) ? cerebrasCodexModels() : []),
   ];
   if (!paidModels.length && !configured.length) return null;
   // This path answers without a stored catalog, so the Codex snapshot is the only
@@ -140,7 +148,9 @@ const meteredCatalogResponse = async (selection: ProviderSelection | null): Prom
   const codexRecords = codexSnapshotRecords(await loadFullCodexModelsSnapshot());
   return new Response(
     JSON.stringify({
-      models: withLithosModels(withDeepSeekOfficialModels(paidModels.map((model) => meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null)))),
+      models: withCerebrasModels(
+        withLithosModels(withDeepSeekOfficialModels(paidModels.map((model) => meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null))))
+      ),
     }),
     {
       status: 200,

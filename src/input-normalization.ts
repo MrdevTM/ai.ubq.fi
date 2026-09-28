@@ -323,7 +323,8 @@ export const normalizeModelList = (payload: unknown): { object: "list"; data: Re
   return null;
 };
 
-const CEREBRAS_MODEL_DISPLAY_NAMES: Record<string, string> = {
+/** Human names for the two Cerebras ids, shared with the Codex catalog rows. */
+export const CEREBRAS_MODEL_DISPLAY_NAMES: Record<string, string> = {
   [CEREBRAS_GPT_OSS_120B_MODEL]: "GPT-OSS 120B",
   [CEREBRAS_QWEN_3_8_27B_MODEL]: "Qwen 3.8 27B",
 };

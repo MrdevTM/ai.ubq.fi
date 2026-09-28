@@ -1,8 +1,6 @@
 // Responses request parsing, validation and upstream body assembly, extracted from src/openai.ts.
 
 import { buildCodexRequest } from "./codex/index.ts";
-import { cerebrasUpstreamModelFor } from "./provider/cerebras.ts";
-import { isProviderEnabled, loadProviderSelectionCached } from "./provider/selection.ts";
 import { type ReasoningEffort } from "./defaults.ts";
 import { openaiError } from "./http.ts";
 import { type StreamDeadline } from "./inference-deadline.ts";
@@ -216,15 +214,6 @@ export const resolveResponsesModel = async (
   }
   const model = normalizeModelForCodex(modelRaw);
   if (usageContext?.responseTelemetry) usageContext.responseTelemetry.model = modelRaw;
-  // A switched-off Cerebras provider no longer owns this id, so the ordinary
-  // availability check below decides whether anything else can serve it.
-  const cerebrasModel = cerebrasUpstreamModelFor(model);
-  if (cerebrasModel && isProviderEnabled("cerebras", await loadProviderSelectionCached())) {
-    return {
-      ok: false,
-      response: openaiError(400, `${cerebrasModel} is available only on /v1/chat/completions.`, "unsupported_model", { param: "model" }),
-    };
-  }
   // The DeepSeek official route is deliberately scoped to /v1/chat/completions.
   // Unlike the Cerebras model, the interchangeable DeepSeek ids are already
   // catalog models that /v1/responses serves through the provider waterfall,
