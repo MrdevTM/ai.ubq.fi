@@ -217,6 +217,70 @@ Deno.test("cerebras responses: a qwen-3.8-27b round trip translates the body and
   });
 });
 
+/**
+ * Qwen's chat template accepts exactly one `system` message and requires it
+ * first, while the shared translation emits one for `instructions` and one for
+ * each `developer` input item. A Codex client sends both, which used to reach
+ * the provider as two `system` messages and fail the whole turn with
+ * `wrong_api_format`; the body dispatched after the collapse is recorded here.
+ */
+Deno.test("cerebras responses: instructions and a leading developer item collapse into one leading system message", async () => {
+  await withCerebrasKey(async () => {
+    const { result, calls } = await withUpstream(
+      () => chatCompletion(QWEN, { role: "assistant", content: "pong" }),
+      () =>
+        handleResponses(
+          responsesRequest({
+            model: QWEN,
+            instructions: "Follow the house style.",
+            input: [
+              { type: "message", role: "developer", content: "Answer in one word." },
+              { type: "message", role: "user", content: "Say pong." },
+            ],
+            reasoning: { effort: "none" },
+          })
+        )
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].body.messages, [
+      { role: "system", content: "Follow the house style.\n\nAnswer in one word." },
+      { role: "user", content: "Say pong." },
+    ]);
+  });
+});
+
+Deno.test("cerebras responses: a mid-list developer item collapses into one leading system message", async () => {
+  await withCerebrasKey(async () => {
+    const { result, calls } = await withUpstream(
+      () => chatCompletion(QWEN, { role: "assistant", content: "pong" }),
+      () =>
+        handleResponses(
+          responsesRequest({
+            model: QWEN,
+            input: [
+              { type: "message", role: "user", content: "First." },
+              { type: "message", role: "developer", content: "Be brief." },
+              { type: "message", role: "user", content: "Second." },
+            ],
+            reasoning: { effort: "none" },
+          })
+        )
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal(calls.length, 1);
+    // The developer item's text leads the turn as the only `system` message and
+    // the user turns keep their order.
+    assert.deepEqual(calls[0].body.messages, [
+      { role: "system", content: "Be brief." },
+      { role: "user", content: "First." },
+      { role: "user", content: "Second." },
+    ]);
+  });
+});
+
 Deno.test("cerebras responses: gpt-oss-120b is served on /v1/responses instead of being refused", async () => {
   await withCerebrasKey(async () => {
     const { result, calls } = await withUpstream(

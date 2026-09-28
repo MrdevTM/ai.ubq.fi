@@ -263,8 +263,54 @@ const projectCerebrasMessages = (messages: unknown): unknown => {
   return messages.map((message) => (isRecord(message) && !Array.isArray(message) && message.role === "developer" ? { ...message, role: "system" } : message));
 };
 
+const isCerebrasSystemMessage = (message: unknown): message is Record<string, unknown> =>
+  isRecord(message) && !Array.isArray(message) && message.role === "system";
+
+/** One part of a `system` message's content: a string part whole, a record part's text, else nothing. */
+const cerebrasSystemPartText = (part: unknown): string => {
+  if (typeof part === "string") return part;
+  if (isRecord(part) && !Array.isArray(part) && typeof part.text === "string") return part.text;
+  return "";
+};
+
+/** One `system` message's own text: a string whole, or the concatenation of its text parts. */
+const cerebrasSystemContentText = (content: unknown): string => {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map(cerebrasSystemPartText).join("");
+};
+
+/**
+ * Cerebras applies the model's chat template strictly, and the Qwen template
+ * accepts exactly one `system` message, at index 0: a second `system` message,
+ * or one that follows another message, fails the whole turn before inference
+ * with "Failed to apply chat template to messages due to error: System message
+ * must be at the beginning." (`wrong_api_format`, verified live 2026-09-28
+ * against qwen-3.8-27b). The shared Responses translation emits one `system`
+ * message per `instructions` plus one for each `developer` input item, and a
+ * Codex client sends both, so the Cerebras wires have to collapse them into the
+ * single leading message the template accepts.
+ *
+ * Every `system` message's text is kept, in original order, joined with a blank
+ * line; all other messages keep their relative order. A body that already holds
+ * at most one `system` message, at index 0, is returned unchanged, so an
+ * ordinary request is never rewritten. The collapse runs for both ids on this
+ * route: `gpt-oss-120b`'s harmony template tolerates the extra message, but one
+ * wire shape must not drift by model.
+ */
+export const collapseCerebrasSystemMessages = (messages: unknown): unknown => {
+  if (!Array.isArray(messages)) return messages;
+  const systems = messages.filter(isCerebrasSystemMessage);
+  if (systems.length === 0 || (systems.length === 1 && isCerebrasSystemMessage(messages[0]))) return messages;
+  const texts = systems.map((message) => cerebrasSystemContentText(message.content)).filter((text) => text !== "");
+  return [{ ...systems[0], content: texts.join("\n\n") }, ...messages.filter((message) => !isCerebrasSystemMessage(message))];
+};
+
 const projectCerebrasRequest = (body: Record<string, unknown>): Record<string, unknown> => {
-  const projected: Record<string, unknown> = { ...body, messages: projectCerebrasMessages(body.messages) };
+  // The Chat wire's `developer` mapping and the system-message collapse both
+  // live here, so every dispatch through this transport carries exactly one
+  // leading `system` message whichever wire built the body.
+  const projected: Record<string, unknown> = { ...body, messages: collapseCerebrasSystemMessages(projectCerebrasMessages(body.messages)) };
   if (!Array.isArray(body.tools)) return projected;
   return {
     ...projected,

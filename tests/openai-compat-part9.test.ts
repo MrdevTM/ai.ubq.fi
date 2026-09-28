@@ -521,6 +521,125 @@ Deno.test("openai: Cerebras GPT-OSS Chat Completions adapter is native, bounded,
       assert.equal(requestBody.messages[0].role, "developer");
     });
 
+    // Qwen's chat template accepts exactly one `system` message and requires it
+    // at index 0, so `system` + `developer` (which is mapped onto `system`)
+    // reaches the provider as one leading message. Recorded live 2026-09-28:
+    // two `system` messages failed the whole turn with `wrong_api_format`.
+    await t.step("collapses repeated system messages into one leading system message", async () => {
+      const seen: Record<string, unknown>[] = [];
+      const response = await withFetchMock(
+        (_url, bodyText) => {
+          if (bodyText) seen.push(JSON.parse(bodyText) as Record<string, unknown>);
+          return new Response(
+            JSON.stringify({
+              id: "chatcmpl_cerebras_system_collapse",
+              object: "chat.completion",
+              created: 1_728_000_023,
+              model: "qwen-3.8-27b",
+              choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        },
+        () =>
+          handleChatCompletions(
+            request({
+              ...canonicalBody,
+              model: "qwen-3.8-27b",
+              messages: [
+                { role: "system", content: "Follow the house style." },
+                { role: "developer", content: "Answer in one word." },
+                { role: "user", content: "go" },
+              ],
+            })
+          )
+      );
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(seen[0]?.messages, [
+        { role: "system", content: "Follow the house style.\n\nAnswer in one word." },
+        { role: "user", content: "go" },
+      ]);
+    });
+
+    await t.step("leaves a single leading system message unchanged", async () => {
+      const seen: Record<string, unknown>[] = [];
+      const response = await withFetchMock(
+        (_url, bodyText) => {
+          if (bodyText) seen.push(JSON.parse(bodyText) as Record<string, unknown>);
+          return new Response(
+            JSON.stringify({
+              id: "chatcmpl_cerebras_single_system",
+              object: "chat.completion",
+              created: 1_728_000_024,
+              model: "qwen-3.8-27b",
+              choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        },
+        () =>
+          handleChatCompletions(
+            request({
+              ...canonicalBody,
+              model: "qwen-3.8-27b",
+              messages: [
+                { role: "system", content: "Follow the house style." },
+                { role: "user", content: "go" },
+              ],
+            })
+          )
+      );
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(seen[0]?.messages, [
+        { role: "system", content: "Follow the house style." },
+        { role: "user", content: "go" },
+      ]);
+    });
+
+    // A system message's content may be text parts instead of a plain string;
+    // the merged message keeps that text rather than dropping it.
+    await t.step("merges text-part system content into the single leading message", async () => {
+      const seen: Record<string, unknown>[] = [];
+      const response = await withFetchMock(
+        (_url, bodyText) => {
+          if (bodyText) seen.push(JSON.parse(bodyText) as Record<string, unknown>);
+          return new Response(
+            JSON.stringify({
+              id: "chatcmpl_cerebras_system_parts",
+              object: "chat.completion",
+              created: 1_728_000_025,
+              model: "qwen-3.8-27b",
+              choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        },
+        () =>
+          handleChatCompletions(
+            request({
+              ...canonicalBody,
+              model: "qwen-3.8-27b",
+              messages: [
+                { role: "system", content: [{ type: "text", text: "Follow the house style." }] },
+                { role: "developer", content: "Answer in one word." },
+                { role: "user", content: "go" },
+              ],
+            })
+          )
+      );
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(seen[0]?.messages, [
+        { role: "system", content: "Follow the house style.\n\nAnswer in one word." },
+        { role: "user", content: "go" },
+      ]);
+    });
+
     await t.step("preserves upstream reasoning 1:1 in buffered Chat responses", async () => {
       const response = await withFetchMock(
         () =>
