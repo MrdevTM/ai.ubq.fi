@@ -4,6 +4,21 @@ Production runs as `ai-ubq-fi.service` on `codex@vps.pavlovcik.com` (129.158.58.
 to `/home/codex/repos/ubiquity/ai.ubq.fi`.
 
 - `ops/ai-ubq-fi.service`: enabled systemd service; starts at boot and restarts after exit.
+- `ops/codex-auth-repair.service` and `ops/codex-auth-repair.timer`: enabled systemd timer that repairs this host's
+  Codex auth pool every 15 minutes with `scripts/codex-auth-repair.ts --apply`, adopting only a credential the script
+  has already proven with an account-bound `GET`. The Mac runs the same script from
+  `ops/com.ubiquity.ai.codex-auth-repair.plist`. Both are needed: the script only ever writes the pool of the host it
+  runs on, so a host with no unit never repairs its own pool. Install it after linking the units:
+
+  ```sh
+  sudo ln -sf /home/codex/repos/ubiquity/ai.ubq.fi/ops/codex-auth-repair.service /etc/systemd/system/codex-auth-repair.service
+  sudo ln -sf /home/codex/repos/ubiquity/ai.ubq.fi/ops/codex-auth-repair.timer /etc/systemd/system/codex-auth-repair.timer
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now codex-auth-repair.timer
+  ```
+
+  Confirm it works with `systemctl list-timers codex-auth-repair.timer` and
+  `sudo journalctl -u codex-auth-repair.service -n 20 --no-pager`.
 - `scripts/serve-vps.ts`: authenticated listener on `127.0.0.1:7999`, with graceful shutdown.
 - `.env`: existing production credentials, mode 0600. `DENO_DEPLOY_TOKEN` remains the application's admin-token name.
 - `.data/kv.sqlite3`: persistent local KV. Never replace it during a code deployment.
