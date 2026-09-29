@@ -60,8 +60,8 @@
     "npm:@peculiar/asn1-schema@^2.3.8": "2.6.0",
     "npm:@peculiar/asn1-x509@^2.3.8": "2.6.0",
     "npm:@peculiar/x509@^1.13.0": "1.14.3",
-    "npm:@trpc/client@^11.0.2": "11.18.0_@trpc+server@11.18.0__typescript@7.0.2_typescript@7.0.2",
-    "npm:@trpc/client@^11.18.0": "11.18.0_@trpc+server@11.18.0__typescript@7.0.2_typescript@7.0.2",
+    "npm:@trpc/client@^11.0.2": "11.18.0_@trpc+server@11.18.0_typescript@7.0.2",
+    "npm:@trpc/client@^11.18.0": "11.18.0_@trpc+server@11.18.0_typescript@7.0.2",
     "npm:@trpc/server@^11.0.2": "11.18.0_typescript@7.0.2",
     "npm:@trpc/server@^11.18.0": "11.18.0_typescript@7.0.2",
     "npm:@types/ws@^8.18.1": "8.18.1",
@@ -71,12 +71,13 @@
     "npm:open@^10.1.0": "10.2.0",
     "npm:open@^10.2.0": "10.2.0",
     "npm:pg-connection-string@^2.9.1": "2.11.0",
+    "npm:prettier@3": "3.9.9",
     "npm:superjson@^2.2.2": "2.2.6",
     "npm:superjson@^2.2.6": "2.2.6",
     "npm:temporal-polyfill@0.3": "0.3.2",
     "npm:temporal-polyfill@~0.3.2": "0.3.2",
     "npm:ws@8.18.3": "8.18.3",
-    "npm:ws@^8.18.3": "8.20.0",
+    "npm:ws@^8.18.3": "8.18.3",
     "npm:zod@^4.1.5": "4.3.6"
   },
   "jsr": {
@@ -187,7 +188,7 @@
         "jsr:@std/fs",
         "jsr:@std/path@^1.1.2",
         "npm:@types/ws",
-        "npm:ws",
+        "npm:ws@8.18.3",
         "npm:zod"
       ]
     },
@@ -463,7 +464,7 @@
         "tsyringe"
       ]
     },
-    "@trpc/client@11.18.0_@trpc+server@11.18.0__typescript@7.0.2_typescript@7.0.2": {
+    "@trpc/client@11.18.0_@trpc+server@11.18.0_typescript@7.0.2": {
       "integrity": "sha512-wOqeg3Fvl25V1ZisQhUD3K8G60ZJDlSGJNSyeXrLH24xAo5w6GSR2Kzb1cSNY9Y+IQ2YZvYGZstBU+V/ulo/ow==",
       "dependencies": [
         "@trpc/server",
@@ -664,6 +665,10 @@
     "pg-connection-string@2.11.0": {
       "integrity": "sha512-kecgoJwhOpxYU21rZjULrmrBJ698U2RxXofKVzOn5UDj61BPj/qMb7diYUR1nLScCDbrztQFl1TaQZT0t1EtzQ=="
     },
+    "prettier@3.9.9": {
+      "integrity": "sha512-Z/CJHIkdujO/OtN7nXUii0Rf3VT5SRuhjBA82Xvu2XhBUgX3nhP67T0LHceBdQLex7OOFGTox+Q5Yg8Jk2Qivg==",
+      "bin": true
+    },
     "pvtsutils@1.3.6": {
       "integrity": "sha512-PLgQXQ6H2FWCaeRak8vvk1GW462lMxB5s3Jm673N82zI4vqtVUPuZdffdZbPDFRoU8kAhItWFtPCWiPpp4/EDg==",
       "dependencies": [
@@ -737,9 +742,6 @@
     },
     "ws@8.18.3": {
       "integrity": "sha512-PEIGCY5tSlUt50cqyMXfCzX+oOPqN0vuGqWzbcJ2xvnkzkq46oOpz7dQaTDBdfICb4N14+GARUDw2XV2N4tvzg=="
-    },
-    "ws@8.20.0": {
-      "integrity": "sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA=="
     },
     "wsl-utils@0.1.0": {
       "integrity": "sha512-h3Fbisa2nKGPxCpm89Hk33lBLsnaGBvctQopaBSOW/uIs6FTe1ATyAnKFJrzVs9vpGdsTe73WF3V4lIsk4Gacw==",
