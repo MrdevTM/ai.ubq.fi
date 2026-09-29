@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodically repair this host's Codex auth pool
+Documentation=file:/home/codex/repos/ubiquity/ai.ubq.fi/scripts/codex-auth-repair.ts
+
+[Timer]
+# Offset from the hour like the Mac job, so the two hosts do not probe the
+# same account at the same instant and a repair on one is observed by the
+# other before the next run.
+OnCalendar=*:07/15
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

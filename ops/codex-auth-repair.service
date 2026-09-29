@@ -1,0 +1,36 @@
+[Unit]
+Description=Repair this host's Codex auth pool from a working credential
+Documentation=file:/home/codex/repos/ubiquity/ai.ubq.fi/scripts/codex-auth-repair.ts
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=codex
+Group=codex
+WorkingDirectory=/home/codex/repos/ubiquity/ai.ubq.fi
+Environment=DENO_DIR=/home/codex/repos/ubiquity/ai.ubq.fi/.data/deno
+Environment=DENO_TIMELINE=production
+# The Mac runs the same script every 15 minutes with --apply. Without this unit
+# the VPS kept a pool slot that no longer authenticated for days, because the
+# Mac job only ever writes the pool of the host it runs on.
+#
+# This host owns no other host to pull from: the script's remote sources point
+# at codex@vps.pavlovcik.com, which is this machine, so the remote read fails
+# closed and the run falls back to the local auth.json it is granted above.
+# That is the intended source here, so the failure is expected and harmless.
+#
+# No credential is minted and no refresh is exercised: the script proves each
+# candidate with an account-bound GET before it will adopt it, and the write is
+# a versionstamp-checked compare-and-set against the pool entry.
+ExecStart=/bin/sh -c 'set -eu; release=$$(cd -P .data/current && pwd); exec /usr/local/bin/deno run --config="$$release/deno.json" --lock="$$release/deno.lock" --frozen --no-prompt --env-file=.env --unstable-kv --allow-env --allow-read=/home/codex/repos/ubiquity/ai.ubq.fi,/home/codex/.codex/auth.json --allow-write=/home/codex/repos/ubiquity/ai.ubq.fi/.data --allow-net=chatgpt.com --allow-run=/usr/bin/ssh "$$release/scripts/codex-auth-repair.ts" --apply --ssh /usr/bin/ssh'
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/codex/repos/ubiquity/ai.ubq.fi/.data
+
+[Install]
+WantedBy=multi-user.target
