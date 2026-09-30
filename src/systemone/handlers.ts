@@ -11,7 +11,14 @@
 // to reach unrelated OpenRouter models.
 
 import { openaiError } from "../http.ts";
-import { extractUsageTokens, recordCompletionUsage, recordRequestUsage, recordTerminalUsage, type UsageContext } from "../openai-telemetry.ts";
+import {
+  attachResponseTelemetry,
+  createResponseTelemetryState,
+  extractUsageTokens,
+  recordCompletionUsage,
+  recordRequestUsage,
+  type UsageContext,
+} from "../openai-telemetry.ts";
 import { fetchOpenRouterSystemOne, OpenRouterError, type OpenRouterFetch } from "../provider/openrouter.ts";
 import { readJsonBody } from "../request.ts";
 import { getString, isRecord } from "../utils.ts";
@@ -124,7 +131,17 @@ export const handleSystemOne = async (req: Request, usageContext?: UsageContext,
   if (request instanceof Response) return request;
   const { model } = request;
 
-  await recordRequestUsage(usageContext, { model, route: "systemone", stream: false, reasoning: null });
+  // The terminal wrapper reads its log and quota decoration off the response,
+  // so the handler attaches the telemetry state it records into. The provider
+  // label is authoritative here: the upstream is OpenRouter, whatever header
+  // the transport happens to carry.
+  const telemetry = usageContext?.responseTelemetry ?? createResponseTelemetryState();
+  telemetry.provider = "openrouter";
+  const context: UsageContext = usageContext
+    ? { ...usageContext, responseTelemetry: telemetry }
+    : { keyId: null, kernelRepo: null, kernelOrg: null, responseTelemetry: telemetry };
+
+  await recordRequestUsage(context, { model, route: "systemone", stream: false, reasoning: null });
 
   let payload: Record<string, unknown>;
   try {
@@ -145,7 +162,6 @@ export const handleSystemOne = async (req: Request, usageContext?: UsageContext,
   }
 
   const usage = extractUsageTokens(normalizedUsage(payload.usage));
-  await recordCompletionUsage(usageContext, usage);
-  recordTerminalUsage(usageContext, usage, true);
-  return Response.json(payload);
+  await recordCompletionUsage(context, usage);
+  return attachResponseTelemetry(Response.json(payload), telemetry);
 };
