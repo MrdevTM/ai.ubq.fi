@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { kernelQuotaRouteForRequest, terminalRouteForRequest } from "../src/handler/http.ts";
+import { getResponseTelemetry } from "../src/openai-telemetry.ts";
 import { OPENROUTER_SYSTEMONE_URL } from "../src/provider/openrouter.ts";
 import { handleSystemOne, SYSTEMONE_DEFAULT_MODEL } from "../src/systemone/handlers.ts";
 
@@ -156,4 +157,32 @@ Deno.test("systemone is a terminal inference route with its own quota route", ()
   assert.equal(kernelQuotaRouteForRequest("POST", "/v1/systemone"), "systemone");
   // Hard cutover: the previous UOS platform path no longer routes.
   assert.equal(terminalRouteForRequest("POST", "/uos/systemone"), null);
+});
+
+Deno.test("systemone attaches reported usage telemetry to its response", async () => {
+  const fetcher = (() =>
+    Promise.resolve(
+      Response.json({
+        model: "typesafe/jev-1.13-20260917",
+        answers: { candidate: { type: "choice", choice: "yes", confidence: 0.9 } },
+        usage: { input_tokens: 310, output_tokens: 20, cost: 0.00001302 },
+      })
+    )) as typeof fetch;
+  const response = await handleSystemOne(request({ state, questions }), undefined, {
+    fetcher,
+    apiKey: () => "or-test-key",
+  });
+  assert.equal(response.status, 200);
+  const telemetry = getResponseTelemetry(response);
+  assert.ok(telemetry);
+  assert.equal(telemetry.model, SYSTEMONE_DEFAULT_MODEL);
+  assert.equal(telemetry.provider, "openrouter");
+  assert.equal(telemetry.inputTokens, 310);
+  assert.equal(telemetry.cachedInputTokens, 0);
+  assert.equal(telemetry.outputTokens, 20);
+  assert.equal(telemetry.totalTokens, 330);
+  assert.equal(telemetry.usageObserved, true);
+  assert.equal(telemetry.usageTelemetryStatus, "reported");
+  assert.equal(telemetry.completed, true);
+  assert.equal(telemetry.stream, false);
 });
