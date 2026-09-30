@@ -33,6 +33,7 @@ import {
   storeProviderSelection,
 } from "../provider/selection.ts";
 import { PROVIDER_TIERS, providerPresentation } from "../provider/presentation.ts";
+import { readOpenRouterApiKey } from "../provider/openrouter.ts";
 import { buildModelCatalogSnapshot, type ModelCatalogSource } from "../models/catalog.ts";
 import { listCodexResetShadowDecisions } from "../codex/banked-reset-pool.ts";
 import {
@@ -673,6 +674,12 @@ const codexSubscriptionRoster = async (): Promise<readonly { id: string; label: 
  *
  * `buildCatalog` is injectable for tests, matching the other admin handlers.
  */
+/** A credential-gated row reflects its key; a discovered source keeps its own status. */
+const providerStatusFor = (configured: boolean | null, source: ModelCatalogSource | undefined): string => {
+  if (configured === null) return source?.status ?? "unavailable";
+  return configured ? "available" : "unavailable";
+};
+
 export const handleAdminProviderSelectionGet = async (dependencies: Readonly<{ buildCatalog?: typeof buildModelCatalogSnapshot }> = {}): Promise<Response> => {
   const kv = await getKv();
   if (!kv) {
@@ -700,6 +707,10 @@ export const handleAdminProviderSelectionGet = async (dependencies: Readonly<{ b
         providers: SELECTABLE_PROVIDER_IDS.map((id) => {
           const source = sources.get(id);
           const presentation = providerPresentation(id);
+          // OpenRouter's catalog source is metadata enrichment, not dispatch
+          // readiness: whether this gateway can serve /v1/systemone is the
+          // credential alone, so its row reports the key, not the source.
+          const credentialConfigured = id === "openrouter" ? readOpenRouterApiKey() !== null : null;
           return {
             id,
             label: presentation.label,
@@ -709,10 +720,10 @@ export const handleAdminProviderSelectionGet = async (dependencies: Readonly<{ b
             endpoints: [...presentation.endpoints],
             health_key: presentation.health_key,
             model_count: counts.get(id) ?? 0,
-            status: source?.status ?? "unavailable",
+            status: providerStatusFor(credentialConfigured, source),
             // Only credential-gated providers report this; for the discovered
             // sources the status already says whether they answered.
-            configured: source ? (source.configured ?? source.status === "available") : false,
+            configured: credentialConfigured ?? (source ? (source.configured ?? source.status === "available") : false),
             // Only the Codex tier can be narrowed to individual subscriptions.
             ...(id === "codex" ? { subscriptions } : {}),
           };

@@ -37,7 +37,7 @@ export type ProviderHealthView = Readonly<{
  * top-level key for, named after the route each one reports on: OpenLux
  * reports through `metered`.
  */
-export const RECORD_PROVIDER_IDS = ["cerebras", "codex", "deepseek", "lithos", "metered", "surplus"] as const;
+export const RECORD_PROVIDER_IDS = ["cerebras", "codex", "deepseek", "lithos", "metered", "openrouter", "surplus"] as const;
 
 export type RecordProvider = (typeof RECORD_PROVIDER_IDS)[number];
 
@@ -323,6 +323,7 @@ export const getCodexProviderHealth = (accountId: string, now: () => number = Da
   readProviderHealth("codex", accountId, now);
 
 export const getMeteredProviderHealth = (now: () => number = Date.now): Promise<ProviderHealthView> => readProviderHealth("metered", "default", now);
+export const getOpenRouterProviderHealth = (now: () => number = Date.now): Promise<ProviderHealthView> => readProviderHealth("openrouter", "default", now);
 
 export const getSurplusProviderHealth = (now: () => number = Date.now): Promise<ProviderHealthView> => readProviderHealth("surplus", "default", now);
 

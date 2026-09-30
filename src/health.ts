@@ -11,6 +11,7 @@ import {
   getDeepSeekProviderHealth,
   getLithosProviderHealth,
   getMeteredProviderHealth,
+  getOpenRouterProviderHealth,
   getSurplusProviderHealth,
   PROVIDER_HEALTH_STALE_AFTER_MS,
   type ProviderHealthState,
@@ -18,6 +19,7 @@ import {
 import { decodeBase64ToString } from "./utils.ts";
 import type { CodexAuthPoolState } from "./types.ts";
 import { readMeteredApiKey } from "./provider/metered.ts";
+import { readOpenRouterApiKey } from "./provider/openrouter.ts";
 import { readSurplusApiKey } from "./provider/surplus.ts";
 import {
   fetchMeteredQuotaObservation,
@@ -226,12 +228,13 @@ const quotaView = (snapshot: MeteredQuotaSnapshot | null) => {
 export const getPassiveProviderHealthSnapshot = async (options: Readonly<{ includeQuota?: boolean }> = {}): Promise<Record<string, unknown>> => {
   const context = await getCodexAuthContext();
   const auth = enrichAuthMeta(context.meta);
-  const [cerebrasHealth, codexHealth, deepseekHealth, lithosHealth, meteredHealth, surplusHealth, meteredQuota] = await Promise.all([
+  const [cerebrasHealth, codexHealth, deepseekHealth, lithosHealth, meteredHealth, openRouterHealth, surplusHealth, meteredQuota] = await Promise.all([
     getCerebrasProviderHealth(),
     Promise.all(context.account_ids.map((accountId) => getCodexProviderHealth(accountId))),
     getDeepSeekProviderHealth(),
     getLithosProviderHealth(),
     getMeteredProviderHealth(),
+    getOpenRouterProviderHealth(),
     getSurplusProviderHealth(),
     getCachedConfiguredMeteredQuotaSnapshot(),
   ]);
@@ -276,6 +279,10 @@ export const getPassiveProviderHealthSnapshot = async (options: Readonly<{ inclu
               observed_at_ms: meteredQuota?.state.observed_at_ms ?? null,
             },
           }),
+    },
+    openrouter: {
+      configured: readOpenRouterApiKey() !== null,
+      health: openRouterHealth,
     },
     surplus: {
       configured: readSurplusApiKey() !== null,

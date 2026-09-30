@@ -16,7 +16,7 @@ export const PROVIDER_SELECTION_CACHE_TTL_MS = 5_000;
  * paid fallback tiers (`surplus` before `openlux`), then the credential-gated
  * direct routes (`deepseek`, `cerebras`, `lithos`).
  */
-export const SELECTABLE_PROVIDER_IDS = ["codex", "surplus", "openlux", "deepseek", "cerebras", "lithos"] as const;
+export const SELECTABLE_PROVIDER_IDS = ["codex", "surplus", "openlux", "deepseek", "cerebras", "lithos", "openrouter"] as const;
 
 export type SelectableProviderId = (typeof SELECTABLE_PROVIDER_IDS)[number];
 
