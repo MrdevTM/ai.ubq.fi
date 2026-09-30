@@ -48,6 +48,7 @@ import { corsHeaders, notFound, openaiError, withCors as withCorsHeaders, withou
 import {} from "../inference-admission.ts";
 
 import { handleModelCapabilities, handlePublicModelCatalog } from "../models/catalog.ts";
+import { handleSystemOne } from "../systemone/handlers.ts";
 
 import {
   handlePasskeyLoginFinish,
@@ -243,6 +244,14 @@ const handleAdminRoute = async (req: Request, path: string): Promise<Response | 
   return await handleApiKeyPaidFallbacksRoute(req, path);
 };
 
+/** The System One decisions route authenticates with the caller's UOS API key. */
+const handleSystemOneRoute = async (req: Request): Promise<Response> => {
+  if (req.method !== "POST") return openaiError(405, "Method not allowed", "method_not_allowed");
+  const authResult = await authenticateClient(req);
+  if (!authResult.ok) return authResult.response;
+  return await handleSystemOne(req);
+};
+
 /** Serves the UOS catalog and agent-message routes; null when none matches. */
 const handleUosRoute = async (req: Request, path: string): Promise<Response | null> => {
   if (req.method === "GET" && path === "/uos/auth") return await handleV1Auth(req);
@@ -252,6 +261,7 @@ const handleUosRoute = async (req: Request, path: string): Promise<Response | nu
     if (!authResult.ok) return authResult.response;
     return await handleModelCapabilities();
   }
+  if (path === "/uos/systemone") return await handleSystemOneRoute(req);
   if (path === "/uos/agent-messages" && req.method === "GET") return await handleAgentMessagesList(req);
   if (path === "/uos/agent-messages" && req.method === "POST") return await handleAgentMessagesPost(req);
   if (path === "/uos/agent-messages") return openaiError(405, "Method not allowed", "method_not_allowed");
