@@ -152,26 +152,24 @@ const withProviderRequestId = (response: Response, providerRequestId: string | n
   });
 };
 
+/** Exact-path POST routes; the two readers below add their GET-only cases. */
+const POST_TERMINAL_ROUTES: Readonly<Record<string, string>> = Object.freeze({
+  "/uos/embeddings": "embeddings",
+  "/uos/embedding-jobs": "embeddings.jobs.create",
+  "/v1/chat/completions": "chat.completions",
+  "/v1/responses": "responses",
+  "/v1/systemone": "systemone",
+  "/v1/images/generations": "images.generations",
+  "/v1/images/edits": "images.edits",
+});
+
 const terminalRouteForRequest = (method: string, path: string): string | null => {
-  if (method === "POST" && path === "/uos/embeddings") return "embeddings";
-  if (method === "POST" && path === "/uos/embedding-jobs") return "embeddings.jobs.create";
+  if (method === "POST") return POST_TERMINAL_ROUTES[path] ?? null;
   if (method === "GET" && path.startsWith("/uos/embedding-jobs/")) return "embeddings.jobs.get";
-  if (method === "POST" && path === "/v1/chat/completions") return "chat.completions";
-  if (method === "POST" && path === "/v1/responses") return "responses";
-  if (method === "POST" && path === "/v1/images/generations") return "images.generations";
-  if (method === "POST" && path === "/v1/images/edits") return "images.edits";
   return null;
 };
 
-const kernelQuotaRouteForRequest = (method: string, path: string): string | null => {
-  if (method === "POST" && path === "/uos/embeddings") return "embeddings";
-  if (method === "POST" && path === "/uos/embedding-jobs") return "embeddings.jobs.create";
-  if (method === "POST" && path === "/v1/chat/completions") return "chat.completions";
-  if (method === "POST" && path === "/v1/responses") return "responses";
-  if (method === "POST" && path === "/v1/images/generations") return "images.generations";
-  if (method === "POST" && path === "/v1/images/edits") return "images.edits";
-  return null;
-};
+const kernelQuotaRouteForRequest = (method: string, path: string): string | null => (method === "POST" ? (POST_TERMINAL_ROUTES[path] ?? null) : null);
 
 export type { AuthenticatedClientResult, BodyOutcome, ClientAuthResult, DeliveryOutcome, RequestDeliveryInfo, SentinelBackgroundTaskRegistrar };
 export {

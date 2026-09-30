@@ -29,6 +29,7 @@ import { handleEmbeddingsJobCreate, handleEmbeddingsJobGet } from "../embeddings
 import { getResponseTelemetry } from "../openai-telemetry.ts";
 import { handleImages } from "../images.ts";
 import { handleModels } from "../models/catalog.ts";
+import { handleSystemOne } from "../systemone/handlers.ts";
 import {
   type AcceptedSentinelReplayInput,
   captureAcceptedSentinelReplayInput,
@@ -498,6 +499,15 @@ const handleTerminalRoute = async (
     const response = await executeInference(() => handleResponses(req, usageContext));
     return await finishTerminalResponse(response, "responses", true, true);
   };
+  const runSystemOneRoute = async (): Promise<Response> => {
+    const response = await executeInference(() => handleSystemOne(req, usageContext));
+    if (response.ok) {
+      await bestEffortSettleKernelQuota("completed");
+    } else {
+      await bestEffortSettleKernelQuota("incomplete", "systemone_failed");
+    }
+    return await finishTerminalResponse(response, "systemone", true, true);
+  };
   // Terminal routes in wire order. The conditions are pure, so the first match
   // owns the response exactly as the original if/else chain did.
   const dispatchTerminalRoute = async (): Promise<Response> => {
@@ -509,6 +519,7 @@ const handleTerminalRoute = async (
       [req.method === "POST" && (path === "/v1/images/generations" || path === "/v1/images/edits"), runImagesRoute],
       [req.method === "POST" && path === "/v1/chat/completions", runChatCompletionsRoute],
       [req.method === "POST" && path === "/v1/responses", runResponsesRoute],
+      [req.method === "POST" && path === "/v1/systemone", runSystemOneRoute],
     ];
     for (const [matches, run] of terminalRoutes) {
       if (matches) return await run();
