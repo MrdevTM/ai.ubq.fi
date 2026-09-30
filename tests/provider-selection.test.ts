@@ -5,6 +5,7 @@ import { CODEX_AUTH_POOL_KV_KEY, CODEX_MODELS_KV_KEY, type CodexModelsSnapshot, 
 import { DEEPSEEK_OFFICIAL_MODEL_IDS } from "../src/deepseek/index.ts";
 import { handleHealthProviders } from "../src/health.ts";
 import { LITHOS_MODEL_IDS } from "../src/provider/lithos.ts";
+import { readOpenRouterApiKey } from "../src/provider/openrouter.ts";
 import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/models/codex-models-whitelist.ts";
 import handler from "../src/handler/index.ts";
 import { setKvForTest } from "../src/kv.ts";
@@ -265,6 +266,12 @@ Deno.test("admin provider picker reports the roster, catalog counts, and the sav
       { id: "deepseek", model_count: 1, status: "available", configured: true },
       { id: "cerebras", model_count: 0, status: "unavailable", configured: false },
       { id: "lithos", model_count: 0, status: "unavailable", configured: false },
+      {
+        id: "openrouter",
+        model_count: 0,
+        status: readOpenRouterApiKey() !== null ? "available" : "unavailable",
+        configured: readOpenRouterApiKey() !== null,
+      },
     ];
     assert.deepEqual(
       body.data.providers,

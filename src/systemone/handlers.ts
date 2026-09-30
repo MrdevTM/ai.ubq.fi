@@ -20,6 +20,7 @@ import {
   type UsageContext,
 } from "../openai-telemetry.ts";
 import { fetchOpenRouterSystemOne, OpenRouterError, type OpenRouterFetch } from "../provider/openrouter.ts";
+import { isProviderEnabled, loadProviderSelectionCached } from "../provider/selection.ts";
 import { readJsonBody } from "../request.ts";
 import { getString, isRecord } from "../utils.ts";
 
@@ -135,6 +136,13 @@ export const handleSystemOne = async (req: Request, usageContext?: UsageContext,
   // so the handler attaches the telemetry state it records into. The provider
   // label is authoritative here: the upstream is OpenRouter, whatever header
   // the transport happens to carry.
+  // The operator's provider selection is authoritative: an unchecked
+  // OpenRouter is refused here the same way a deselected provider leaves the
+  // chat waterfall, instead of silently serving decisions.
+  if (!isProviderEnabled("openrouter", await loadProviderSelectionCached())) {
+    return openaiError(503, "System One provider is disabled by the provider selection", "systemone_provider_disabled");
+  }
+
   const telemetry = usageContext?.responseTelemetry ?? createResponseTelemetryState();
   telemetry.provider = "openrouter";
   const context: UsageContext = usageContext
