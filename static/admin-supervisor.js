@@ -112,6 +112,99 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
     return { setActive: () => {} };
   }
 
+  // Upstream provider strip: the same registry the Providers tab manages,
+  // rendered here so the supervisor panel reports what the gateway can dispatch
+  // to without switching tabs. Read-only, best effort, and never cached.
+  const providersCard = document.createElement("article");
+  providersCard.dataset.card = "";
+  providersCard.id = "supervisor-providers-card";
+  const providersHeader = document.createElement("header");
+  const providersEyebrow = document.createElement("span");
+  providersEyebrow.dataset.adminEyebrow = "";
+  providersEyebrow.textContent = "Read-only observation";
+  const providersTitle = document.createElement("h2");
+  providersTitle.id = "card-supervisor-providers";
+  providersTitle.textContent = "Upstream providers";
+  const providersNote = document.createElement("p");
+  providersNote.textContent =
+    "Health and activation of every gateway upstream, read from the same registry the Providers tab manages.";
+  providersHeader.append(providersEyebrow, providersTitle, providersNote);
+  const providersBody = document.createElement("div");
+  providersBody.dataset.cardBody = "";
+  const providersList = document.createElement("div");
+  providersList.dataset.providerList = "";
+  providersList.setAttribute("role", "list");
+  providersBody.append(providersList);
+  providersCard.setAttribute("aria-labelledby", providersTitle.id);
+  providersCard.append(providersHeader, providersBody);
+  section.append(providersCard);
+
+  const providerStateLabel = (health) => {
+    const state = typeof health?.state === "string" && health.state ? health.state : "unknown";
+    return health?.stale === true ? `${state} · stale` : state;
+  };
+
+  const renderProviders = (selection, healthSnapshot) => {
+    const entries = Array.isArray(selection?.data?.providers) ? selection.data.providers : [];
+    if (entries.length === 0) return;
+    const rows = entries.map((entry) => {
+      const health = typeof entry?.health_key === "string" && entry.health_key
+        ? healthSnapshot?.[entry.health_key]
+        : null;
+      const configured = health ? health.configured !== false : entry.configured === true;
+      const state = health ? (typeof health.state === "string" ? health.state : health.health?.state) : null;
+      const row = document.createElement("div");
+      row.dataset.providerEntry = "";
+      row.dataset.providerId = entry.id;
+      row.setAttribute("role", "listitem");
+      const body = document.createElement("span");
+      body.dataset.providerBody = "";
+      const name = document.createElement("span");
+      name.dataset.providerName = "";
+      name.textContent = entry.label ?? entry.id;
+      const badges = document.createElement("span");
+      badges.dataset.providerBadges = "";
+      const tier = document.createElement("span");
+      tier.dataset.providerTierBadge = entry.tier;
+      tier.textContent = entry.tier_label ?? entry.tier;
+      const badge = document.createElement("span");
+      badge.dataset.providerHealthBadge = configured ? (state ?? "unknown") : "unknown";
+      badge.textContent = configured
+        ? `Health ${providerStateLabel({ state: state ?? "unknown", stale: health?.stale === true })}`
+        : "Not configured";
+      badges.append(tier, badge);
+      body.append(name, badges);
+      const detail = document.createElement("span");
+      detail.dataset.providerDetail = "";
+      detail.textContent = entry.detail ?? "";
+      const meta = document.createElement("span");
+      meta.dataset.providerMeta = "";
+      const facts = [`${entry.model_count ?? 0} catalog models`, (entry.endpoints ?? []).join(" · ")];
+      meta.textContent = facts.filter((fact) => fact !== "").join(" · ");
+      body.append(detail, meta);
+      row.append(body);
+      return row;
+    });
+    providersList.replaceChildren(...rows);
+  };
+
+  const loadProviders = async () => {
+    if (!active || !isSuperAdmin()) return;
+    const token = typeof getToken === "function" ? getToken() : "";
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    try {
+      const [selectionResponse, healthResponse] = await Promise.all([
+        fetch(apiUrl("/admin/providers/selection"), { headers, credentials: "include", cache: "no-store" }),
+        fetch(apiUrl("/admin/providers"), { headers, credentials: "include", cache: "no-store" }),
+      ]);
+      const selection = selectionResponse.ok ? await selectionResponse.json().catch(() => null) : null;
+      const healthSnapshot = healthResponse.ok ? await healthResponse.json().catch(() => null) : null;
+      if (selection) renderProviders(selection, healthSnapshot);
+    } catch {
+      // Best effort: the sessions panel already reports its own load state.
+    }
+  };
+
   let active = false;
   let timer = 0;
   let controller = null;
@@ -612,6 +705,7 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
 
   const load = async () => {
     if (!active || !isSuperAdmin()) return;
+    void loadProviders();
     if (controller) controller.abort();
     const request = new AbortController();
     controller = request;
