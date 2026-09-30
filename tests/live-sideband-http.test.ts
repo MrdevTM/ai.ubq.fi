@@ -236,6 +236,88 @@ const nextClose = (socket: UpstreamClient, timeoutMs = 5_000): Promise<{ code: n
     });
   });
 
+/**
+ * A raw sideband client hosted in a Worker. The worker owns its own event loop,
+ * so it puts its first frame on the wire the moment it observes the gateway's
+ * 101 - while the gateway itself is still loading the upstream WebSocket client.
+ * Frames, the handshake, and client-side masking are all real bytes on loopback.
+ */
+const rawSidebandWorkerSource = (url: string, headers: Readonly<Record<string, string>>, frames: readonly string[]): string => `
+const target = new URL(${JSON.stringify(url)});
+const headers = ${JSON.stringify(headers)};
+const frames = ${JSON.stringify(frames)};
+const maskedTextFrame = (text, seed) => {
+  const payload = new TextEncoder().encode(text);
+  const mask = new Uint8Array([(seed >>> 24) & 0xff, (seed >>> 16) & 0xff, (seed >>> 8) & 0xff, seed & 0xff]);
+  const frame = new Uint8Array(2 + 4 + payload.byteLength);
+  frame[0] = 0x81;
+  frame[1] = 0x80 | payload.byteLength;
+  frame.set(mask, 2);
+  for (let index = 0; index < payload.byteLength; index += 1) frame[6 + index] = payload[index] ^ mask[index % 4];
+  return frame;
+};
+const requestHead = [
+  "GET " + target.pathname + " HTTP/1.1",
+  "Host: " + target.host,
+  "Upgrade: websocket",
+  "Connection: Upgrade",
+  "Sec-WebSocket-Key: " + btoa("live-sideband-r"),
+  "Sec-WebSocket-Version: 13",
+  ...Object.entries(headers).map(([name, value]) => name + ": " + value),
+].join("\\r\\n");
+const conn = await Deno.connect({ hostname: target.hostname, port: Number(target.port) });
+await conn.write(new TextEncoder().encode(requestHead + "\\r\\n\\r\\n"));
+const decoder = new TextDecoder();
+const buffer = new Uint8Array(2048);
+let response = "";
+while (!response.includes("\\r\\n\\r\\n")) {
+  const read = await conn.read(buffer);
+  if (read === null) break;
+  response += decoder.decode(buffer.subarray(0, read), { stream: true });
+}
+self.postMessage({ event: "upgraded", status: response.split("\\r\\n")[0] });
+const framed = frames.map((frame, index) => maskedTextFrame(frame, 0x9a2b7c4d + index));
+const wire = new Uint8Array(framed.reduce((total, frame) => total + frame.byteLength, 0));
+let offset = 0;
+for (const frame of framed) {
+  wire.set(frame, offset);
+  offset += frame.byteLength;
+}
+await conn.write(wire);
+self.postMessage({ event: "sent" });
+self.onmessage = () => conn.close();
+`;
+
+type RawSidebandClient = Readonly<{ worker: Worker; waitForEvent: (event: string) => Promise<Record<string, unknown>> }>;
+
+const startRawSidebandClient = (url: string, headers: Readonly<Record<string, string>>, frames: readonly string[]): RawSidebandClient => {
+  const events: Record<string, unknown>[] = [];
+  const worker = new Worker(`data:text/javascript,${encodeURIComponent(rawSidebandWorkerSource(url, headers, frames))}`, { type: "module" });
+  worker.onmessage = (event: MessageEvent) => {
+    events.push(event.data as Record<string, unknown>);
+  };
+  return {
+    worker,
+    waitForEvent: async (event) => {
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const found = events.find((candidate) => candidate.event === event);
+        if (found) return found;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error(`the raw sideband client never reported ${event}`);
+    },
+  };
+};
+
+/** Bounded polling on the upstream fixture; no arbitrary sleep. */
+const waitForUpstreamFrames = async (sideband: UpstreamSideband, expected: number): Promise<string[]> => {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (sideband.messages.length >= expected) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return sideband.messages;
+};
+
 const expectHandshakeStatus = async (url: string, headers: Record<string, string>, status: number): Promise<void> => {
   try {
     const socket = await connectSideband(url, headers);
@@ -246,6 +328,30 @@ const expectHandshakeStatus = async (url: string, headers: Record<string, string
     assert.equal(error.status, status);
   }
 };
+
+Deno.test({
+  name: "GET /v1/live/<call_id> keeps the frames a client sends immediately after the 101, in order",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    const frames = [1, 2, 3].map((seq) => JSON.stringify({ type: "input_audio.append", seq }));
+    const client = startRawSidebandClient(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` }, frames);
+    try {
+      const upgraded = await client.waitForEvent("upgraded");
+      assert.match(String(upgraded.status), /^HTTP\/1\.1 101 /u);
+      await client.waitForEvent("sent");
+      const upstream = await fixture.waitForUpstreamSideband();
+      const received = await waitForUpstreamFrames(upstream, frames.length);
+      assert.deepEqual(received, frames, "the upstream sideband is missing frames the client sent after the 101");
+    } finally {
+      client.worker.postMessage("close");
+      client.worker.terminate();
+      await fixture.close();
+    }
+  },
+});
 
 Deno.test({
   name: "GET /v1/live/<call_id> bridges the sideband to the mapped account's upstream and relays frames both ways",

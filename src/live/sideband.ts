@@ -115,39 +115,32 @@ type LiveSidebandBridge = Readonly<{ downstream: DownstreamSocket; callId: strin
  */
 const bridgeLiveSideband = async (input: LiveSidebandBridge): Promise<void> => {
   const { downstream, callId, accountId, accessToken } = input;
-  let upstream: UpstreamSocket;
-  try {
-    const WEB_SOCKET_CONSTRUCTOR = await loadUpstreamWebSocketConstructor();
-    upstream = new WEB_SOCKET_CONSTRUCTOR(liveSidebandUrl(callId), {
-      headers: liveSidebandUpstreamHeaders(accessToken, accountId),
-      perMessageDeflate: false,
-      maxPayload: LIVE_SIDEBAND_MAX_PAYLOAD_BYTES,
-      handshakeTimeout: LIVE_SIDEBAND_HANDSHAKE_TIMEOUT_MS,
-    });
-  } catch {
-    logLiveSideband("rejected", { call_id: callId, reason: "upstream_dial_failed" });
-    closeDownstream(downstream, SIDEBAND_FAILURE_CLOSE_CODE, "realtime upstream unavailable");
-    return;
-  }
 
   const preopenFrames: string[] = [];
-  let upstreamOpen = false;
-  let settled = false;
+  // The state the downstream handlers share with the dial behind the first
+  // await: whether the bridge settled, whether the upstream handshake finished,
+  // and whether that dial produced the socket below.
+  const relay = { settled: false, upstreamOpen: false, dialed: false };
+  let upstream: UpstreamSocket;
 
   const finish = (code: number, reason: string): void => {
-    if (settled) return;
-    settled = true;
+    if (relay.settled) return;
+    relay.settled = true;
     preopenFrames.length = 0;
-    closeUpstream(upstream, code, reason);
+    if (relay.dialed) closeUpstream(upstream, code, reason);
     closeDownstream(downstream, code, reason);
     logLiveSideband("closed", { call_id: callId, account_id: accountId, code });
   };
 
+  // Deno delivers the downstream events to the handler attached when they
+  // arrive and discards the rest, so these come before the first await: a frame
+  // the client sends right after the 101, or its disconnect, has to be queued
+  // (or acted on) instead of lost while the upstream constructor loads.
   downstream.onmessage = (event: MessageEvent) => {
     // The frameless sideband is JSON text; a binary frame is a protocol error.
     const text = frameText(event.data);
-    if (text === null) return;
-    if (!upstreamOpen) {
+    if (text === null || relay.settled) return;
+    if (!relay.upstreamOpen) {
       if (preopenFrames.length >= LIVE_SIDEBAND_PREOPEN_MAX_FRAMES) {
         finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime sideband frame queue overflow");
         return;
@@ -172,8 +165,26 @@ const bridgeLiveSideband = async (input: LiveSidebandBridge): Promise<void> => {
     finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime sideband error");
   };
 
+  try {
+    const WEB_SOCKET_CONSTRUCTOR = await loadUpstreamWebSocketConstructor();
+    // The client can be gone by now: its queued frames were cleared with it, so
+    // no upstream socket is dialed for a call nobody is joining.
+    if (relay.settled) return;
+    upstream = new WEB_SOCKET_CONSTRUCTOR(liveSidebandUrl(callId), {
+      headers: liveSidebandUpstreamHeaders(accessToken, accountId),
+      perMessageDeflate: false,
+      maxPayload: LIVE_SIDEBAND_MAX_PAYLOAD_BYTES,
+      handshakeTimeout: LIVE_SIDEBAND_HANDSHAKE_TIMEOUT_MS,
+    });
+    relay.dialed = true;
+  } catch {
+    logLiveSideband("rejected", { call_id: callId, reason: "upstream_dial_failed" });
+    closeDownstream(downstream, SIDEBAND_FAILURE_CLOSE_CODE, "realtime upstream unavailable");
+    return;
+  }
+
   upstream.on("open", () => {
-    upstreamOpen = true;
+    relay.upstreamOpen = true;
     logLiveSideband("joined", { call_id: callId, account_id: accountId });
     for (const frame of preopenFrames.splice(0)) {
       try {

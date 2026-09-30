@@ -6,6 +6,29 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## `/v1/live` relays call creation to the ChatGPT backend and the sideband to api.openai.com - 2026-09-30
+
+The Codex client's realtime voice (TUI, v3/frameless) creates a WebRTC call with `POST <provider-base>/live` (multipart
+`sdp` + `session` parts) and joins the call's control socket at `wss://<ws-base>/v1/live/<call_id>`. The gateway serves
+both under `src/live/`: call creation is translated to the ChatGPT backend JSON shape at
+`${CODEX_BASE_URL}/realtime/calls?intent=quicksilver&architecture=avas` on one eligible Codex pool account, the returned
+`Location` is rewritten to `/v1/live/<call_id>`, and the creating account is mapped to that id (1 h TTL) so the sideband
+rejoins on the same credentials; the sideband then bridges text frames to `wss://api.openai.com/v1/live/<call_id>`. The
+two legs cannot share one upstream base: the ChatGPT backend rejects the multipart shape
+(`400 Unsupported content
+type`), and the API host refuses subscription-created calls
+(`403 Voice session access denied`) while accepting the sideband join with the same subscription token. SDP, ICE, and
+media are passed through untouched, so WebRTC media still flows between the client and OpenAI directly.
+
+Reason: live calls are metered on the ChatGPT backend route while the call's control socket lives on the API host; only
+the two-step relay keeps both legs on one account without terminating WebRTC in the gateway.
+
+Reversal risk: pointing creation at `api.openai.com/v1/live` restores the 403; dropping the call-id-to-account map makes
+sideband joins fail closed with 404; and a client without `experimental_realtime_ws_base_url` set to the gateway base
+joins `api.openai.com` directly with the gateway's own credential and fails, so that client-side setting is part of this
+deployment contract. `/v1/live` stays outside inference metering and admission, but its responses feed Codex provider
+health/capacity.
+
 ## Sandboxed commits sign through a GNUPGHOME inside writable roots - 2026-09-29
 
 DSH's `workspace-write` file sandbox permits writes only under the workspace root, `/tmp`, and `os.tmpdir()`

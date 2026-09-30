@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { CountingKv } from "./helpers/counting-kv.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, CodexAuthState } from "../src/types.ts";
+import { LIVE_CALL_MAX_BODY_BYTES } from "../src/live/upstream.ts";
 import { sha256Base64Url } from "../src/utils.ts";
 
 // Hermetic loopback proof for `POST /v1/live`: the real production handler, a
@@ -160,7 +161,7 @@ const seedApiKey = async (kv: CountingKv, token: string, nowMs: number): Promise
 
 const postLiveCall = async (
   fixture: LiveCallsFixture,
-  options: Readonly<{ body?: string; contentType?: string | null; authorization?: string | null }> = {}
+  options: Readonly<{ body?: string; stream?: ReadableStream<Uint8Array>; contentType?: string | null; authorization?: string | null }> = {}
 ): Promise<Response> => {
   const headers = new Headers();
   const contentType = options.contentType === undefined ? `multipart/form-data; boundary=${BOUNDARY}` : options.contentType;
@@ -171,7 +172,7 @@ const postLiveCall = async (
   return await fetch(`${fixture.gatewayBaseUrl}/v1/live`, {
     method: "POST",
     headers,
-    body: options.body ?? realtimeCallBody(SDP_OFFER, SESSION),
+    body: options.stream ?? options.body ?? realtimeCallBody(SDP_OFFER, SESSION),
   });
 };
 
@@ -181,6 +182,52 @@ const errorPayload = async (response: Response): Promise<Record<string, unknown>
   assert.ok(error && typeof error === "object", JSON.stringify(payload));
   return error as Record<string, unknown>;
 };
+
+Deno.test({
+  name: "POST /v1/live answers 413 for an oversize body with a declared Content-Length",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startLiveCallsFixture(() => acceptedAnswer());
+    try {
+      const response = await postLiveCall(fixture, { body: "x".repeat(LIVE_CALL_MAX_BODY_BYTES + 1) });
+      const error = await errorPayload(response);
+      assert.equal(response.status, 413, JSON.stringify(error));
+      assert.equal(error.message, `Live call creation bodies must be no larger than ${LIVE_CALL_MAX_BODY_BYTES} bytes.`);
+      assert.equal(fixture.upstreamCalls.length, 0, "an oversize body never reaches upstream");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "POST /v1/live answers 413 for an oversize streamed body that declares no length",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startLiveCallsFixture(() => acceptedAnswer());
+    try {
+      // A streamed request body is chunked, so no `content-length` exists and
+      // only the read-time byte cap can decide this rejection.
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(LIVE_CALL_MAX_BODY_BYTES + 2));
+          controller.close();
+        },
+      });
+      const response = await postLiveCall(fixture, { stream });
+      const error = await errorPayload(response);
+      assert.equal(response.status, 413, JSON.stringify(error));
+      assert.equal(error.message, `Live call creation bodies must be no larger than ${LIVE_CALL_MAX_BODY_BYTES} bytes.`);
+      assert.equal(fixture.upstreamCalls.length, 0, "an oversize body never reaches upstream");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
 
 Deno.test({
   name: "POST /v1/live relays the multipart SDP offer as the backend JSON call and maps the call to its account",

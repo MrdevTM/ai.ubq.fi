@@ -61,14 +61,17 @@ const readLiveCallBody = async (
     signal: req.signal,
     cancellationReason: "Live call creation body exceeded its read limit",
   });
-  if (!bounded.complete) {
-    return { ok: false, response: openaiError(400, "Live call creation body could not be read completely.", "invalid_request_error") };
-  }
+  // The byte cap is checked before completeness: a streamed body that passes
+  // the cap is truncated at the cap and reported incomplete, and it is too
+  // large whichever way it ended.
   if (bounded.bytes.byteLength > LIVE_CALL_MAX_BODY_BYTES) {
     return {
       ok: false,
       response: openaiError(413, `Live call creation bodies must be no larger than ${LIVE_CALL_MAX_BODY_BYTES} bytes.`, "invalid_request_error"),
     };
+  }
+  if (!bounded.complete) {
+    return { ok: false, response: openaiError(400, "Live call creation body could not be read completely.", "invalid_request_error") };
   }
   return { ok: true, bytes: bounded.bytes };
 };
