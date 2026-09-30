@@ -25,7 +25,10 @@ export type OpenRouterErrorCode =
 export class OpenRouterError extends Error {
   constructor(
     readonly code: OpenRouterErrorCode,
-    readonly status: number
+    /** Client-facing status, normalized (e.g. an upstream 401 answers 502). */
+    readonly status: number,
+    /** The raw upstream status when a response arrived; null otherwise. */
+    readonly upstreamStatus: number | null = null
   ) {
     super(code);
     this.name = "OpenRouterError";
@@ -75,7 +78,7 @@ export const fetchOpenRouterSystemOne = async (input: {
   }
   if (!response.ok) {
     const status = response.status === 429 || response.status === 400 ? response.status : 502;
-    throw new OpenRouterError("openrouter_upstream_error", status);
+    throw new OpenRouterError("openrouter_upstream_error", status, response.status);
   }
   const payload = await response.json().catch(() => null);
   if (!isRecord(payload)) throw new OpenRouterError("openrouter_upstream_invalid_response", 502);
