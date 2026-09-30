@@ -48,6 +48,7 @@ import { corsHeaders, notFound, openaiError, withCors as withCorsHeaders, withou
 import {} from "../inference-admission.ts";
 
 import { handleModelCapabilities, handlePublicModelCatalog } from "../models/catalog.ts";
+import { handleLiveRoute } from "../live/handler.ts";
 import { handleSystemOne } from "../systemone/handlers.ts";
 
 import {
@@ -296,6 +297,13 @@ export default async function handler(req: Request, delivery?: RequestDeliveryIn
   if (adminResponse) return withCors(adminResponse);
   const uosResponse = await handleUosRoute(req, path);
   if (uosResponse) return withCors(uosResponse);
+
+  // The realtime voice relay owns its own decorations: a sideband upgrade must
+  // be returned exactly as `Deno.upgradeWebSocket` produced it, and `withCors`
+  // above would rebuild the response and drop its socket. The JSON arms apply
+  // both decorations themselves.
+  const liveResponse = await handleLiveRoute(req, requestId);
+  if (liveResponse) return liveResponse;
 
   if (!isTerminalInferencePath(path)) {
     const response = notFound();

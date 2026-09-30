@@ -1,0 +1,344 @@
+import assert from "node:assert/strict";
+import type { WebSocket as UpstreamClient } from "ws";
+import { CountingKv } from "./helpers/counting-kv.ts";
+import type { ApiKeyHashRecord, ApiKeyRecord, CodexAuthState } from "../src/types.ts";
+import { sha256Base64Url } from "../src/utils.ts";
+
+// Hermetic loopback proof for the `GET /v1/live/<call_id>` sideband: the real
+// production handler, a disposable in-memory KV, a seeded Codex auth pool, and
+// one task-owned loopback WebSocket upstream standing in for the realtime API.
+// No production data and no real upstream is touched.
+const loopbackPermission = await Deno.permissions.query({ name: "net", host: "127.0.0.1" });
+
+// The narrow `--allow-env` allowlist this suite runs under denies the
+// `WS_NO_BUFFER_UTIL` read that `ws/lib/buffer-util.js` performs while the
+// module is evaluated, in the gateway's lazy import as much as in this file's.
+// `process.env` is replaced with an inert view for this test worker only, so
+// `ws` falls back to its JavaScript buffer implementation; the transport itself
+// stays the real `ws` client over real loopback TCP.
+Object.defineProperty(process, "env", {
+  value: new Proxy({}, { get: () => undefined, has: () => false, ownKeys: () => [], getOwnPropertyDescriptor: () => undefined }),
+  configurable: true,
+  writable: true,
+});
+
+const ACCOUNT_A = "live-sideband-http-account-a";
+const CALL_ID = "rtc_live_sideband_http";
+const UNKNOWN_CALL_ID = "rtc_live_sideband_unknown";
+const CLIENT_FRAME = JSON.stringify({ type: "input_audio.append", audio: "AAAA" });
+const UPSTREAM_FRAME = JSON.stringify({ type: "output_audio.delta", audio: "BBBB" });
+
+const codexAccount = (accountId: string, nowMs: number): CodexAuthState => ({
+  account_id: accountId,
+  access_token: `${accountId}-access-token`,
+  refresh_token: `${accountId}-refresh-token`,
+  updated_at_ms: nowMs,
+});
+
+const seedApiKey = async (kv: CountingKv, token: string, nowMs: number): Promise<void> => {
+  const tokenHash = await sha256Base64Url(token);
+  const commonPolicy = {
+    expires_at_ms: -1,
+    revoked_at_ms: null,
+    usage_limit_requests: -1,
+    usage_requests: 0,
+    usage_reset_at_ms: nowMs + 60 * 60_000,
+    window_ms: 60 * 60_000,
+    usage_quota_version: 3,
+    paid_fallback_enabled: false,
+    paid_fallback_limit_microcredits: 0,
+    paid_fallback_spent_microcredits: 0,
+    paid_fallback_reserved_microcredits: 0,
+    paid_fallback_reservation_request_id: null,
+  } satisfies Omit<ApiKeyHashRecord, "id">;
+  const keyRecord: ApiKeyRecord = {
+    id: "live-sideband-http-key",
+    name: "Live sideband HTTP key",
+    prefix: token.slice(0, 10),
+    hash: tokenHash,
+    created_at_ms: nowMs,
+    ...commonPolicy,
+    paid_fallback_model_ids: [],
+    paid_fallback_quota_per_credit: 0,
+    paid_fallback_max_exposure_microcredits: {},
+    paid_fallback_pricing_checked_at_ms: nowMs,
+  };
+  await kv.set(["ubq_ai", "api_keys", "id", keyRecord.id], keyRecord);
+  await kv.set(["ubq_ai", "api_keys", "hash", tokenHash], { id: keyRecord.id, ...commonPolicy } satisfies ApiKeyHashRecord);
+};
+
+type UpstreamSideband = {
+  path: string;
+  headers: Headers;
+  socket: WebSocket;
+  messages: string[];
+  closed: { code: number; reason: string } | null;
+};
+
+type SidebandFixture = {
+  readonly kv: CountingKv;
+  readonly token: string;
+  readonly gatewayWsBaseUrl: string;
+  readonly upstreamSidebands: UpstreamSideband[];
+  waitForUpstreamSideband: () => Promise<UpstreamSideband>;
+  close: () => Promise<void>;
+};
+
+const startSidebandFixture = async (): Promise<SidebandFixture> => {
+  const { setKvForTest } = await import("../src/kv.ts");
+  const { resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
+  const { resetCodexAccountRoutingForTest } = await import("../src/codex/account-routing.ts");
+  const { default: handler } = await import("../src/handler/index.ts");
+  const { createServeHandler } = await import("../src/handler/serve-handler.ts");
+  const { setLiveUpstreamBasesForTest } = await import("../src/live/upstream.ts");
+  const { config } = await import("../src/config.ts");
+
+  const kv = new CountingKv();
+  const upstreamSidebands: UpstreamSideband[] = [];
+  const openSidebands: WebSocket[] = [];
+  const originalDeployFlag = config.isDeploy;
+  const originalInfo = console.info;
+  const originalWarn = console.warn;
+
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAuthCacheForTest();
+  resetCodexAccountRoutingForTest();
+  console.info = () => {};
+  console.warn = () => {};
+  // A loopback caller would otherwise receive the passwordless local principal
+  // instead of an API key decision, which would hide the 401 arm.
+  (config as { isDeploy: boolean }).isDeploy = true;
+
+  const now = Date.now();
+  await kv.set(["ubq_ai", "codex_auth"], { accounts: [codexAccount(ACCOUNT_A, now)], updated_at_ms: now });
+  await kv.set(["uos_ai", "codex_live_calls", "v1", CALL_ID], { account_id: ACCOUNT_A, created_at_ms: now }, { expireIn: 60 * 60_000 });
+  const token = `u_${"d".repeat(64)}`;
+  await seedApiKey(kv, token, now);
+
+  const upstreamServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, (request) => {
+    const url = new URL(request.url);
+    if (url.pathname !== `/v1/live/${CALL_ID}`) return new Response("not found", { status: 404 });
+    // The upgraded request is closed once its response is returned, so its
+    // headers must be copied while the handshake is still in scope.
+    const record: UpstreamSideband = {
+      path: url.pathname,
+      headers: new Headers(request.headers),
+      socket: null as unknown as WebSocket,
+      messages: [],
+      closed: null,
+    };
+    const upgrade = Deno.upgradeWebSocket(request);
+    record.socket = upgrade.socket;
+    openSidebands.push(upgrade.socket);
+    upgrade.socket.onmessage = (event: MessageEvent) => {
+      if (typeof event.data === "string") record.messages.push(event.data);
+    };
+    upgrade.socket.onclose = (event: CloseEvent) => {
+      record.closed = { code: event.code, reason: event.reason };
+    };
+    upstreamSidebands.push(record);
+    return upgrade.response;
+  });
+  setLiveUpstreamBasesForTest({
+    callsBaseUrl: null,
+    sidebandBaseUrl: `ws://127.0.0.1:${(upstreamServer.addr as Deno.NetAddr).port}/v1/live`,
+  });
+
+  const gatewayServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, createServeHandler(handler));
+
+  return {
+    kv,
+    token,
+    gatewayWsBaseUrl: `ws://127.0.0.1:${(gatewayServer.addr as Deno.NetAddr).port}/v1/live`,
+    upstreamSidebands,
+    waitForUpstreamSideband: async () => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const sideband = upstreamSidebands.at(0);
+        if (sideband !== undefined) return sideband;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error("the gateway never dialed the upstream sideband");
+    },
+    close: async () => {
+      for (const socket of openSidebands) {
+        try {
+          socket.close();
+        } catch {
+          // The sideband already ended.
+        }
+      }
+      console.info = originalInfo;
+      console.warn = originalWarn;
+      (config as { isDeploy: boolean }).isDeploy = originalDeployFlag;
+      setLiveUpstreamBasesForTest({ callsBaseUrl: null, sidebandBaseUrl: null });
+      setKvForTest(null);
+      resetCodexAuthCacheForTest();
+      resetCodexAccountRoutingForTest();
+      await gatewayServer.shutdown();
+      await upstreamServer.shutdown();
+    },
+  };
+};
+
+/** A non-101 handshake is surfaced as its HTTP status rather than a socket error. */
+class SidebandHandshakeError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`sideband handshake answered ${status}`);
+    this.name = "SidebandHandshakeError";
+    this.status = status;
+  }
+}
+
+const loadClientConstructor = async (): Promise<typeof UpstreamClient> => {
+  const module: unknown = await import("ws");
+  const candidate = (module as { default?: unknown }).default;
+  assert.equal(typeof candidate, "function");
+  return candidate as typeof UpstreamClient;
+};
+
+const connectSideband = async (url: string, headers: Record<string, string> = {}): Promise<UpstreamClient> => {
+  const CLIENT_CONSTRUCTOR = await loadClientConstructor();
+  return await new Promise<UpstreamClient>((resolve, reject) => {
+    const socket = new CLIENT_CONSTRUCTOR(url, { headers, perMessageDeflate: false });
+    socket.on("open", () => {
+      resolve(socket);
+    });
+    socket.on("unexpected-response", (_request, response) => {
+      reject(new SidebandHandshakeError(response.statusCode ?? 0));
+    });
+    socket.on("error", (error: Error) => {
+      reject(error);
+    });
+  });
+};
+
+const nextFrame = (socket: UpstreamClient, timeoutMs = 5_000): Promise<string> =>
+  new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("timed out waiting for a sideband frame"));
+    }, timeoutMs);
+    socket.once("message", (data: unknown) => {
+      clearTimeout(timer);
+      resolve(String(data));
+    });
+  });
+
+const nextClose = (socket: UpstreamClient, timeoutMs = 5_000): Promise<{ code: number; reason: string }> =>
+  new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("timed out waiting for a sideband close"));
+    }, timeoutMs);
+    socket.once("close", (code: number, reason: Buffer) => {
+      clearTimeout(timer);
+      resolve({ code, reason: String(reason) });
+    });
+  });
+
+const expectHandshakeStatus = async (url: string, headers: Record<string, string>, status: number): Promise<void> => {
+  try {
+    const socket = await connectSideband(url, headers);
+    socket.close();
+    assert.fail(`expected the sideband to answer ${status}`);
+  } catch (error) {
+    assert.ok(error instanceof SidebandHandshakeError, String(error));
+    assert.equal(error.status, status);
+  }
+};
+
+Deno.test({
+  name: "GET /v1/live/<call_id> bridges the sideband to the mapped account's upstream and relays frames both ways",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    const client = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+    try {
+      const upstream = await fixture.waitForUpstreamSideband();
+      assert.equal(upstream.path, `/v1/live/${CALL_ID}`);
+      assert.equal(upstream.headers.get("authorization"), `Bearer ${ACCOUNT_A}-access-token`);
+      assert.equal(upstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+      assert.equal(upstream.headers.get("originator"), "codex_cli_rs");
+      assert.equal(upstream.headers.get("openai-alpha"), "quicksilver=v2");
+      assert.match(upstream.headers.get("user-agent") ?? "", /^codex_cli_rs\//u);
+
+      // The client's frame reaches upstream, and the upstream's frame reaches back.
+      const upstreamFrame = nextFrame(client);
+      const receivedUpstream = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error("upstream never received the client frame"));
+        }, 5_000);
+        upstream.socket.onmessage = (event: MessageEvent) => {
+          if (typeof event.data !== "string") return;
+          clearTimeout(timer);
+          upstream.messages.push(event.data);
+          resolve();
+        };
+      });
+      client.send(CLIENT_FRAME);
+      await receivedUpstream;
+      assert.deepEqual(upstream.messages, [CLIENT_FRAME]);
+
+      upstream.socket.send(UPSTREAM_FRAME);
+      assert.equal(await upstreamFrame, UPSTREAM_FRAME);
+
+      // A clean client close propagates to the upstream as a normal close, and
+      // the gateway completes the close handshake back to the client. Both
+      // listeners are armed before the close frame is sent.
+      const downstreamClosed = nextClose(client);
+      const upstreamClosed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error("upstream never observed the close"));
+        }, 5_000);
+        upstream.socket.onclose = (event: CloseEvent) => {
+          clearTimeout(timer);
+          resolve({ code: event.code, reason: event.reason });
+        };
+      });
+      client.close(1000, "session complete");
+      assert.equal((await downstreamClosed).code, 1000);
+      assert.equal((await upstreamClosed).code, 1000);
+    } finally {
+      try {
+        client.terminate();
+      } catch {
+        // Already closed.
+      }
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> rejects an unauthenticated upgrade without dialing upstream",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, {}, 401);
+      assert.equal(fixture.upstreamSidebands.length, 0);
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> answers 404 for an unknown call id without dialing upstream",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${UNKNOWN_CALL_ID}`, { authorization: `Bearer ${fixture.token}` }, 404);
+      assert.equal(fixture.upstreamSidebands.length, 0);
+    } finally {
+      await fixture.close();
+    }
+  },
+});
