@@ -64,8 +64,9 @@ A local preview therefore needs, in addition to the existing serve permissions:
 --allow-sys=hostname   # optional: without it the machine name reports as unavailable
 ```
 
-Deployment service files (`ops/`) do not currently grant those paths; granting them is a separate, explicit operations
-change.
+The Mac service file `ops/com.ubiquity.ai.local.plist` grants read access to `~/.codex` and write access to
+`~/.codex/app-server-control`; the VPS service file does not yet grant those paths, and granting them there is a
+separate, explicit operations change.
 
 ## Read methods
 
