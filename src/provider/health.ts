@@ -213,6 +213,13 @@ export const recordCodexProviderHealth = (
   providerRequestId: string | null = null
 ): Promise<void> => recordProviderHealth("codex", accountId, event, status, now, providerRequestId);
 
+export const recordOpenRouterProviderHealth = (
+  event: ProviderHealthEvent,
+  status: number | null = null,
+  now: () => number = Date.now,
+  providerRequestId: string | null = null
+): Promise<void> => recordProviderHealth("openrouter", "default", event, status, now, providerRequestId);
+
 export const recordMeteredProviderHealth = (
   event: ProviderHealthEvent,
   status: number | null = null,

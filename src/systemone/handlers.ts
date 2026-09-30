@@ -20,6 +20,7 @@ import {
   type UsageContext,
 } from "../openai-telemetry.ts";
 import { fetchOpenRouterSystemOne, OpenRouterError, type OpenRouterFetch } from "../provider/openrouter.ts";
+import { recordOpenRouterProviderHealth } from "../provider/health.ts";
 import { isProviderEnabled, loadProviderSelectionCached } from "../provider/selection.ts";
 import { readJsonBody } from "../request.ts";
 import { getString, isRecord } from "../utils.ts";
@@ -102,6 +103,27 @@ type SystemOneRequest = Readonly<{
   questions: Record<string, unknown>;
 }>;
 
+/** Mirrors the other providers' classification so the admin badge reflects reality. */
+export const recordSystemOneResponseHealth = (status: number): void => {
+  if (status === 401 || status === 403) {
+    void recordOpenRouterProviderHealth("auth_invalid", status, Date.now);
+    return;
+  }
+  if (status === 429) {
+    void recordOpenRouterProviderHealth("quota_exhausted", status, Date.now);
+    return;
+  }
+  if (status >= 500) {
+    void recordOpenRouterProviderHealth("upstream_error", status, Date.now);
+    return;
+  }
+  if (status >= 400) {
+    void recordOpenRouterProviderHealth("reachable", status, Date.now);
+    return;
+  }
+  void recordOpenRouterProviderHealth("success", status, Date.now);
+};
+
 const SYSTEMONE_ERROR_MESSAGES: Readonly<Record<OpenRouterError["code"], string>> = Object.freeze({
   openrouter_api_key_missing: "System One upstream is not configured",
   openrouter_upstream_unreachable: "System One upstream unreachable",
@@ -160,14 +182,23 @@ export const handleSystemOne = async (req: Request, usageContext?: UsageContext,
     });
   } catch (error) {
     if (error instanceof OpenRouterError) {
+      if (error.code === "openrouter_upstream_error" && error.upstreamStatus !== null) {
+        recordSystemOneResponseHealth(error.upstreamStatus);
+      } else if (error.code !== "openrouter_api_key_missing") {
+        // Unreachable transport or an unusable body: not healthy, and there
+        // is no upstream status to classify.
+        void recordOpenRouterProviderHealth("upstream_error", null, Date.now);
+      }
       return openaiError(error.status, SYSTEMONE_ERROR_MESSAGES[error.code], error.code);
     }
     throw error;
   }
 
   if (!isRecord(payload.answers)) {
+    void recordOpenRouterProviderHealth("upstream_error", null, Date.now);
     return openaiError(502, "System One upstream invalid response", "openrouter_upstream_invalid_response");
   }
+  recordSystemOneResponseHealth(200);
 
   const usage = extractUsageTokens(normalizedUsage(payload.usage));
   await recordCompletionUsage(context, usage);
