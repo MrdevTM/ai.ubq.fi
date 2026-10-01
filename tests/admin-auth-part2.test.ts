@@ -47,10 +47,25 @@ Deno.test("admin paid fallback history exposes V3 request lifecycle and billing 
     provider: "voyage",
   });
 
+  await recordApiKeyRequestLog(keyId, {
+    route: "chat.completions",
+    path: "/v1/chat/completions",
+    method: "post",
+    status_code: 200,
+    stream: true,
+    model: "google/gemini-2.5-flash",
+    reasoning: null,
+    created_at_ms: 3_000,
+    provider: "openrouter",
+  });
+
   const newest = await listApiKeyRequestLogs(keyId, { limit: 1 });
   assert.equal(newest.length, 1);
-  assert.equal(newest[0].created_at_ms, 2_000);
+  assert.equal(newest[0].created_at_ms, 3_000);
   assert.equal(newest[0].method, "POST");
+  assert.equal(newest[0].provider, "openrouter", "an OpenRouter request log keeps its own provider");
+  const previous = await listApiKeyRequestLogs(keyId, { limit: 2 });
+  assert.equal(previous[1].provider, "voyage");
 
   const settledRequest = {
     v: 3,
