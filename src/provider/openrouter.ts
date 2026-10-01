@@ -11,7 +11,7 @@
 // Chat and model-catalog access is deliberately not wired here yet; the repo
 // already reads OpenRouter's public model list for metadata enrichment only.
 
-import { openRouterModelsSnapshot } from "../models/openrouter-models.ts";
+import { fetchOpenRouterModels, openRouterModelsSnapshot } from "../models/openrouter-models.ts";
 import type { ApiKeyProviderDispatch } from "../api-key-policy.ts";
 import type { SentinelUpstreamRecorder } from "../sentinel/upstream-capture.ts";
 import { isRecord } from "../utils.ts";
@@ -55,6 +55,22 @@ export const openRouterUpstreamModelFor = (model: string): string | null => {
   const trimmed = model.trim();
   if (!trimmed) return null;
   return openRouterServableModelIds().includes(trimmed) ? trimmed : null;
+};
+
+/**
+ * The same resolution for a request that arrives before the catalogue cache
+ * has warmed - for example the first request after a restart. A cold snapshot
+ * refreshes once (coalesced, bounded by the catalogue transport's own
+ * timeout) and the id is re-resolved; a snapshot that is already warm is
+ * authoritative, and a failed refresh still answers not-served rather than
+ * dispatching an unvetted id.
+ */
+export const resolveOpenRouterUpstreamModel = async (model: string): Promise<string | null> => {
+  const resolved = openRouterUpstreamModelFor(model);
+  if (resolved !== null || openRouterModelsSnapshot() !== null) return resolved;
+  if (readOpenRouterApiKey() === null) return null;
+  await fetchOpenRouterModels().catch(() => null);
+  return openRouterUpstreamModelFor(model);
 };
 
 export type OpenRouterDispatchHooks = Readonly<{

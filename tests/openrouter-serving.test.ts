@@ -7,7 +7,7 @@ import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/models/codex-models-whitel
 import { handleModelCapabilities, handleModels, handlePublicModelCatalog } from "../src/models/catalog.ts";
 import { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest, setOpenRouterModelsFetchForTest } from "../src/models/openrouter-models.ts";
 import { createResponseTelemetryState, type ResponseTelemetryState } from "../src/openai-telemetry.ts";
-import { openRouterUpstreamModelFor } from "../src/provider/openrouter.ts";
+import { openRouterUpstreamModelFor, resolveOpenRouterUpstreamModel } from "../src/provider/openrouter.ts";
 import { handleOpenRouterChatCompletions, handleOpenRouterResponses } from "../src/provider/openrouter-handlers.ts";
 import { resetProviderSelectionCacheForTest } from "../src/provider/selection.ts";
 import { resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
@@ -317,4 +317,28 @@ Deno.test("openrouter responses relays native events and records the terminal", 
     assert.equal(telemetry.streamTerminalType, "response.completed");
     assert.equal(telemetry.outputTokens, 1);
   });
+});
+
+Deno.test("openrouter resolves a served id from a cold catalogue and stays cache-authoritative once warm", async () => {
+  resetOpenRouterModelsCacheForTest();
+  Deno.env.set("OPENROUTER_API_KEY", "fixture-openrouter-key");
+  let fetches = 0;
+  setOpenRouterModelsFetchForTest((() => {
+    fetches += 1;
+    return Promise.resolve(jsonResponse(catalogue));
+  }) as typeof fetch);
+  try {
+    assert.equal(await resolveOpenRouterUpstreamModel("vendor/alpha"), "vendor/alpha", "a cold cache refreshes before refusing a served id");
+    assert.equal(fetches, 1);
+    assert.equal(await resolveOpenRouterUpstreamModel("vendor/gamma"), null, "a warm cache stays authoritative");
+    assert.equal(fetches, 1, "no extra refresh once the catalogue is warm");
+    Deno.env.delete("OPENROUTER_API_KEY");
+    resetOpenRouterModelsCacheForTest();
+    assert.equal(await resolveOpenRouterUpstreamModel("vendor/alpha"), null, "an unconfigured upstream never fetches");
+    assert.equal(fetches, 1);
+  } finally {
+    setOpenRouterModelsFetchForTest(null);
+    resetOpenRouterModelsCacheForTest();
+    Deno.env.delete("OPENROUTER_API_KEY");
+  }
 });

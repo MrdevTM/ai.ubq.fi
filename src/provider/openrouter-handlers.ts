@@ -29,9 +29,9 @@ import { recordOpenRouterResponseHealth, streamOpenRouterChatCompletion, streamO
 import {
   fetchOpenRouterChatCompletions,
   fetchOpenRouterResponses,
-  openRouterUpstreamModelFor,
   OpenRouterError,
   type OpenRouterDispatchHooks,
+  resolveOpenRouterUpstreamModel,
 } from "./openrouter.ts";
 
 type OpenRouterRouteTransport = (
@@ -103,7 +103,7 @@ export const handleOpenRouterChatCompletions = async (
   usageContext?: UsageContext,
   deps: OpenRouterHandlerDeps = {}
 ): Promise<Response> => {
-  const upstreamModel = openRouterUpstreamModelFor(modelRaw);
+  const upstreamModel = await resolveOpenRouterUpstreamModel(modelRaw);
   if (!upstreamModel) {
     return openaiError(400, "The requested model is not served by OpenRouter.", "openrouter_request_invalid", { param: "model" });
   }
@@ -161,7 +161,7 @@ export const handleOpenRouterResponses = async (
   usageContext?: UsageContext,
   deps: OpenRouterHandlerDeps = {}
 ): Promise<Response> => {
-  const upstreamModel = openRouterUpstreamModelFor(modelRaw);
+  const upstreamModel = await resolveOpenRouterUpstreamModel(modelRaw);
   if (!upstreamModel) {
     return openaiError(400, "The requested model is not served by OpenRouter.", "openrouter_request_invalid", { param: "model" });
   }

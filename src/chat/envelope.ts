@@ -7,7 +7,7 @@ import { buildCodexRequest, markCodexResponseCompleted, markCodexResponseUpstrea
 import { cerebrasUpstreamModelFor } from "../provider/cerebras.ts";
 import { deepSeekUpstreamModelFor } from "../deepseek/index.ts";
 import { lithosUpstreamModelFor } from "../provider/lithos.ts";
-import { openRouterUpstreamModelFor } from "../provider/openrouter.ts";
+import { resolveOpenRouterUpstreamModel } from "../provider/openrouter.ts";
 import { handleOpenRouterChatCompletions } from "../provider/openrouter-handlers.ts";
 import { isProviderEnabled, loadProviderSelectionCached } from "../provider/selection.ts";
 import { type ReasoningEffort } from "../defaults.ts";
@@ -575,7 +575,7 @@ export const handleChatCompletionsInternal = async (req: Request, usageContext?:
   if (isProviderEnabled("lithos", selection) && lithosUpstreamModelFor(model)) {
     return await handleLithosChatCompletions(req, rawRecord, modelRaw, usageContext);
   }
-  if (isProviderEnabled("openrouter", selection) && openRouterUpstreamModelFor(model)) {
+  if (isProviderEnabled("openrouter", selection) && (await resolveOpenRouterUpstreamModel(model))) {
     return await handleOpenRouterChatCompletions(req, rawRecord, model, usageContext);
   }
 
