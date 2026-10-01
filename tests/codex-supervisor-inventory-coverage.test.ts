@@ -797,7 +797,8 @@ Deno.test("buildSupervisorBriefRequestBody bounds the prompt, names unavailable 
   const body = buildSupervisorBriefRequestBody(emptyContext);
   assert.equal(body.stream, false);
   assert.deepEqual(body.response_format, { type: "json_object" });
-  assert.equal(body.reasoning_effort, "max");
+  assert.equal(body.model, "gpt-oss-120b");
+  assert.equal(body.reasoning_effort, "high");
   assert.equal(body.max_completion_tokens, 4_096);
   const messages = body.messages as { role: string; content: string }[];
   assert.deepEqual(
