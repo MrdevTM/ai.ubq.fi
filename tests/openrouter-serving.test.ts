@@ -6,6 +6,7 @@ import { setKvForTest } from "../src/kv.ts";
 import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/models/codex-models-whitelist.ts";
 import { handleModelCapabilities, handleModels, handlePublicModelCatalog } from "../src/models/catalog.ts";
 import { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest, setOpenRouterModelsFetchForTest } from "../src/models/openrouter-models.ts";
+import { createResponseTelemetryState, type ResponseTelemetryState } from "../src/openai-telemetry.ts";
 import { openRouterUpstreamModelFor } from "../src/provider/openrouter.ts";
 import { handleOpenRouterChatCompletions, handleOpenRouterResponses } from "../src/provider/openrouter-handlers.ts";
 import { resetProviderSelectionCacheForTest } from "../src/provider/selection.ts";
@@ -219,5 +220,101 @@ Deno.test("openrouter codex rows carry only source-stated metadata", async () =>
     assert.deepEqual(beta.supported_endpoint_types, ["openai-response", "openai-chat"]);
     assert.deepEqual(beta.supported_reasoning_levels, [{ effort: "none", description: "No reasoning" }]);
     assert.equal(beta.default_reasoning_level, "none");
+  });
+});
+
+/** One recorded upstream SSE body. */
+const sseResponse = (frames: readonly string[]): Response =>
+  new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
+
+const streamUsageContext = (responseTelemetry: ResponseTelemetryState) => ({
+  keyId: null,
+  kernelRepo: null,
+  kernelOrg: null,
+  requestId: "openrouter-stream-test",
+  startedAtMs: Date.now(),
+  startedAtMonotonicMs: performance.now(),
+  responseTelemetry,
+});
+
+Deno.test("openrouter chat relays validated stream frames and records usage", async () => {
+  await withServedCatalogue(async () => {
+    const telemetry = createResponseTelemetryState();
+    const chunks = [
+      { id: "gen-1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "pi" }, finish_reason: null }] },
+      { id: "gen-1", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } },
+    ];
+    const response = await handleOpenRouterChatCompletions(
+      new Request("https://ai.ubq.fi/v1/chat/completions", { method: "POST" }),
+      { model: "vendor/alpha", messages: [{ role: "user", content: "hi" }], stream: true },
+      "vendor/alpha",
+      streamUsageContext(telemetry),
+      {
+        fetchChat: (body) => {
+          assert.equal(body.stream, true);
+          assert.deepEqual(body.stream_options, { include_usage: true });
+          return Promise.resolve(sseResponse([`data: ${JSON.stringify(chunks[0])}\n\n`, `data: ${JSON.stringify(chunks[1])}\n\n`, "data: [DONE]\n\n"]));
+        },
+      }
+    );
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /"content":"pi"/);
+    assert.match(body, /data: \[DONE\]/);
+    assert.equal(telemetry.inputTokens, 3);
+    assert.equal(telemetry.outputTokens, 2);
+    assert.equal(telemetry.usageObserved, true);
+    assert.equal(telemetry.streamTerminalType, "response.completed");
+  });
+});
+
+Deno.test("openrouter chat reports a malformed stream frame as a stream error", async () => {
+  await withServedCatalogue(async () => {
+    const telemetry = createResponseTelemetryState();
+    const response = await handleOpenRouterChatCompletions(
+      new Request("https://ai.ubq.fi/v1/chat/completions", { method: "POST" }),
+      { model: "vendor/alpha", stream: true },
+      "vendor/alpha",
+      streamUsageContext(telemetry),
+      { fetchChat: () => Promise.resolve(sseResponse(["data: {not json}\n\n", "data: [DONE]\n\n"])) }
+    );
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /openrouter_upstream_stream_error/);
+    assert.equal(telemetry.streamTerminalType, "error");
+    assert.equal(telemetry.failureKind, "malformed_event");
+  });
+});
+
+Deno.test("openrouter responses relays native events and records the terminal", async () => {
+  await withServedCatalogue(async () => {
+    const telemetry = createResponseTelemetryState();
+    const events = [
+      { type: "response.created", response: { id: "resp_1" } },
+      { type: "response.output_text.delta", delta: "ok" },
+      { type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 } } },
+    ];
+    const response = await handleOpenRouterResponses(
+      new Request("https://ai.ubq.fi/v1/responses", { method: "POST" }),
+      { model: "vendor/beta", input: "hi", stream: true },
+      "vendor/beta",
+      streamUsageContext(telemetry),
+      { fetchResponses: () => Promise.resolve(sseResponse(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`))) }
+    );
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /response.output_text.delta/);
+    assert.match(body, /response.completed/);
+    assert.equal(telemetry.streamTerminalType, "response.completed");
+    assert.equal(telemetry.outputTokens, 1);
   });
 });
