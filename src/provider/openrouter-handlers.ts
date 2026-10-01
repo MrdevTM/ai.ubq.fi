@@ -11,7 +11,7 @@ import { readBoundedResponseBody } from "../bounded-response-body.ts";
 import { markChatSemanticOutput } from "../chat/stream-translation.ts";
 import { json, openaiError } from "../http.ts";
 import { BUFFERED_INFERENCE_DEADLINE_MS } from "../inference-deadline.ts";
-import { inferenceSignal } from "../openai.ts";
+import { downstreamSignalFor, inferenceSignal } from "../openai.ts";
 import {
   extractChatUsageTokens,
   extractUsageTokens,
@@ -25,6 +25,7 @@ import {
 } from "../openai-telemetry.ts";
 import { chatCompletionHasAnswerBearingOutput, providerRequestIdFromResponse, toOpenAiUpstreamErrorResponse } from "../upstream-wire.ts";
 import { recordOpenRouterProviderHealth } from "./health.ts";
+import { recordOpenRouterResponseHealth, streamOpenRouterChatCompletion, streamOpenRouterResponses } from "./openrouter-streams.ts";
 import {
   fetchOpenRouterChatCompletions,
   fetchOpenRouterResponses,
@@ -46,27 +47,6 @@ export type OpenRouterHandlerDeps = Readonly<{
 
 const OPENROUTER_UPSTREAM_LABEL = "openrouter";
 
-/** Mirrors the other providers' health classification for both routes. */
-const recordOpenRouterResponseHealth = (status: number): void => {
-  if (status === 401 || status === 403) {
-    void recordOpenRouterProviderHealth("auth_invalid", status, Date.now);
-    return;
-  }
-  if (status === 429) {
-    void recordOpenRouterProviderHealth("quota_exhausted", status, Date.now);
-    return;
-  }
-  if (status >= 500) {
-    void recordOpenRouterProviderHealth("upstream_error", status, Date.now);
-    return;
-  }
-  if (status >= 400) {
-    void recordOpenRouterProviderHealth("reachable", status, Date.now);
-    return;
-  }
-  void recordOpenRouterProviderHealth("success", status, Date.now);
-};
-
 const dispatchFailure = (error: unknown): Response => {
   if (error instanceof OpenRouterError && error.code === "openrouter_api_key_missing") {
     return openaiError(503, "OpenRouter is not configured", "openrouter_api_key_missing");
@@ -81,14 +61,6 @@ const dispatchFailure = (error: unknown): Response => {
 const isAbortLike = (error: unknown): boolean => {
   if (error instanceof Error) return error.name === "AbortError" || error.name === "TimeoutError";
   return false;
-};
-
-const streamedResponse = (upstream: Response): Response => {
-  const headers = new Headers(upstream.headers);
-  headers.set("content-type", "text/event-stream");
-  headers.set("cache-control", "no-cache");
-  headers.set("x-uos-upstream", OPENROUTER_UPSTREAM_LABEL);
-  return new Response(upstream.body, { status: 200, headers });
 };
 
 type Dispatched = Readonly<{ response: Response; providerRequestId: string | null }>;
@@ -150,13 +122,17 @@ export const handleOpenRouterChatCompletions = async (
   await recordRequestUsage(usageContext, { model: modelRaw, route: "chat.completions", stream: clientWantsStream, reasoning: null });
 
   const requestSignal = inferenceSignal(req, usageContext);
+  const downstreamSignal = downstreamSignalFor(req, usageContext);
   const transport = deps.fetchChat ?? fetchOpenRouterChatCompletions;
   const dispatched = await dispatchUpstream(
     async () => await transport(body, { signal: requestSignal, hooks: hooksFor(usageContext) }),
     requestSignal,
     usageContext
   );
-  if (!dispatched.response.ok || clientWantsStream) return streamedResponse(dispatched.response);
+  if (!dispatched.response.ok) return dispatched.response;
+  if (clientWantsStream) {
+    return streamOpenRouterChatCompletion(dispatched.response, dispatched.providerRequestId, usageContext, downstreamSignal, requestSignal, upstreamModel);
+  }
 
   const captured = await readBoundedResponseBody(dispatched.response, {
     signal: requestSignal,
@@ -197,13 +173,17 @@ export const handleOpenRouterResponses = async (
   await recordRequestUsage(usageContext, { model: modelRaw, route: "responses", stream: clientWantsStream, reasoning: null });
 
   const requestSignal = inferenceSignal(req, usageContext);
+  const downstreamSignal = downstreamSignalFor(req, usageContext);
   const transport = deps.fetchResponses ?? fetchOpenRouterResponses;
   const dispatched = await dispatchUpstream(
     async () => await transport(body, { signal: requestSignal, hooks: hooksFor(usageContext) }),
     requestSignal,
     usageContext
   );
-  if (!dispatched.response.ok || clientWantsStream) return streamedResponse(dispatched.response);
+  if (!dispatched.response.ok) return dispatched.response;
+  if (clientWantsStream) {
+    return streamOpenRouterResponses(dispatched.response, dispatched.providerRequestId, usageContext, downstreamSignal, requestSignal);
+  }
 
   const captured = await readBoundedResponseBody(dispatched.response, {
     signal: requestSignal,
