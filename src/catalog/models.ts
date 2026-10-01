@@ -19,6 +19,8 @@ import {
   readLithosApiKey,
 } from "../provider/lithos.ts";
 import { codexSnapshotMetadataHint, codexSubscriptionMetadataHint, resolveModelMetadata } from "../models/metadata.ts";
+import { openRouterModelsSnapshot } from "../models/openrouter-models.ts";
+import { readOpenRouterApiKey } from "../provider/openrouter.ts";
 import { CODEX_CATALOG_AUTH_GENERATION_KEY } from "./types.ts";
 
 const maybeUpdateNormalizedSnapshot = async (
@@ -392,6 +394,70 @@ const withCerebrasModels = (models: readonly Record<string, unknown>[]): Record<
   return [...models, ...configured.filter((model) => !present.has(String(model.slug)))];
 };
 
+/**
+ * Codex catalog records for the OpenRouter upstream.
+ *
+ * OpenRouter re-publishes OpenAI-compatible Chat Completions and Responses
+ * wires, so every id its cached public catalogue advertises is directly
+ * callable by a Codex client. Context windows and reasoning tiers come from the
+ * same enrichment snapshot the capabilities route reads, so a row states only
+ * what a source actually publishes; an id no source describes still defaults to
+ * `none` alone.
+ */
+const openRouterCodexModels = (): Record<string, unknown>[] => {
+  if (readOpenRouterApiKey() === null) return [];
+  return (openRouterModelsSnapshot()?.models ?? []).map((model) => {
+    const resolved = resolveModelMetadata(model.id);
+    const levels = resolved.supported_reasoning_levels;
+    return {
+      slug: model.id,
+      display_name: model.id,
+      description: "OpenRouter upstream (Chat Completions and Responses) served by this gateway.",
+      owned_by: model.id.split("/", 1)[0] || "openrouter",
+      supported_endpoint_types: ["openai-response", "openai-chat"],
+      supported_reasoning_levels: levels?.length
+        ? levels.map((effort) => ({ effort, description: codexReasoningEffortDescription(effort) }))
+        : [{ effort: "none", description: "No reasoning" }],
+      default_reasoning_level: resolved.default_reasoning_effort ?? "none",
+      ...(resolved.context_window_tokens === null
+        ? {}
+        : {
+            context_window: resolved.context_window_tokens,
+            max_context_window: resolved.max_context_window_tokens,
+            ...(resolved.auto_compact_token_limit_tokens === null ? {} : { auto_compact_token_limit: resolved.auto_compact_token_limit_tokens }),
+            ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
+          }),
+      shell_type: "shell_command",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 1000,
+      availability_nux: null,
+      upgrade: null,
+      base_instructions: "",
+      support_verbosity: false,
+      default_verbosity: null,
+      apply_patch_tool_type: null,
+      web_search_tool_type: "text",
+      truncation_policy: { mode: "tokens", limit: 10000 },
+      supports_parallel_tool_calls: false,
+      experimental_supported_tools: [],
+    };
+  });
+};
+
+/**
+ * Appends OpenRouter's served ids, skipping any slug the catalog already
+ * advertises. Callers append these rows after the operator whitelist: the
+ * upstream catalogue refreshes on its own TTL, so these rows cannot be curated
+ * by hand, and a new upstream model appears here as soon as the cache refreshes.
+ */
+const withOpenRouterModels = (models: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
+  const configured = openRouterCodexModels();
+  if (!configured.length) return [...models];
+  const present = new Set(models.map((model) => getString(model.slug) ?? getString(model.id) ?? ""));
+  return [...models, ...configured.filter((model) => !present.has(String(model.slug)))];
+};
+
 /** Trimmed model slugs advertised by a catalog body, in their stored order. */
 const catalogModelIds = (models: readonly unknown[]): Set<string> => {
   const ids = models
@@ -414,8 +480,10 @@ export {
   lithosCodexModels,
   maybeUpdateNormalizedSnapshot,
   meteredCodexModelRecord,
+  openRouterCodexModels,
   uniqueResponsesModels,
   withCerebrasModels,
   withDeepSeekOfficialModels,
   withLithosModels,
+  withOpenRouterModels,
 };

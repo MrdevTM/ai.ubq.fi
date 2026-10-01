@@ -37,6 +37,8 @@ import { readOpenRouterApiKey } from "../provider/openrouter.ts";
 import { cerebrasProviderHint, LITHOS_PROVIDER_HINT, modelIdFromSnapshotRecord } from "../request-policy.ts";
 import {
   configuredCerebrasModelCapabilities,
+  configuredOpenRouterModelCapabilities,
+  configuredOpenRouterModels,
   normalizeModelCapabilitiesEntry,
   normalizeModelList,
   withConfiguredCerebrasModel,
@@ -44,8 +46,6 @@ import {
   withConfiguredDeepSeekModels,
   withConfiguredLithosCapabilities,
   withConfiguredLithosModels,
-  withConfiguredOpenRouterCapabilities,
-  withConfiguredOpenRouterModels,
   OPENROUTER_SERVED_MODEL_ID,
 } from "../input-normalization.ts";
 
@@ -66,21 +66,15 @@ export const handleModels = async (req?: Request): Promise<Response> => {
   const snapshot = await loadCodexModelsSnapshot();
   const normalized = snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 ? normalizeModelList(snapshot) : null;
   const codexModels = isProviderEnabled("codex", selection) ? (normalized?.data ?? []) : [];
-  const data = withConfiguredOpenRouterModels(
-    withConfiguredLithosModels(
-      withConfiguredDeepSeekModels(
-        withConfiguredCerebrasModel(codexModels, isProviderEnabled("cerebras", selection)),
-        isProviderEnabled("deepseek", selection)
-      ),
-      isProviderEnabled("lithos", selection)
-    ),
-    isProviderEnabled("openrouter", selection)
+  const providerModels = withConfiguredLithosModels(
+    withConfiguredDeepSeekModels(withConfiguredCerebrasModel(codexModels, isProviderEnabled("cerebras", selection)), isProviderEnabled("deepseek", selection)),
+    isProviderEnabled("lithos", selection)
   );
   const [metered, surplus] = await Promise.all([
     isProviderEnabled("openlux", selection) ? fetchMeteredModels() : Promise.resolve(null),
     isProviderEnabled("surplus", selection) ? fetchSurplusModels() : Promise.resolve(null),
   ]);
-  const merged = [...data];
+  const merged = [...providerModels];
   for (const model of [...(metered?.models ?? []), ...(surplus?.models ?? [])]) {
     if (!model.supported_endpoint_types.some((type) => type === "openai" || type === "openai-response")) continue;
     if (merged.some((candidate) => candidate.id === model.id)) continue;
@@ -95,8 +89,15 @@ export const handleModels = async (req?: Request): Promise<Response> => {
   const modelsKv = await getKv();
   const whitelist = modelsKv ? await loadCodexModelsWhitelist(modelsKv) : null;
   const filtered = filterWhitelistedModelList(merged, whitelist);
+  // OpenRouter's served catalogue is the upstream's own and refreshes on its
+  // own TTL, so its rows stay advertised whenever the provider is on: a new
+  // upstream model lists without an operator re-save. The operator whitelist
+  // keeps curating every gateway-hosted id above.
+  const openRouterModels = isProviderEnabled("openrouter", selection) ? configuredOpenRouterModels() : [];
+  const listedIds = new Set(filtered.map((model) => getString(model.id) ?? ""));
+  const data = [...filtered, ...openRouterModels.filter((model) => !listedIds.has(getString(model.id) ?? ""))];
 
-  return json(200, { object: "list", data: filtered }, { "x-uos-upstream": snapshotUpstreamSource(snapshot) });
+  return json(200, { object: "list", data }, { "x-uos-upstream": snapshotUpstreamSource(snapshot) });
 };
 
 type PublicModelProvider = Readonly<{
@@ -424,9 +425,21 @@ export const handlePublicModelCatalog = async (): Promise<Response> => {
   const [catalog, selection] = await Promise.all([buildModelCatalogSnapshot(), loadProviderSelectionCached()]);
   const catalogKv = await getKv();
   const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
+  const selected = filterCatalogEntriesByProviderSelection(catalog.models, selection);
+  // OpenRouter's entries follow the upstream's own catalogue, which refreshes
+  // on its TTL; the operator whitelist curates every other entry as before.
+  const openRouterEntries = isProviderEnabled("openrouter", selection)
+    ? selected.filter((entry) => entry.providers.some((provider) => provider.id === "openrouter"))
+    : [];
+  const openRouterIds = new Set(openRouterEntries.map((entry) => entry.id));
+  const curated = filterWhitelistedModelMap(
+    selected.filter((entry) => !openRouterIds.has(entry.id)),
+    catalogWhitelist
+  );
+  const data = [...curated, ...openRouterEntries].sort((left, right) => left.id.localeCompare(right.id));
   return json(200, {
     object: "uos.model_catalog",
-    data: filterWhitelistedModelMap(filterCatalogEntriesByProviderSelection(catalog.models, selection), catalogWhitelist),
+    data,
     sources: selectedCatalogSources(catalog.sources, selection),
   });
 };
@@ -502,17 +515,22 @@ export const handleModelCapabilities = async (): Promise<Response> => {
   // fallback is replaced by the capabilities of the route it actually uses.
   data = withConfiguredDeepSeekCapabilities(data, isProviderEnabled("deepseek", selection));
   data = withConfiguredLithosCapabilities(data, isProviderEnabled("lithos", selection));
-  data = withConfiguredOpenRouterCapabilities(data, isProviderEnabled("openrouter", selection));
 
   const capabilitiesKv = await getKv();
   const capabilitiesWhitelist = capabilitiesKv ? await loadCodexModelsWhitelist(capabilitiesKv) : null;
   const filteredData = filterWhitelistedModelList(data, capabilitiesWhitelist);
+  // Appended after the whitelist for the same reason as `/v1/models`:
+  // OpenRouter's rows follow its own catalogue rather than the operator's
+  // curated gateway list.
+  const openRouterCapabilities = isProviderEnabled("openrouter", selection) ? configuredOpenRouterModelCapabilities() : [];
+  const listedIds = new Set(filteredData.map((model) => getString(model.id) ?? ""));
+  const dataWithOpenRouter = [...filteredData, ...openRouterCapabilities.filter((model) => !listedIds.has(getString(model.id) ?? ""))];
 
   return json(
     200,
     {
       object: "list",
-      data: filteredData,
+      data: dataWithOpenRouter,
       upstream_provider: "codex_chatgpt",
       source: snapshot?.source ?? "stored_codex_models",
       client_version: snapshot?.client_version ?? null,
