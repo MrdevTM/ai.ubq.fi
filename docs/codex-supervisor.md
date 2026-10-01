@@ -64,9 +64,9 @@ A local preview therefore needs, in addition to the existing serve permissions:
 --allow-sys=hostname   # optional: without it the machine name reports as unavailable
 ```
 
-The Mac service file `ops/com.ubiquity.ai.local.plist` grants read access to `~/.codex` and write access to
-`~/.codex/app-server-control`; the VPS service file does not yet grant those paths, and granting them there is a
-separate, explicit operations change.
+Both service files grant read access to the Codex home and write access to `<codexHome>/app-server-control`:
+`ops/com.ubiquity.ai.local.plist` for the Mac agent, and `ops/ai-ubq-fi.service` for the VPS unit, which also sets
+`PrivateTmp=false` because the daemon's real socket lives in a hashed `/tmp` directory.
 
 ## Read methods
 
