@@ -1,4 +1,4 @@
-import { DEEPSEEK_FLASH_MODEL, DeepSeekError, fetchDeepSeekChatCompletions } from "../deepseek/index.ts";
+import { CEREBRAS_GPT_OSS_120B_MODEL, CerebrasError, fetchCerebrasChatCompletions } from "../provider/cerebras.ts";
 import { redactSupervisorSecrets } from "./supervisor-secret.ts";
 import { json, openaiError } from "../http.ts";
 import { readSupervisorRolloutTail, type SupervisorLogEvent } from "./supervisor-log.ts";
@@ -14,13 +14,19 @@ import { ensureSupervisorSnapshot } from "./supervisor-inventory.ts";
  * super admin clicks the per-session button: the normal inventory poll never
  * reaches it. It reads a bounded, redacted transcript through the same
  * read-only app-server allowlist the rest of the panel uses, treats the
- * recorded log as untrusted data, and asks DeepSeek's existing official client
+ * recorded log as untrusted data, and asks the existing Cerebras client
  * for one JSON object with no tools. It never writes to, resumes, or steers the
  * monitored session.
  */
 
-const BRIEF_MODEL = DEEPSEEK_FLASH_MODEL;
-const BRIEF_REASONING_EFFORT = "max";
+const BRIEF_MODEL = CEREBRAS_GPT_OSS_120B_MODEL;
+/**
+ * The deepest tier gpt-oss-120b accepts: Cerebras refuses `none` for this model
+ * and does not advertise `max`, which is DeepSeek's own top tier. Measured on
+ * this repository's brief prompts, `high` still finishes with `stop` well
+ * inside the 4,096-token completion cap.
+ */
+const BRIEF_REASONING_EFFORT = "high";
 const BRIEF_DEADLINE_MS = 45_000;
 const BRIEF_MAX_COMPLETION_TOKENS = 4_096;
 const BRIEF_RECENT_TURNS = 6;
@@ -539,6 +545,7 @@ export const buildSupervisorBriefPrompt = (context: SupervisorBriefContext): str
 export const buildSupervisorBriefRequestBody = (context: SupervisorBriefContext): Record<string, unknown> => {
   const prompt = boundedText(buildSupervisorBriefPrompt(context), BRIEF_MAX_PROMPT_BYTES);
   return {
+    model: BRIEF_MODEL,
     messages: [
       { role: "system", content: BRIEF_SYSTEM_PROMPT },
       { role: "user", content: prompt },
@@ -653,9 +660,9 @@ const briefTranscriptMeta = (context: SupervisorBriefContext): Record<string, un
 const generateBrief = async (context: SupervisorBriefContext, sampledAtMs: number, signal: AbortSignal): Promise<Record<string, unknown> | Response> => {
   let response: Response;
   try {
-    response = await fetchDeepSeekChatCompletions(buildSupervisorBriefRequestBody(context), BRIEF_MODEL, { signal });
+    response = await fetchCerebrasChatCompletions(buildSupervisorBriefRequestBody(context), { signal });
   } catch (error) {
-    if (error instanceof DeepSeekError) return openaiError(error.status, error.message, error.code, { type: "server_error" });
+    if (error instanceof CerebrasError) return openaiError(error.status, error.message, error.code, { type: "server_error" });
     return briefError(502, "The summarizer request failed");
   }
   if (!response.ok) return briefError(502, `The summarizer returned HTTP ${response.status}`);

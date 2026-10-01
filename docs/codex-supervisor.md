@@ -143,8 +143,9 @@ The data flow is:
    sent.
 4. The prompt carries the session metadata and transcript inside `<session_metadata>`/`<session_log>` delimiters and
    instructs the model to treat that content as untrusted data. The summarizer calls the existing DeepSeek Chat
-   Completions client with the `deepseek-flash` model, `reasoning_effort: "max"`, JSON response mode, no tools, and a
-   45-second deadline, and validates the returned `{ "about": string, "status": string }` object before rendering it.
+   Completions client with the `gpt-oss-120b` model on Cerebras, `reasoning_effort: "high"` (that provider's deepest
+   tier; `max` is DeepSeek-only), JSON response mode, no tools, and a 45-second deadline, and validates the returned
+   `{ "about": string, "status": string }` object before rendering it.
 5. A partial or missing transcript is stated plainly in the brief instead of being guessed at; when no recorded turn was
    available at all, the route answers from the live thread metadata without calling the model. The brief line shows the
    inventory snapshot timestamp, the generation timestamp, truncation, and redaction counts.

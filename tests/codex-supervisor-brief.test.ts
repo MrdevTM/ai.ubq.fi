@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { fetchDeepSeekChatCompletions } from "../src/deepseek/index.ts";
+import { fetchCerebrasChatCompletions } from "../src/provider/cerebras.ts";
 import handler from "../src/handler/index.ts";
 import type { SupervisorSource } from "../src/codex/supervisor-config.ts";
 import {
@@ -103,7 +103,7 @@ Deno.test("redactBriefText recognizes quoted JSON credential keys and real GitHu
   assert.match(result.text, /\[redacted\]/);
 });
 
-Deno.test("the brief's DeepSeek payload carries no quoted-JSON or GitHub credential canaries", async () => {
+Deno.test("the brief's Cerebras payload carries no quoted-JSON or GitHub credential canaries", async () => {
   const classicTokens = [
     "ghp_syntheticcanary0000000000000011",
     "gho_syntheticcanary0000000000000012",
@@ -140,25 +140,28 @@ Deno.test("the brief's DeepSeek payload carries no quoted-JSON or GitHub credent
     ],
   });
   // generateBrief is module-private, so this drives the exact body it hands to
-  // fetchDeepSeekChatCompletions and captures the bytes that transport sends.
+  // fetchCerebrasChatCompletions and captures the bytes that transport sends.
   const body = buildSupervisorBriefRequestBody(context);
   const outbound: string[] = [];
-  const response = await fetchDeepSeekChatCompletions(body, "deepseek-flash", {
-    apiKey: "synthetic-api-key",
-    fetcher: (_input, init) => {
-      const bodyText = init?.body;
-      outbound.push(typeof bodyText === "string" ? bodyText : "");
-      return Promise.resolve(
-        Response.json({
-          id: "chatcmpl-synthetic",
-          object: "chat.completion",
-          created: 1,
-          model: "deepseek-flash",
-          choices: [{ index: 0, message: { role: "assistant", content: '{"about":"Panel work","status":"Tests passed"}' }, finish_reason: "stop" }],
-        })
-      );
-    },
-  });
+  const response = await fetchCerebrasChatCompletions(
+    { ...body, model: "gpt-oss-120b" },
+    {
+      apiKey: "synthetic-api-key",
+      fetcher: (_input, init) => {
+        const bodyText = init?.body;
+        outbound.push(typeof bodyText === "string" ? bodyText : "");
+        return Promise.resolve(
+          Response.json({
+            id: "chatcmpl-synthetic",
+            object: "chat.completion",
+            created: 1,
+            model: "gpt-oss-120b",
+            choices: [{ index: 0, message: { role: "assistant", content: '{"about":"Panel work","status":"Tests passed"}' }, finish_reason: "stop" }],
+          })
+        );
+      },
+    }
+  );
   assert.equal(response.ok, true);
   await response.json();
   const wire = outbound.join("");
@@ -438,7 +441,7 @@ Deno.test("brief transcript reports a missing transcript instead of inventing pr
   assert.equal(context.contextBytes, 0);
 });
 
-Deno.test("the summarizer request is a no-tools JSON-mode deepseek call on untrusted data", async () => {
+Deno.test("the summarizer request is a no-tools JSON-mode Cerebras gpt-oss call on untrusted data", async () => {
   const context = await collectWith({
     read: threadRead,
     first: [{ id: "turn-0", status: "completed", items: [{ type: "userMessage", id: "u0", content: [{ type: "text", text: "Please fix the panel" }] }] }],
@@ -449,7 +452,8 @@ Deno.test("the summarizer request is a no-tools JSON-mode deepseek call on untru
   assert.equal("tool_choice" in body, false);
   assert.equal(body.stream, false);
   assert.deepEqual(body.response_format, { type: "json_object" });
-  assert.equal(body.reasoning_effort, "max");
+  assert.equal(body.model, "gpt-oss-120b");
+  assert.equal(body.reasoning_effort, "high");
   assert.equal(typeof body.max_completion_tokens, "number");
   assert.ok(Array.isArray(body.messages));
   const messages = body.messages as { role: string; content: string }[];
