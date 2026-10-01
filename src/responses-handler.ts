@@ -7,7 +7,7 @@ import { markCodexResponseCompleted, markCodexResponseUpstreamError, releaseCode
 import { deepSeekUpstreamModelFor } from "./deepseek/index.ts";
 import { cerebrasUpstreamModelFor } from "./provider/cerebras.ts";
 import { lithosUpstreamModelFor } from "./provider/lithos.ts";
-import { openRouterUpstreamModelFor } from "./provider/openrouter.ts";
+import { resolveOpenRouterUpstreamModel } from "./provider/openrouter.ts";
 import { handleOpenRouterResponses } from "./provider/openrouter-handlers.ts";
 import { isProviderEnabled, loadProviderSelectionCached } from "./provider/selection.ts";
 import { createStreamFirstEventDeadline, createStreamSemanticDeadline, STREAM_FAILOVER_RESERVE_MS } from "./inference-deadline.ts";
@@ -803,7 +803,7 @@ const handleResponsesInternal = async (req: Request, usageContext?: UsageContext
   // OpenRouter serves the Responses wire natively; only an id in its served
   // catalogue takes this branch, and a switched-off provider leaves its ids to
   // the ordinary availability check.
-  if (requestedModel && openRouterUpstreamModelFor(requestedModel) && isProviderEnabled("openrouter", await loadProviderSelectionCached())) {
+  if (requestedModel && (await resolveOpenRouterUpstreamModel(requestedModel)) && isProviderEnabled("openrouter", await loadProviderSelectionCached())) {
     return await handleOpenRouterResponses(req, rawRecord, requestedModel, usageContext);
   }
   const prepared = await prepareResponsesRequest(req, rawRecord, rawBody, usageContext);
