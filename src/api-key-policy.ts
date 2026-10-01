@@ -192,6 +192,7 @@ export const normalizeApiKeyUsageRequestV3 = (value: unknown): ApiKeyUsageReques
       value.provider === "chatgpt_codex" ||
       value.provider === "deepseek" ||
       value.provider === "lithos" ||
+      value.provider === "openrouter" ||
       value.provider === "removed_provider" ||
       value.provider === "metered" ||
       value.provider === "surplus" ||

@@ -490,6 +490,8 @@ Deno.test("a malformed usage window or request row is refused instead of trusted
   );
   const dispatched = { ...reserved, state: "dispatched", provider: "cerebras", dispatched_at_ms: 2 };
   assert.deepEqual(normalizeApiKeyUsageRequestV3(dispatched), dispatched);
+  const openRouterDispatched = { ...reserved, state: "dispatched", provider: "openrouter", dispatched_at_ms: 2 };
+  assert.deepEqual(normalizeApiKeyUsageRequestV3(openRouterDispatched), openRouterDispatched, "an OpenRouter dispatch keeps its provider identity");
   assert.equal(normalizeApiKeyUsageRequestV3({ ...dispatched, provider: null }), null);
   assert.equal(normalizeApiKeyUsageRequestV3({ ...dispatched, dispatched_at_ms: null }), null);
   const released = { ...reserved, state: "released", released_at_ms: 3, release_reason: "route_completed_without_provider_dispatch" };
