@@ -15,7 +15,7 @@
     <link rel="icon" href="/favicon.png" type="image/png" sizes="256x256" />
     <link rel="stylesheet" href="/style.css?v=passport-design-20260922" />
     <link rel="stylesheet" href="/admin.css?v=passport-design-20260922" />
-    <link rel="stylesheet" href="/admin-supervisor.css?v=20261001-supervisor-v3" />
+    <link rel="stylesheet" href="/admin-supervisor.css?v=20261001-supervisor-v4" />
   </head>
   <body data-page="admin" data-role="admin" data-auth-widget="collapsed" data-auth-scope="none">
     <div data-shell>
@@ -846,9 +846,8 @@
               <span data-admin-eyebrow>Read-only observation</span>
               <h2 id="card-supervisor">Codex supervisor</h2>
               <p>
-                See which Codex sessions are running on each connected machine, what they are working on, and what they are
-                waiting for. This panel only reads: it never resumes, steers, approves, or stops a session. A session is
-                active only when its runtime status says so, not because its timestamp is recent.
+                Every session is reported as its runtime state describes it; this panel only reads and never resumes,
+                steers, approves, or stops a session.
               </p>
             </header>
             <div data-card-body>
@@ -884,33 +883,39 @@
                 </label>
               </div>
               <div id="supervisor-notice" hidden></div>
-              <div id="supervisor-list" data-key-list role="list" aria-live="polite"></div>
-              <p id="supervisor-empty" data-empty>Waiting for the first sample.</p>
-              <section id="supervisor-follow" aria-label="Follow recorded output" hidden>
-                <div data-provider-heading>
-                  <strong id="supervisor-follow-title">Follow output</strong>
-                  <button id="supervisor-follow-stop" type="button">Stop following</button>
+              <div data-supervisor-columns>
+                <div data-supervisor-sessions>
+                  <div id="supervisor-list" data-key-list role="list"></div>
+                  <p id="supervisor-empty" data-empty>Waiting for the first sample.</p>
                 </div>
-                <p id="supervisor-follow-status" data-muted></p>
-                <div id="supervisor-follow-log" role="log" aria-live="polite"></div>
-              </section>
-              <section id="supervisor-brief" aria-label="Session brief" hidden>
-                <div data-provider-heading>
-                  <strong id="supervisor-brief-title">Session brief</strong>
-                  <button id="supervisor-brief-close" type="button">Close</button>
+                <div data-supervisor-inspector>
+                  <section id="supervisor-follow" aria-label="Follow recorded output" hidden>
+                    <div data-provider-heading>
+                      <strong id="supervisor-follow-title">Follow output</strong>
+                      <button id="supervisor-follow-stop" type="button">Stop following</button>
+                    </div>
+                    <p id="supervisor-follow-status" data-muted></p>
+                    <div id="supervisor-follow-log" role="log" aria-live="polite"></div>
+                  </section>
+                  <section id="supervisor-brief" aria-label="Session brief" hidden>
+                    <div data-provider-heading>
+                      <strong id="supervisor-brief-title">Session brief</strong>
+                      <button id="supervisor-brief-close" type="button">Close</button>
+                    </div>
+                    <p id="supervisor-brief-status" data-muted></p>
+                    <div id="supervisor-brief-body" hidden>
+                      <div data-brief-section>
+                        <h3>About this session</h3>
+                        <p id="supervisor-brief-about"></p>
+                      </div>
+                      <div data-brief-section>
+                        <h3>Current status</h3>
+                        <p id="supervisor-brief-state"></p>
+                      </div>
+                    </div>
+                  </section>
                 </div>
-                <p id="supervisor-brief-status" data-muted></p>
-                <div id="supervisor-brief-body" hidden>
-                  <div data-brief-section>
-                    <h3>About this session</h3>
-                    <p id="supervisor-brief-about"></p>
-                  </div>
-                  <div data-brief-section>
-                    <h3>Current status</h3>
-                    <p id="supervisor-brief-state"></p>
-                  </div>
-                </div>
-              </section>
+              </div>
             </div>
           </article>
         </section>
