@@ -68,8 +68,8 @@ export const PROVIDER_PRESENTATION: Readonly<Record<SelectableProviderId, Provid
   openrouter: {
     label: "OpenRouter",
     tier: "direct",
-    detail: "System One decisions (Typesafe Jev) for the selector-repair design step. Serves /v1/systemone; it is not part of the chat waterfall.",
-    endpoints: ["/v1/systemone"],
+    detail: "OpenRouter's full served catalogue on both OpenAI wires, plus System One decisions (Typesafe Jev) for the selector-repair design step.",
+    endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/systemone"],
     health_key: "openrouter",
   },
   lithos: {

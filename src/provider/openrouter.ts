@@ -1,15 +1,13 @@
 // OpenRouter upstream provider.
 //
-// OpenRouter is the gateway's upstream for Typesafe System One decisions
-// (`typesafe/jev-*`). Its SystemOne contract is not OpenAI-shaped chat, so this
-// provider exposes one typed transport — `fetchOpenRouterSystemOne` — that the
-// `/v1/systemone` terminal route serves with the gateway's own quota,
-// admission, and telemetry treatment. Nothing here hardcodes a Jev model id:
-// callers pass the SystemOne model they want, and the route constrains it to
-// the typesafe namespace so a shared credential cannot reach unrelated models.
-//
-// Chat and model-catalog access is deliberately not wired here yet; the repo
-// already reads OpenRouter's public model list for metadata enrichment only.
+// OpenRouter serves two surfaces for this gateway: its cached public catalogue
+// on both OpenAI-compatible wires, and the typed System One decision transport
+// (`typesafe/jev-*`) behind `/v1/systemone`. The SystemOne contract is not
+// OpenAI-shaped chat, so it keeps its own fetch — `fetchOpenRouterSystemOne` —
+// which the terminal route serves with the gateway's own quota, admission, and
+// telemetry treatment. Nothing here hardcodes a Jev model id: callers pass the
+// SystemOne model they want, and the route constrains it to the typesafe
+// namespace so a shared credential cannot reach unrelated models.
 
 import { fetchOpenRouterModels, openRouterModelsSnapshot } from "../models/openrouter-models.ts";
 import type { ApiKeyProviderDispatch } from "../api-key-policy.ts";
