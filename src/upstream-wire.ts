@@ -575,6 +575,11 @@ export const lithosResponseHeaders = (providerRequestId: string | null): Record<
   ...(providerRequestId ? { "x-uos-provider-request-id": providerRequestId } : {}),
 });
 
+export const openRouterResponseHeaders = (providerRequestId: string | null): Record<string, string> => ({
+  "x-uos-upstream": "openrouter",
+  ...(providerRequestId ? { "x-uos-provider-request-id": providerRequestId } : {}),
+});
+
 export const toLithosErrorResponse = (error: unknown): Response => {
   let response: Response;
   if (error instanceof ApiKeyQuotaDispatchError) {

@@ -29,6 +29,9 @@ export type ProviderStreamFrame = DeepSeekStreamFrame;
  * telemetry, semantic-output detection, failure classification order - is
  * written once.
  */
+/** The adapter a chat-wire relay needs; the Responses translator profile is not part of it. */
+export type ProviderChatStreamAdapter = Omit<ProviderStreamAdapter, "responsesProfile">;
+
 export type ProviderStreamAdapter = Readonly<{
   /** This provider's response headers, including its provider-request-id echo. */
   responseHeaders: (providerRequestId: string | null) => Record<string, string>;
@@ -104,7 +107,7 @@ const closeController = (controller: ReadableStreamDefaultController<Uint8Array>
  * buffered replay.
  */
 export const relayChatCompletionStream = (
-  adapter: ProviderStreamAdapter,
+  adapter: ProviderChatStreamAdapter,
   /**
    * The provider attempt that is ready now, or the promise a deferred wait
    * resolves with once the vendor's own window passes. A pending source is

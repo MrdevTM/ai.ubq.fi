@@ -62,6 +62,9 @@ export const handleModels = async (req?: Request): Promise<Response> => {
   }
   // A switched-off provider is not advertised, so its rows leave this list even
   // while the discovery snapshots still hold them.
+  // Start the OpenRouter catalogue refresh without waiting: the first request
+  // after a cold start may still miss its rows, and the next one has them.
+  warmOpenRouterModels();
   const selection = await loadProviderSelectionCached();
   const snapshot = await loadCodexModelsSnapshot();
   const normalized = snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 ? normalizeModelList(snapshot) : null;
