@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 
+import { withOpenRouterModels } from "../src/catalog/models.ts";
+import { CODEX_MODELS_KV_KEY } from "../src/codex/index.ts";
+import { setKvForTest } from "../src/kv.ts";
+import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/models/codex-models-whitelist.ts";
+import { handleModelCapabilities, handleModels, handlePublicModelCatalog } from "../src/models/catalog.ts";
 import { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest, setOpenRouterModelsFetchForTest } from "../src/models/openrouter-models.ts";
 import { openRouterUpstreamModelFor } from "../src/provider/openrouter.ts";
 import { handleOpenRouterChatCompletions, handleOpenRouterResponses } from "../src/provider/openrouter-handlers.ts";
+import { resetProviderSelectionCacheForTest } from "../src/provider/selection.ts";
+import { resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
 
 const catalogue = {
   data: [
@@ -108,5 +115,109 @@ Deno.test("openrouter responses forwards the client body and reports the upstrea
     assert.equal(response.status, 200);
     assert.equal(captured.body?.model, "vendor/beta");
     assert.equal(response.headers.get("x-uos-upstream"), "openrouter");
+  });
+});
+
+const keyOf = (key: Deno.KvKey): string => JSON.stringify(key);
+
+/** Minimal Deno.Kv stand-in for the model-listing paths. */
+class CatalogKv {
+  readonly values = new Map<string, unknown>();
+
+  get<T>(key: Deno.KvKey, _options?: { consistency?: "strong" | "eventual" }): Promise<Deno.KvEntryMaybe<T>> {
+    const stored = this.values.get(keyOf(key));
+    return Promise.resolve({
+      key,
+      value: (stored ?? null) as T | null,
+      versionstamp: stored === undefined ? null : "00000000000000000001",
+    } as Deno.KvEntryMaybe<T>);
+  }
+
+  set(key: Deno.KvKey, value: unknown): Promise<Deno.KvCommitResult> {
+    this.values.set(keyOf(key), value);
+    return Promise.resolve({ ok: true, versionstamp: "00000000000000000002" });
+  }
+}
+
+Deno.test("openrouter catalogue rows stay listed while the operator whitelist hides gateway ids", async () => {
+  const meteredKey = Deno.env.get("METERED_API_KEY");
+  const surplusKey = Deno.env.get("SURPLUS_API_KEY");
+  Deno.env.delete("METERED_API_KEY");
+  Deno.env.delete("SURPLUS_API_KEY");
+  const kv = new CatalogKv();
+  const codexSnapshot = {
+    source: "chatgpt_codex",
+    client_version: "0.125.0",
+    updated_at_ms: Date.now(),
+    models: [{ slug: "hidden-codex-id" }, { slug: "listed-codex-id" }],
+  };
+  kv.values.set(keyOf([...CODEX_MODELS_KV_KEY]), codexSnapshot);
+  kv.values.set(keyOf([...RUNTIME_CONFIG_V2_KEY]), {
+    version: 2,
+    default_model: "listed-codex-id",
+    default_reasoning_effort: "low",
+    codex_models: codexSnapshot,
+    updated_at_ms: Date.now(),
+  });
+  kv.values.set(keyOf([...CODEX_MODELS_WHITELIST_KV_KEY]), { model_ids: ["listed-codex-id"], updated_at_ms: 1 });
+  resetProviderSelectionCacheForTest();
+  resetRuntimeConfigCacheForTest();
+  setKvForTest(kv as unknown as Deno.Kv);
+  try {
+    await withServedCatalogue(async () => {
+      const list = await handleModels();
+      assert.equal(list.status, 200);
+      const listedIds = ((await list.json()) as { data: { id: string }[] }).data.map((model) => model.id);
+      assert.equal(listedIds.includes("listed-codex-id"), true, "a whitelisted gateway id stays listed");
+      assert.equal(listedIds.includes("hidden-codex-id"), false, "the whitelist still hides gateway ids");
+      assert.equal(listedIds.includes("vendor/alpha"), true, "every served OpenRouter id is listed");
+      assert.equal(listedIds.includes("vendor/beta"), true, "every served OpenRouter id is listed");
+      assert.equal(listedIds.includes("typesafe/jev-latest"), true, "the System One id stays listed");
+
+      const capabilities = await handleModelCapabilities();
+      assert.equal(capabilities.status, 200);
+      const capabilityIds = ((await capabilities.json()) as { data: { id: string }[] }).data.map((model) => model.id);
+      assert.equal(capabilityIds.includes("vendor/alpha"), true, "capabilities advertise the served OpenRouter ids");
+      assert.equal(capabilityIds.includes("vendor/beta"), true, "capabilities advertise the served OpenRouter ids");
+      assert.equal(capabilityIds.includes("hidden-codex-id"), false, "capabilities still honor the whitelist");
+
+      const catalog = await handlePublicModelCatalog();
+      assert.equal(catalog.status, 200);
+      const entries = ((await catalog.json()) as { data: { id: string; providers: { id: string }[] }[] }).data;
+      assert.deepEqual(
+        entries.find((entry) => entry.id === "vendor/alpha")?.providers.map((provider) => provider.id),
+        ["openrouter"]
+      );
+      assert.equal(
+        entries.some((entry) => entry.id === "hidden-codex-id"),
+        false,
+        "the public catalogue still honors the whitelist"
+      );
+    });
+  } finally {
+    setKvForTest(null);
+    resetProviderSelectionCacheForTest();
+    resetRuntimeConfigCacheForTest();
+    if (meteredKey === undefined) Deno.env.delete("METERED_API_KEY");
+    else Deno.env.set("METERED_API_KEY", meteredKey);
+    if (surplusKey === undefined) Deno.env.delete("SURPLUS_API_KEY");
+    else Deno.env.set("SURPLUS_API_KEY", surplusKey);
+  }
+});
+
+Deno.test("openrouter codex rows carry only source-stated metadata", async () => {
+  await withServedCatalogue(() => {
+    const rows = withOpenRouterModels([{ slug: "vendor/alpha", display_name: "stored alpha" }]);
+    assert.deepEqual(
+      rows.map((row) => row.slug),
+      ["vendor/alpha", "vendor/beta"]
+    );
+    assert.equal(rows[0].display_name, "stored alpha", "an existing row keeps precedence over the appended id");
+    const beta = rows[1];
+    assert.equal(beta.display_name, "vendor/beta");
+    assert.equal(beta.owned_by, "vendor");
+    assert.deepEqual(beta.supported_endpoint_types, ["openai-response", "openai-chat"]);
+    assert.deepEqual(beta.supported_reasoning_levels, [{ effort: "none", description: "No reasoning" }]);
+    assert.equal(beta.default_reasoning_level, "none");
   });
 });

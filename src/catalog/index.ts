@@ -7,6 +7,7 @@ import { getKv } from "../kv.ts";
 import { sha256Hex } from "../utils.ts";
 
 import { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS } from "../provider/metered.ts";
+import { readOpenRouterApiKey } from "../provider/openrouter.ts";
 import type { recordSentinelProviderDegradationFromEnvironment } from "../sentinel/incident-outbox.ts";
 import { fetchSurplusModels, SURPLUS_MODELS_CACHE_TTL_MS } from "../provider/surplus.ts";
 
@@ -36,10 +37,12 @@ import {
   lithosCodexModels,
   maybeUpdateNormalizedSnapshot,
   meteredCodexModelRecord,
+  openRouterCodexModels,
   uniqueResponsesModels,
   withCerebrasModels,
   withDeepSeekOfficialModels,
   withLithosModels,
+  withOpenRouterModels,
 } from "./models.ts";
 
 const catalogBodyEtag = async (body: string, catalog: LoadedCodexCatalog): Promise<string | null> =>
@@ -79,6 +82,19 @@ const enabledPaidCatalogSources = async (selection: ProviderSelection | null, op
   ]);
 };
 
+/**
+ * Apply the operator's curated whitelist to the gateway-hosted rows, then
+ * append OpenRouter's own dynamic catalogue: those rows come from the upstream
+ * snapshot and refresh on its TTL, so they stay listed without an operator
+ * re-save while every curated id above stays gated.
+ */
+const applyCatalogWhitelist = async (models: readonly Record<string, unknown>[], openRouterEnabled: boolean): Promise<Record<string, unknown>[]> => {
+  const kv = await getKv();
+  const whitelist = kv ? await loadCodexModelsWhitelist(kv) : null;
+  const filtered = filterWhitelistedCatalogModels(models, whitelist);
+  return openRouterEnabled ? withOpenRouterModels(filtered) : filtered;
+};
+
 const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheState: string): Promise<Response> => {
   // Rows this response appends are resolved dynamically, so start an enrichment
   // refresh without waiting for it; the stored catalog already carries Codex's
@@ -95,6 +111,9 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   const deepSeekEnabled = isProviderEnabled("deepseek", selection);
   const lithosEnabled = isProviderEnabled("lithos", selection);
   const cerebrasEnabled = isProviderEnabled("cerebras", selection);
+  // OpenRouter serves its own dynamic catalogue on both OpenAI wires; its rows
+  // are appended after the operator whitelist below.
+  const openRouterEnabled = isProviderEnabled("openrouter", selection) && readOpenRouterApiKey() !== null;
   const [metered, surplus] = await enabledPaidCatalogSources(selection);
   const nowMs = Date.now();
   if (metered) refreshExpiredModelList(nowMs, metered.updated_at_ms, METERED_MODELS_CACHE_TTL_MS, fetchMeteredModels);
@@ -105,7 +124,8 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   // A provider that can append rows keeps the response off the stored-body
   // short circuit, so an appended row is never dropped by answering with the
   // catalog body alone.
-  if (!paidModels.length && !deepSeekEnabled && !lithosEnabled && !cerebrasEnabled && codexEnabled) return catalogOnlyResponse(catalog, req, headers);
+  if (!paidModels.length && !deepSeekEnabled && !lithosEnabled && !cerebrasEnabled && !openRouterEnabled && codexEnabled)
+    return catalogOnlyResponse(catalog, req, headers);
   const parsed = {
     ...catalog.parsed,
     models: codexEnabled && Array.isArray(catalog.parsed.models) ? [...catalog.parsed.models] : [],
@@ -118,13 +138,11 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
     seen.add(model.id);
   }
   // The official ids are appended first so an operator whitelist still has the
-  // final say over every advertised model, this route included.
+  // final say over every gateway-hosted model.
   parsed.models = deepSeekEnabled ? withDeepSeekOfficialModels(parsed.models) : parsed.models;
   parsed.models = lithosEnabled ? withLithosModels(parsed.models) : parsed.models;
   parsed.models = cerebrasEnabled ? withCerebrasModels(parsed.models) : parsed.models;
-  const catalogKv = await getKv();
-  const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
-  parsed.models = filterWhitelistedCatalogModels(parsed.models, catalogWhitelist);
+  parsed.models = await applyCatalogWhitelist(parsed.models, openRouterEnabled);
   const body = JSON.stringify(parsed);
   const etag = await catalogBodyEtag(body, catalog);
   if (etag) headers.set("ETag", etag);
@@ -137,10 +155,12 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
 const meteredCatalogResponse = async (selection: ProviderSelection | null): Promise<Response | null> => {
   const [metered, surplus] = await enabledPaidCatalogSources(selection, { force: true });
   const paidModels = uniqueResponsesModels([...(metered?.models ?? []), ...(surplus?.models ?? [])]);
+  const openRouterModels = isProviderEnabled("openrouter", selection) ? openRouterCodexModels() : [];
   const configured = [
     ...(isProviderEnabled("deepseek", selection) ? deepSeekOfficialCodexModels() : []),
     ...(isProviderEnabled("lithos", selection) ? lithosCodexModels() : []),
     ...(isProviderEnabled("cerebras", selection) ? cerebrasCodexModels() : []),
+    ...openRouterModels,
   ];
   if (!paidModels.length && !configured.length) return null;
   // This path answers without a stored catalog, so the Codex snapshot is the only
@@ -148,8 +168,10 @@ const meteredCatalogResponse = async (selection: ProviderSelection | null): Prom
   const codexRecords = codexSnapshotRecords(await loadFullCodexModelsSnapshot());
   return new Response(
     JSON.stringify({
-      models: withCerebrasModels(
-        withLithosModels(withDeepSeekOfficialModels(paidModels.map((model) => meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null))))
+      models: withOpenRouterModels(
+        withCerebrasModels(
+          withLithosModels(withDeepSeekOfficialModels(paidModels.map((model) => meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null))))
+        )
       ),
     }),
     {

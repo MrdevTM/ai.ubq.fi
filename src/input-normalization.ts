@@ -509,10 +509,15 @@ const openRouterServedModels = (): readonly { id: string; endpoints: readonly st
   return catalogue;
 };
 
-const configuredOpenRouterModels = (): Record<string, unknown>[] =>
+/**
+ * OpenRouter's served rows are published by the upstream and refresh on the
+ * cache TTL, so the listing routes append them after the operator whitelist
+ * instead of letting a curated list hide ids the upstream already serves.
+ */
+export const configuredOpenRouterModels = (): Record<string, unknown>[] =>
   openRouterServedModels().map((model) => ({ id: model.id, object: "model", created: 0, owned_by: model.ownedBy }));
 
-const configuredOpenRouterModelCapabilities = (): Record<string, unknown>[] =>
+export const configuredOpenRouterModelCapabilities = (): Record<string, unknown>[] =>
   openRouterServedModels().map((model) => {
     const resolved = resolveModelMetadata(model.id);
     return {
@@ -532,20 +537,6 @@ const configuredOpenRouterModelCapabilities = (): Record<string, unknown>[] =>
       reasoning_source: model.id === OPENROUTER_SERVED_MODEL_ID ? "unknown" : resolved.reasoning_source,
     };
   });
-
-export const withConfiguredOpenRouterModels = (models: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
-  const configured = enabled ? configuredOpenRouterModels() : [];
-  if (!configured.length) return [...models];
-  const ids = new Set(configured.map((model) => getString(model.id) ?? ""));
-  return [...models.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
-};
-
-export const withConfiguredOpenRouterCapabilities = (data: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
-  const configured = enabled ? configuredOpenRouterModelCapabilities() : [];
-  if (!configured.length) return [...data];
-  const ids = new Set(configured.map((model) => getString(model.id) ?? ""));
-  return [...data.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
-};
 
 export const withConfiguredLithosCapabilities = (data: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
   const configured = enabled ? configuredLithosModelCapabilities() : [];
