@@ -11,11 +11,16 @@
 // Chat and model-catalog access is deliberately not wired here yet; the repo
 // already reads OpenRouter's public model list for metadata enrichment only.
 
+import { openRouterModelsSnapshot } from "../models/openrouter-models.ts";
+import type { ApiKeyProviderDispatch } from "../api-key-policy.ts";
+import type { SentinelUpstreamRecorder } from "../sentinel/upstream-capture.ts";
 import { isRecord } from "../utils.ts";
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 export const OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY";
 export const OPENROUTER_SYSTEMONE_URL = `${OPENROUTER_BASE_URL}/systemone`;
+export const OPENROUTER_CHAT_COMPLETIONS_URL = `${OPENROUTER_BASE_URL}/chat/completions`;
+export const OPENROUTER_RESPONSES_URL = `${OPENROUTER_BASE_URL}/responses`;
 export const OPENROUTER_FETCH_TIMEOUT_MS = 20_000;
 
 export type OpenRouterErrorCode =
@@ -36,6 +41,75 @@ export class OpenRouterError extends Error {
 }
 
 export type OpenRouterFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The OpenRouter model ids this gateway serves, read from the cached public
+ * catalogue. A new upstream model therefore becomes servable as soon as the
+ * cached list refreshes — the dispatch, catalogue, and capabilities routes all
+ * read this one function, so they can never disagree about what is offered.
+ */
+export const openRouterServableModelIds = (): readonly string[] => (openRouterModelsSnapshot()?.models ?? []).map((model) => model.id);
+
+/** The upstream id for a requested model, or null when OpenRouter does not serve it. */
+export const openRouterUpstreamModelFor = (model: string): string | null => {
+  const trimmed = model.trim();
+  if (!trimmed) return null;
+  return openRouterServableModelIds().includes(trimmed) ? trimmed : null;
+};
+
+export type OpenRouterDispatchHooks = Readonly<{
+  beforeDispatch?: () => Promise<ApiKeyProviderDispatch | undefined>;
+  onDispatch?: () => void;
+  onHeaders?: () => void;
+  /** The request-owned Sentinel recorder, exactly as the other providers take it. */
+  sentinelUpstreamRecorder?: SentinelUpstreamRecorder;
+}>;
+
+const dispatchOpenRouter = async (
+  url: string,
+  body: Readonly<Record<string, unknown>>,
+  init: Readonly<{ signal: AbortSignal; hooks?: OpenRouterDispatchHooks }>
+): Promise<Response> => {
+  const apiKey = readOpenRouterApiKey();
+  if (!apiKey) throw new OpenRouterError("openrouter_api_key_missing", 503);
+  const dispatch = init.hooks?.beforeDispatch ? await init.hooks.beforeDispatch() : undefined;
+  if (init.signal.aborted) {
+    await dispatch?.cancelBeforeTransport();
+    throw new DOMException("Aborted", "AbortError");
+  }
+  dispatch?.markTransportStarted();
+  init.hooks?.onDispatch?.();
+  const upstreamAttempt = init.hooks?.sentinelUpstreamRecorder?.startAttempt("openrouter") ?? null;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: init.signal,
+    });
+  } catch (error) {
+    upstreamAttempt?.recordFetchError();
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new OpenRouterError("openrouter_upstream_unreachable", 502);
+  }
+  init.hooks?.onHeaders?.();
+  return upstreamAttempt ? upstreamAttempt.wrap(response) : response;
+};
+
+export const fetchOpenRouterChatCompletions = async (
+  body: Readonly<Record<string, unknown>>,
+  init: Readonly<{ signal: AbortSignal; hooks?: OpenRouterDispatchHooks }>
+): Promise<Response> => await dispatchOpenRouter(OPENROUTER_CHAT_COMPLETIONS_URL, body, init);
+
+export const fetchOpenRouterResponses = async (
+  body: Readonly<Record<string, unknown>>,
+  init: Readonly<{ signal: AbortSignal; hooks?: OpenRouterDispatchHooks }>
+): Promise<Response> => await dispatchOpenRouter(OPENROUTER_RESPONSES_URL, body, init);
 
 export const readOpenRouterApiKey = (): string | null => {
   try {
