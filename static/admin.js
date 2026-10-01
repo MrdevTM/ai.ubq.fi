@@ -23,7 +23,7 @@ import { createAdminSnapshotCache } from "./admin-cache.js?v=admin-indexeddb-cac
 import { bindForegroundRefresh } from "./foreground-refresh.js";
 import { setReasoningPlaceholder, updateReasoningSelectForModel } from "./reasoning-select.js";
 import { toast } from "./toast.js?v=passport-design-20260922";
-import { createSupervisorView } from "./admin-supervisor.js";
+import { createSupervisorView } from "./admin-supervisor.js?v=20261001-supervisor-v4";
 
 const STORAGE_KEYS = {
   rememberToken: AUTH_STORAGE_KEYS.rememberToken,
