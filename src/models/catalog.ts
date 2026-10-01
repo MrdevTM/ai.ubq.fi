@@ -347,12 +347,21 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
   }
 
   const credentialGated = addCredentialGatedCatalogProviders(models);
-  // OpenRouter is a serving provider for the Typesafe System One decision
-  // model behind /v1/systemone; its public model list stays a metadata source.
+  // OpenRouter serves its cached public catalogue on the OpenAI-compatible
+  // wires and the Typesafe System One model behind /v1/systemone.
   let openrouterServed = 0;
   if (readOpenRouterApiKey() !== null) {
+    for (const model of openRouterModelsSnapshot()?.models ?? []) {
+      addPublicModelCatalogEntry(
+        models,
+        model.id,
+        { id: "openrouter", owned_by: model.id.split("/", 1)[0] || "openrouter", supported_endpoints: ["/v1/responses", "/v1/chat/completions"] },
+        0
+      );
+      openrouterServed += 1;
+    }
     addPublicModelCatalogEntry(models, OPENROUTER_SERVED_MODEL_ID, { id: "openrouter", owned_by: "typesafe", supported_endpoints: ["/v1/systemone"] }, 0);
-    openrouterServed = 1;
+    openrouterServed += 1;
   }
 
   return {

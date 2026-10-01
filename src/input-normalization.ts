@@ -17,6 +17,7 @@ import {
   readDeepSeekApiKey,
 } from "./deepseek/index.ts";
 import { LITHOS_DEFAULT_REASONING_EFFORT, LITHOS_DISPLAY_NAMES, LITHOS_MODEL_IDS, LITHOS_REASONING_LEVELS, readLithosApiKey } from "./provider/lithos.ts";
+import { openRouterModelsSnapshot } from "./models/openrouter-models.ts";
 import { readOpenRouterApiKey } from "./provider/openrouter.ts";
 import { normalizePromptCacheCapabilities } from "./models/codex-models.ts";
 import { codexSnapshotMetadataHint, codexSubscriptionMetadataHint, resolveModelMetadata } from "./models/metadata.ts";
@@ -484,36 +485,53 @@ export const withConfiguredLithosModels = (models: readonly Record<string, unkno
   return [...models.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
 };
 
-/** The model this gateway serves through the OpenRouter upstream (Typesafe System One). */
+/** The Typesafe System One decision model, served through the same upstream. */
 export const OPENROUTER_SERVED_MODEL_ID = "typesafe/jev-latest";
 
-const configuredOpenRouterModels = (): Record<string, unknown>[] => {
+/**
+ * Everything this gateway can dispatch to OpenRouter: the cached public model
+ * catalogue (OpenAI-compatible chat and responses wires) plus the Typesafe
+ * System One decision model behind `/v1/systemone`. The dispatch path reads the
+ * same snapshot, so a model listed here is a model that works, and a new
+ * upstream model appears as soon as the cached list refreshes.
+ */
+const openRouterServedModels = (): readonly { id: string; endpoints: readonly string[]; ownedBy: string }[] => {
   if (readOpenRouterApiKey() === null) return [];
-  return [{ id: OPENROUTER_SERVED_MODEL_ID, object: "model", created: 0, owned_by: "typesafe" }];
+  const catalogue: { id: string; endpoints: readonly string[]; ownedBy: string }[] = (openRouterModelsSnapshot()?.models ?? []).map((model) => ({
+    id: model.id,
+    endpoints: ["/v1/responses", "/v1/chat/completions"] as const,
+    ownedBy: model.id.split("/", 1)[0] || "openrouter",
+  }));
+  const seen = new Set(catalogue.map((model) => model.id));
+  if (!seen.has(OPENROUTER_SERVED_MODEL_ID)) {
+    catalogue.push({ id: OPENROUTER_SERVED_MODEL_ID, endpoints: ["/v1/systemone"] as const, ownedBy: "typesafe" });
+  }
+  return catalogue;
 };
 
-const configuredOpenRouterModelCapabilities = (): Record<string, unknown>[] => {
-  if (readOpenRouterApiKey() === null) return [];
-  return [
-    {
-      id: OPENROUTER_SERVED_MODEL_ID,
+const configuredOpenRouterModels = (): Record<string, unknown>[] =>
+  openRouterServedModels().map((model) => ({ id: model.id, object: "model", created: 0, owned_by: model.ownedBy }));
+
+const configuredOpenRouterModelCapabilities = (): Record<string, unknown>[] =>
+  openRouterServedModels().map((model) => {
+    const resolved = resolveModelMetadata(model.id);
+    return {
+      id: model.id,
       object: "uos.model_capabilities",
-      owned_by: "typesafe",
-      display_name: "Jev (Typesafe System One decisions)",
+      owned_by: model.ownedBy,
+      display_name: model.id === OPENROUTER_SERVED_MODEL_ID ? "Jev (Typesafe System One decisions)" : model.id,
       upstream_provider: "openrouter",
-      // The only surface this model serves: System One decisions, not chat.
-      supported_endpoints: ["/v1/systemone"],
-      supported_reasoning_levels: ["none"],
-      default_reasoning_effort: "none",
+      supported_endpoints: [...model.endpoints],
+      supported_reasoning_levels: model.id === OPENROUTER_SERVED_MODEL_ID ? ["none"] : (resolved.supported_reasoning_levels ?? ["none"]),
+      default_reasoning_effort: model.id === OPENROUTER_SERVED_MODEL_ID ? "none" : (resolved.default_reasoning_effort ?? "none"),
       reasoning_effort_wire_map: {},
-      context_window_tokens: null,
-      max_context_window_tokens: null,
-      auto_compact_token_limit_tokens: null,
-      context_source: "unknown",
-      reasoning_source: "unknown",
-    },
-  ];
-};
+      context_window_tokens: model.id === OPENROUTER_SERVED_MODEL_ID ? null : resolved.context_window_tokens,
+      max_context_window_tokens: model.id === OPENROUTER_SERVED_MODEL_ID ? null : resolved.max_context_window_tokens,
+      auto_compact_token_limit_tokens: model.id === OPENROUTER_SERVED_MODEL_ID ? null : resolved.auto_compact_token_limit_tokens,
+      context_source: model.id === OPENROUTER_SERVED_MODEL_ID ? "unknown" : resolved.context_source,
+      reasoning_source: model.id === OPENROUTER_SERVED_MODEL_ID ? "unknown" : resolved.reasoning_source,
+    };
+  });
 
 export const withConfiguredOpenRouterModels = (models: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
   const configured = enabled ? configuredOpenRouterModels() : [];
