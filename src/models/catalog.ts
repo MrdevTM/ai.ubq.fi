@@ -33,6 +33,7 @@ import { warmOpenRouterModels, openRouterModelsSnapshot } from "./openrouter-mod
 import { getString, isRecord } from "../utils.ts";
 import { fetchMeteredModels } from "../provider/metered.ts";
 import { fetchSurplusModels } from "../provider/surplus.ts";
+import { readOpenRouterApiKey } from "../provider/openrouter.ts";
 import { cerebrasProviderHint, LITHOS_PROVIDER_HINT, modelIdFromSnapshotRecord } from "../request-policy.ts";
 import {
   configuredCerebrasModelCapabilities,
@@ -43,6 +44,9 @@ import {
   withConfiguredDeepSeekModels,
   withConfiguredLithosCapabilities,
   withConfiguredLithosModels,
+  withConfiguredOpenRouterCapabilities,
+  withConfiguredOpenRouterModels,
+  OPENROUTER_SERVED_MODEL_ID,
 } from "../input-normalization.ts";
 
 const snapshotUpstreamSource = (snapshot: CodexModelsSnapshot | null): string => {
@@ -62,9 +66,15 @@ export const handleModels = async (req?: Request): Promise<Response> => {
   const snapshot = await loadCodexModelsSnapshot();
   const normalized = snapshot && Array.isArray(snapshot.models) && snapshot.models.length > 0 ? normalizeModelList(snapshot) : null;
   const codexModels = isProviderEnabled("codex", selection) ? (normalized?.data ?? []) : [];
-  const data = withConfiguredLithosModels(
-    withConfiguredDeepSeekModels(withConfiguredCerebrasModel(codexModels, isProviderEnabled("cerebras", selection)), isProviderEnabled("deepseek", selection)),
-    isProviderEnabled("lithos", selection)
+  const data = withConfiguredOpenRouterModels(
+    withConfiguredLithosModels(
+      withConfiguredDeepSeekModels(
+        withConfiguredCerebrasModel(codexModels, isProviderEnabled("cerebras", selection)),
+        isProviderEnabled("deepseek", selection)
+      ),
+      isProviderEnabled("lithos", selection)
+    ),
+    isProviderEnabled("openrouter", selection)
   );
   const [metered, surplus] = await Promise.all([
     isProviderEnabled("openlux", selection) ? fetchMeteredModels() : Promise.resolve(null),
@@ -90,7 +100,7 @@ export const handleModels = async (req?: Request): Promise<Response> => {
 };
 
 type PublicModelProvider = Readonly<{
-  id: "codex" | "openlux" | "surplus" | "deepseek" | "cerebras" | "lithos";
+  id: "codex" | "openlux" | "surplus" | "deepseek" | "cerebras" | "lithos" | "openrouter";
   owned_by: string;
   supported_endpoints: readonly string[];
 }>;
@@ -337,6 +347,13 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
   }
 
   const credentialGated = addCredentialGatedCatalogProviders(models);
+  // OpenRouter is a serving provider for the Typesafe System One decision
+  // model behind /v1/systemone; its public model list stays a metadata source.
+  let openrouterServed = 0;
+  if (readOpenRouterApiKey() !== null) {
+    addPublicModelCatalogEntry(models, OPENROUTER_SERVED_MODEL_ID, { id: "openrouter", owned_by: "typesafe", supported_endpoints: ["/v1/systemone"] }, 0);
+    openrouterServed = 1;
+  }
 
   return {
     models: [...models.values()].sort((left, right) => left.id.localeCompare(right.id)),
@@ -359,12 +376,11 @@ export const buildModelCatalogSnapshot = async (): Promise<ModelCatalogSnapshot>
       deepseek: credentialGatedCatalogSource(readDeepSeekApiKey() !== null, credentialGated.deepseek),
       cerebras: credentialGatedCatalogSource(readCerebrasApiKey() !== null, credentialGated.cerebras),
       lithos: credentialGatedCatalogSource(readLithosApiKey() !== null, credentialGated.lithos),
-      // Enrichment is listed as a source so the page can show how much of THIS
-      // catalog it fills, counted the same way as every other source: rows it
-      // supplied, not the size of the upstream catalog.
+      // The public OpenRouter catalog stays a metadata-enrichment source, but
+      // the source row reports what this gateway serves through the upstream,
+      // exactly like every other provider row.
       openrouter: {
-        status: catalogAvailabilityStatus(openRouterModelsSnapshot()),
-        count: [...models.values()].filter((model) => model.context_source === "openrouter" || model.reasoning_source === "openrouter").length,
+        ...credentialGatedCatalogSource(readOpenRouterApiKey() !== null, openrouterServed),
         updated_at_ms: openRouterModelsSnapshot()?.updated_at_ms ?? null,
       },
     },
@@ -477,6 +493,7 @@ export const handleModelCapabilities = async (): Promise<Response> => {
   // fallback is replaced by the capabilities of the route it actually uses.
   data = withConfiguredDeepSeekCapabilities(data, isProviderEnabled("deepseek", selection));
   data = withConfiguredLithosCapabilities(data, isProviderEnabled("lithos", selection));
+  data = withConfiguredOpenRouterCapabilities(data, isProviderEnabled("openrouter", selection));
 
   const capabilitiesKv = await getKv();
   const capabilitiesWhitelist = capabilitiesKv ? await loadCodexModelsWhitelist(capabilitiesKv) : null;

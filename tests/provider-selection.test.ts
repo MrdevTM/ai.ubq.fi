@@ -498,13 +498,17 @@ Deno.test("/v1/models hides the models of a switched-off provider", async () => 
   // LithosAI key itself instead of leaving the row set to the ambient
   // environment.
   Deno.env.set("LITHOSAI_API_KEY", "fixture-lithos-key");
+  // Same ownership for the OpenRouter upstream: this test configures its key
+  // rather than inheriting the ambient environment
+  const previousOpenRouterKey = Deno.env.get("OPENROUTER_API_KEY");
+  Deno.env.set("OPENROUTER_API_KEY", "fixture-openrouter-key");
   const kv = new SelectionKv();
   seedCodexSnapshot(kv, ["gpt-5.6-sol"]);
   try {
     await withKv(kv, async () => {
       assert.deepEqual(
         await listModelIds(),
-        ["gpt-5.6-sol", "gpt-oss-120b", "qwen-3.8-27b", ...DEEPSEEK_OFFICIAL_MODEL_IDS, ...LITHOS_MODEL_IDS],
+        ["gpt-5.6-sol", "gpt-oss-120b", "qwen-3.8-27b", ...DEEPSEEK_OFFICIAL_MODEL_IDS, ...LITHOS_MODEL_IDS, "typesafe/jev-latest"],
         "no filter lists every provider"
       );
 
@@ -524,6 +528,8 @@ Deno.test("/v1/models hides the models of a switched-off provider", async () => 
     Deno.env.delete("DEEPSEEK_API_KEY");
     Deno.env.delete("CEREBRAS_API_KEY");
     Deno.env.delete("LITHOSAI_API_KEY");
+    if (previousOpenRouterKey === undefined) Deno.env.delete("OPENROUTER_API_KEY");
+    else Deno.env.set("OPENROUTER_API_KEY", previousOpenRouterKey);
     resetRuntimeConfigCacheForTest();
   }
 });

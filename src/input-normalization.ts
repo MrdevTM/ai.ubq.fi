@@ -17,6 +17,7 @@ import {
   readDeepSeekApiKey,
 } from "./deepseek/index.ts";
 import { LITHOS_DEFAULT_REASONING_EFFORT, LITHOS_DISPLAY_NAMES, LITHOS_MODEL_IDS, LITHOS_REASONING_LEVELS, readLithosApiKey } from "./provider/lithos.ts";
+import { readOpenRouterApiKey } from "./provider/openrouter.ts";
 import { normalizePromptCacheCapabilities } from "./models/codex-models.ts";
 import { codexSnapshotMetadataHint, codexSubscriptionMetadataHint, resolveModelMetadata } from "./models/metadata.ts";
 import { getString, isRecord } from "./utils.ts";
@@ -481,6 +482,51 @@ export const withConfiguredLithosModels = (models: readonly Record<string, unkno
   if (!configured.length) return [...models];
   const ids = new Set(configured.map((model) => model.id));
   return [...models.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
+};
+
+/** The model this gateway serves through the OpenRouter upstream (Typesafe System One). */
+export const OPENROUTER_SERVED_MODEL_ID = "typesafe/jev-latest";
+
+const configuredOpenRouterModels = (): Record<string, unknown>[] => {
+  if (readOpenRouterApiKey() === null) return [];
+  return [{ id: OPENROUTER_SERVED_MODEL_ID, object: "model", created: 0, owned_by: "typesafe" }];
+};
+
+const configuredOpenRouterModelCapabilities = (): Record<string, unknown>[] => {
+  if (readOpenRouterApiKey() === null) return [];
+  return [
+    {
+      id: OPENROUTER_SERVED_MODEL_ID,
+      object: "uos.model_capabilities",
+      owned_by: "typesafe",
+      display_name: "Jev (Typesafe System One decisions)",
+      upstream_provider: "openrouter",
+      // The only surface this model serves: System One decisions, not chat.
+      supported_endpoints: ["/v1/systemone"],
+      supported_reasoning_levels: ["none"],
+      default_reasoning_effort: "none",
+      reasoning_effort_wire_map: {},
+      context_window_tokens: null,
+      max_context_window_tokens: null,
+      auto_compact_token_limit_tokens: null,
+      context_source: "unknown",
+      reasoning_source: "unknown",
+    },
+  ];
+};
+
+export const withConfiguredOpenRouterModels = (models: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
+  const configured = enabled ? configuredOpenRouterModels() : [];
+  if (!configured.length) return [...models];
+  const ids = new Set(configured.map((model) => getString(model.id) ?? ""));
+  return [...models.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
+};
+
+export const withConfiguredOpenRouterCapabilities = (data: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
+  const configured = enabled ? configuredOpenRouterModelCapabilities() : [];
+  if (!configured.length) return [...data];
+  const ids = new Set(configured.map((model) => getString(model.id) ?? ""));
+  return [...data.filter((model) => !ids.has(getString(model.id) ?? "")), ...configured];
 };
 
 export const withConfiguredLithosCapabilities = (data: readonly Record<string, unknown>[], enabled: boolean): Record<string, unknown>[] => {
