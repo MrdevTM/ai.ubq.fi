@@ -76,6 +76,9 @@ const modelError = (raw: Record<string, unknown>): Response | null => {
 
 const modelOf = (raw: Record<string, unknown>): string => getString(raw.model) ?? SYSTEMONE_DEFAULT_MODEL;
 
+/** OpenRouter requires the tilde-prefixed alias; the catalog advertises the same id without it. */
+const upstreamModelFor = (model: string): string => (model.startsWith("~") ? model : `~${model}`);
+
 /**
  * Normalizes OpenRouter's SystemOne usage onto the gateway's canonical token
  * shape so the shared telemetry and metering read it. System One reports no
@@ -176,7 +179,7 @@ export const handleSystemOne = async (req: Request, usageContext?: UsageContext,
   let payload: Record<string, unknown>;
   try {
     payload = await fetchOpenRouterSystemOne({
-      body: { model, state: request.state, questions: request.questions },
+      body: { model: upstreamModelFor(model), state: request.state, questions: request.questions },
       ...(deps.apiKey ? { apiKey: deps.apiKey() } : {}),
       ...(deps.fetcher ? { fetcher: deps.fetcher } : {}),
     });
