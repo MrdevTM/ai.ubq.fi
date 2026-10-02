@@ -31,6 +31,27 @@ Reversal risk: widening the drop to every reasoning item without `encrypted_cont
 client can legitimately replay; matching ids by a loose `resp_` substring would rewrite genuine ids, so only the
 producer's exact `<kind>_...` shapes are recognized.
 
+## The Codex-native catalog honors the operator whitelist for every assembled provider - 2026-10-02
+
+On 2026-10-02 the user's intent is that the enabled-model policy, the operator's model whitelist, controls what a Codex
+client can select. The Codex-native versioned contract `GET /v1/models?client_version=X.Y.Z` therefore filters every
+assembled row through that one authority, OpenRouter's dynamic rows included; neither the stored-catalog cache fast path
+nor the metered fallback may serve rows past a nonempty whitelist. An absent or empty whitelist remains no filter at
+all, so OpenRouter's rows still list on their own snapshot TTL without an operator re-save. Per-model metadata is
+preserved verbatim; only the advertised set is narrowed. The unversioned `GET /v1/models` and the provider-discovery
+surfaces (`/uos/models/catalog`, `/uos/models/capabilities`) keep their existing contracts unchanged, deliberately,
+because the reported bug is the Codex client picker and this entry expands no policy beyond it.
+
+Reason: the operator enabled 16 ids while Codex showed 477, because OpenRouter's rows were appended after the whitelist
+on every listing surface (commit `9531d8b8`, 2026-09-30) and the versioned catalog's cache fast path bypassed the filter
+entirely. The versioned catalog is the one Codex selects from, and it is the seam corrected for this report; the other
+surfaces were not part of the reported defect and are intentionally left as they are.
+
+Reversal risk: appending OpenRouter rows after the filter again restores hundreds of unenabled models in the Codex
+picker; treating an absent or empty whitelist as "nothing enabled" hides the dynamic catalogue without an operator
+selection; extending this gate to the unversioned or discovery surfaces is a separate decision this entry does not
+authorize.
+
 ## `/v1/live` relays call creation to the ChatGPT backend and the sideband to api.openai.com - 2026-09-30
 
 The Codex client's realtime voice (TUI, v3/frameless) creates a WebRTC call with `POST <provider-base>/live` (multipart
