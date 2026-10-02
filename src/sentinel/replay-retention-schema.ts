@@ -52,6 +52,7 @@ export type SentinelReplayAccountingState = "reserved" | "stored" | "evicting" |
 export type SentinelReplayAccountingRow = Readonly<{
   version: 1;
   capture_id: string;
+  /** Empty only for a legacy manifest whose request owner was never recorded. */
   request_id: string;
   fingerprint: string;
   bytes: number;
