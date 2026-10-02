@@ -312,14 +312,14 @@ Deno.test("the model picker route is registered and stays behind admin auth", as
 
 Deno.test("the public and admin catalogs are built by one shared unfiltered snapshot", () => {
   // Drift guard: the admin picker must list models the whitelist hides, and the
-  // public catalog must still apply the whitelist to the very same snapshot,
-  // except for OpenRouter's own dynamic entries.
+  // public catalog must apply the whitelist to the very same snapshot with no
+  // row, OpenRouter's dynamic entries included, bypassing it afterwards.
   const publicHandler = /export const handlePublicModelCatalog = async \(\): Promise<Response> => \{([\s\S]*?)\n\};/.exec(openaiSource)?.[1] ?? "";
   assert.notEqual(publicHandler, "", "handlePublicModelCatalog must stay declared");
   assert.match(publicHandler, /const \[catalog, selection\] = await Promise\.all\(\[buildModelCatalogSnapshot\(\), loadProviderSelectionCached\(\)\]\);/);
   assert.match(publicHandler, /const selected = filterCatalogEntriesByProviderSelection\(catalog\.models, selection\);/);
-  assert.match(publicHandler, /isProviderEnabled\("openrouter", selection\)/);
-  assert.match(publicHandler, /filterWhitelistedModelMap\(\s*selected\.filter\(\(entry\) => !openRouterIds\.has\(entry\.id\)\),\s*catalogWhitelist\s*\)/s);
+  assert.match(publicHandler, /filterWhitelistedModelMap\(\s*selected,\s*catalogWhitelist\s*\)/s);
+  assert.doesNotMatch(publicHandler, /openRouterEntries|openRouterIds/, "no public row may skip the operator whitelist");
   assert.match(publicHandler, /sources: selectedCatalogSources\(catalog\.sources, selection\)/);
 
   const adminHandler = /export const handleAdminModelsCatalogGet = async \(([\s\S]*?)\n\};/.exec(adminCodexSource)?.[1] ?? "";
