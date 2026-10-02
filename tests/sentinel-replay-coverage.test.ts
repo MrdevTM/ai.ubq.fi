@@ -245,8 +245,11 @@ Deno.test({
       assert.equal(omitted.manifest_key, null);
       assert.equal(omitted.expires_at_ms, null);
 
-      // A storage failure is diagnostic only: the call still resolves.
-      const failingKv = new Proxy(kv, {
+      // A storage failure is diagnostic only: the call still resolves. The
+      // status row is committed through kv.atomic(), so this unwritable seam
+      // must fail that channel as well as the plain kv.set path; no row may be
+      // written when storage fails.
+      const failingKv = new Proxy(alwaysConflictingKv(kv), {
         get(target, property) {
           if (property === "set") return () => Promise.reject(new Error("storage unavailable"));
           const value = Reflect.get(target, property, target);
@@ -794,18 +797,18 @@ Deno.test({
         /Sentinel replay dedupe record is invalid/
       );
 
-      // A commit that never lands leaves no chunks and no manifest behind.
+      // A reservation commit that never lands leaves no chunks and no manifest
+      // behind: accounting is already bootstrap-complete here, so the bounded
+      // reservation retries are exhausted and admission reports storage_full
+      // instead of staging unaccounted bytes, exactly as PR437's fallthrough does.
       const failingKv = alwaysConflictingKv(kv);
-      await assert.rejects(
-        () =>
-          persistEncryptedSentinelReplay(
-            replayInput('{"model":"gpt-5-lost-cas"}', "lost-cas-request"),
-            failure,
-            storeDependencies(failingKv, { randomUuid: () => "capture-lost-cas" }),
-            client
-          ),
-        /Sentinel replay dedupe winner is unavailable/
+      const refused = await persistEncryptedSentinelReplay(
+        replayInput('{"model":"gpt-5-lost-cas"}', "lost-cas-request"),
+        failure,
+        storeDependencies(failingKv, { randomUuid: () => "capture-lost-cas" }),
+        client
       );
+      assert.deepEqual(refused, { status: "incomplete", reason: "storage_full" });
       assert.equal((await kv.get([...SENTINEL_REPLAY_CHUNK_PREFIX, "capture-lost-cas", 0])).value, null);
       const manifestKeys: Deno.KvKey[] = [];
       for await (const entry of kv.list({ prefix: SENTINEL_REPLAY_MANIFEST_PREFIX })) manifestKeys.push([...entry.key]);

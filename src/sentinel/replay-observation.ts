@@ -5,6 +5,7 @@ import { observeRawBodyOnce } from "../request.ts";
 import { emptySentinelUpstreamTrace } from "./upstream-capture.ts";
 import { type SentinelIncidentFailureEvent } from "./incident-outbox.ts";
 import { isRecord } from "../utils.ts";
+import { SENTINEL_REPLAY_ACCOUNTING_REASON, SENTINEL_REPLAY_STORAGE_FULL_REASON } from "./replay-retention-schema.ts";
 import type {
   AcceptedSentinelReplayInput,
   SentinelClientBodyObservation,
@@ -29,7 +30,13 @@ import {
 } from "./replay-model.ts";
 
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-const STORED_CAPTURE_STATUSES = new Set<SentinelReplayCaptureStatus>(["ready", "incomplete", "disabled", "failed"]);
+/**
+ * Statuses a persisted row may carry. `unknown` and `status_not_retained` are
+ * derived at read time and are deliberately absent: they must never be decoded
+ * from storage. `expired` IS persisted by retention reclamation so that an
+ * expired payload stays reportable after its manifest and chunks are deleted.
+ */
+const STORED_CAPTURE_STATUSES = new Set<SentinelReplayCaptureStatus>(["ready", "incomplete", "disabled", "failed", "evicted", "expired"]);
 const STATUS_REASON = /^[A-Za-z0-9_.:-]{1,128}$/;
 
 export const isSentinelReplayRequestId = (value: unknown): value is string => typeof value === "string" && REQUEST_ID.test(value);
@@ -59,7 +66,8 @@ export const isSentinelReplayCaptureStatusRow = (value: unknown): value is Senti
 export type SentinelReplayPersistResult =
   | Readonly<{ status: "stored"; manifest: SentinelReplayManifest; manifest_key?: Deno.KvKey }>
   | Readonly<{ status: "duplicate"; fingerprint: string; manifest_key?: Deno.KvKey }>
-  | Readonly<{ status: "disabled"; reason: "key_missing" | "kv_unavailable" }>;
+  | Readonly<{ status: "disabled"; reason: "key_missing" | "kv_unavailable" }>
+  | Readonly<{ status: "incomplete"; reason: typeof SENTINEL_REPLAY_STORAGE_FULL_REASON | typeof SENTINEL_REPLAY_ACCOUNTING_REASON }>;
 
 type PersistDependencies = Readonly<{
   kv: Deno.Kv;
@@ -68,6 +76,8 @@ type PersistDependencies = Readonly<{
   randomUuid?: () => string;
   randomBytes?: (length: number) => Uint8Array<ArrayBuffer>;
   incidentEvent?: Deno.KvEntry<SentinelIncidentFailureEvent>;
+  /** Test seam: an injectable small retention budget; production uses the fixed 1 GiB default. */
+  budgetBytes?: number;
 }>;
 
 export const normalizeSentinelCompatibilityHeaders = (headers: Headers): SentinelCompatibilityHeaders => {
