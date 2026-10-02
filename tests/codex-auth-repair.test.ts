@@ -10,6 +10,7 @@ import {
   planCodexAuthRepair,
   rankCodexAuthCandidates,
 } from "../src/codex/auth-repair.ts";
+import { accountAction, anyCodexAuthSlotNeedsRepair, reportStatus } from "../scripts/codex-auth-repair.ts";
 import type { CodexAuthPoolState, CodexAuthState } from "../src/types.ts";
 
 const NOW_MS = Date.UTC(2026, 8, 16, 18, 0, 0);
@@ -151,6 +152,68 @@ Deno.test("planCodexAuthRepair treats a probe-valid but already expired local to
   assert.equal(plan.healthy.length, 0);
   assert.equal(plan.selections.length, 1);
   assert.equal(plan.selections[0].candidate.source, "vps-pool");
+});
+
+Deno.test("planCodexAuthRepair preserves an unexpired slot whose probe was inconclusive", () => {
+  // A timeout and a 403/5xx are all undecidable: none of them is evidence that
+  // the credential is unusable, so a valid candidate must not be adopted.
+  const undecidableProbes: AssessedCodexAuthCandidate["probe"][] = [inconclusive(null), inconclusive(403), inconclusive(503)];
+  for (const probe of undecidableProbes) {
+    const pool = poolOf([account("acct-a", NOW_MS + 3_600_000)]);
+    const plan = planCodexAuthRepair({
+      accounts: [localAccount(1, pool.accounts[0], probe)],
+      candidates: [assessed(candidate("vps-pool", "acct-a", NOW_MS + 86_400_000), valid())],
+      nowMs: NOW_MS,
+    });
+
+    assert.deepEqual(plan.selections, []);
+    assert.deepEqual(plan.unrepairable, []);
+    assert.deepEqual(plan.healthy, []);
+    assert.deepEqual(plan.inconclusive, [{ slot: 1, account_id: "acct-a", probe, refresh_diverged: null }]);
+
+    const applied = applyCodexAuthPlan(pool, plan, NOW_MS);
+    assert.ok(applied);
+    assert.deepEqual(applied.accounts, pool.accounts);
+    assert.equal(applied.accounts[0].access_token, pool.accounts[0].access_token);
+  }
+});
+
+Deno.test("planCodexAuthRepair repairs a slot whose access token has verifiably expired even when the probe was inconclusive", () => {
+  const plan = planCodexAuthRepair({
+    accounts: [localAccount(1, account("acct-a", NOW_MS - 1_000), inconclusive(503))],
+    candidates: [assessed(candidate("vps-pool", "acct-a", NOW_MS + 3_600_000), valid())],
+    nowMs: NOW_MS,
+  });
+
+  assert.deepEqual(plan.inconclusive, []);
+  assert.equal(plan.selections.length, 1);
+  assert.equal(plan.selections[0].candidate.source, "vps-pool");
+});
+
+Deno.test("the repair CLI renders an inconclusive slot as inconclusive and never probes sources for it", () => {
+  const pool = poolOf([account("acct-a", NOW_MS + 3_600_000)]);
+  const plan = planCodexAuthRepair({
+    accounts: [localAccount(1, pool.accounts[0], inconclusive(403))],
+    candidates: [assessed(candidate("vps-pool", "acct-a", NOW_MS + 86_400_000), valid())],
+    nowMs: NOW_MS,
+  });
+
+  // The run cannot certify the pool, so it must not report health, and the row
+  // must name the undecidable state instead of calling it kept.
+  assert.equal(reportStatus(plan, false), "inconclusive");
+  assert.equal(accountAction(undefined, undefined, plan.inconclusive[0], false), "inconclusive");
+  assert.equal(reportStatus(planCodexAuthRepair({ accounts: [localAccount(1, pool.accounts[0], valid())], candidates: [], nowMs: NOW_MS }), false), "healthy");
+
+  // SSH and candidate probes are paid only for a real repair need: neither an
+  // unexpired inconclusive slot nor a 5xx may trigger them, while a rejected or
+  // verifiably expired slot still does.
+  const undecidable = [
+    { account: account("acct-a", NOW_MS + 3_600_000), probe: inconclusive(null) },
+    { account: account("acct-b", NOW_MS + 3_600_000), probe: inconclusive(503) },
+  ];
+  assert.equal(anyCodexAuthSlotNeedsRepair(undecidable, NOW_MS), false);
+  assert.equal(anyCodexAuthSlotNeedsRepair([{ account: account("acct-a", NOW_MS + 3_600_000), probe: invalid() }], NOW_MS), true);
+  assert.equal(anyCodexAuthSlotNeedsRepair([{ account: account("acct-b", NOW_MS - 1_000), probe: inconclusive(null) }], NOW_MS), true);
 });
 
 Deno.test("planCodexAuthRepair repairs a rejected slot from the best candidate for that account", () => {
