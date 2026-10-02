@@ -84,8 +84,8 @@ const { hasStrictPaidFallbackKeyPolicy } = await import("../src/paid-fallback/in
 const { LOCAL_DEVELOPMENT_KEY_ID, ensureLocalDevelopmentApiKey, resolveLocalDevelopmentApiKeyPolicy } = await import("../src/auth/local-development-key.ts");
 const { configureAdminAuthForListener, configureAdminAuthPeerForRequest, configureMacLocalAdminAuthBypassForListener } =
   await import("../src/auth/local-admin.ts");
-const { authenticateClient } = await import("../src/auth/index.ts");
-const { getKv } = await import("../src/kv.ts");
+const { authenticateClient, handleV1Auth } = await import("../src/auth/index.ts");
+const { getKv, setKvForTest } = await import("../src/kv.ts");
 const kvEntry = await getKv();
 assert.ok(kvEntry);
 
@@ -163,6 +163,63 @@ Deno.test("local development key provisioning reports an unavailable pricing sna
     const idEntry = await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID));
     assert.equal(idEntry.value, null);
   });
+});
+
+Deno.test("the hostname-only legacy fallback never attaches the paid local development key", async () => {
+  // Control: the paid principal exists, so a hostname-only decision would
+  // attach it. The checked bypass is active with a loopback peer bound, exactly
+  // as the loopback development server configures them.
+  assert.ok(await resolveLocalDevelopmentApiKeyPolicy(memoryKv as unknown as Deno.Kv));
+  configureAdminAuthForListener(enabledOptions, loopbackAddress);
+  configureAdminAuthPeerForRequest(loopbackAddress);
+  const legacyRequest = (headers?: HeadersInit) => new Request("http://127.0.0.1/v1/chat/completions", { method: "POST", headers });
+
+  try {
+    // A mismatching Origin fails the peer/origin-checked path, leaving only the
+    // legacy hostname fallback: it must stay policy-free.
+    const crossOriginAuth = await authenticateClient(legacyRequest({ origin: "https://attacker.example" }));
+    if (!crossOriginAuth.ok) throw new Error("The legacy fallback still authenticates loopback hostname requests");
+    assert.equal(crossOriginAuth.method.kind, "disabled");
+
+    const whoami = await handleV1Auth(legacyRequest({ origin: "https://attacker.example" }));
+    assert.equal(whoami.status, 200);
+    const body = await whoami.json();
+    assert.equal(body.auth.mode, "disabled");
+    assert.equal(body.auth.method.kind, "disabled");
+    assert.equal(body.auth.is_admin, false);
+    assert.equal(body.auth.is_super_admin, false);
+    assert.equal("key" in body.auth.method, false);
+
+    // The same loopback hostname with a matching Origin passes the checked
+    // bypass and still receives the paid local principal.
+    const sameOriginAuth = await authenticateClient(legacyRequest({ origin: "http://127.0.0.1", "sec-fetch-site": "same-origin" }));
+    if (!sameOriginAuth.ok) throw new Error("Same-origin loopback requests authenticate without a credential");
+    if (sameOriginAuth.method.kind !== "kv_api_key") throw new Error("Expected the checked loopback paid principal");
+    assert.equal(sameOriginAuth.method.key_id, LOCAL_DEVELOPMENT_KEY_ID);
+    assert.equal(sameOriginAuth.method.policy.paid_fallback_enabled, true);
+  } finally {
+    configureAdminAuthForListener(disabledOptions, loopbackAddress);
+    configureAdminAuthPeerForRequest(null);
+  }
+});
+
+Deno.test("the hostname-only legacy fallback stays policy-free without a local development key", async () => {
+  const isolated = new MemoryKv();
+  try {
+    setKvForTest(isolated as unknown as Deno.Kv);
+    assert.equal(await resolveLocalDevelopmentApiKeyPolicy(isolated as unknown as Deno.Kv), null);
+    configureAdminAuthForListener(enabledOptions, loopbackAddress);
+    configureAdminAuthPeerForRequest(loopbackAddress);
+    const auth = await authenticateClient(
+      new Request("http://127.0.0.1/v1/chat/completions", { method: "POST", headers: { origin: "https://attacker.example" } })
+    );
+    if (!auth.ok) throw new Error("The legacy fallback still authenticates loopback hostname requests");
+    assert.equal(auth.method.kind, "disabled");
+  } finally {
+    configureAdminAuthForListener(disabledOptions, loopbackAddress);
+    configureAdminAuthPeerForRequest(null);
+    setKvForTest(memoryKv as unknown as Deno.Kv);
+  }
 });
 
 Deno.test("the loopback bypass authenticates as the unlimited local development key", async () => {
