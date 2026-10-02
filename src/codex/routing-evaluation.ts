@@ -28,6 +28,7 @@ import {
   slotMatchesRoutingAccount,
   withLegacyQuotaClassMap,
 } from "./capacity-routing.ts";
+import { codexModelUnavailableAccounts } from "../models/codex-models-availability.ts";
 
 /** A slot identity resolved from the pool before its durable routing state is read. */
 type CodexRoutingSlotIdentity = Readonly<{
@@ -54,6 +55,8 @@ type CodexRoutingAccountEvaluation = Readonly<{
   activeTransitionReason: Exclude<CodexActiveAccountTransitionReason, "account_removed_or_replaced"> | null;
   /** A fresh, account-bound capacity sample proved the requested class empty. */
   capacityExhausted: boolean;
+  /** Set only when catalog evidence or a learned rejection proves this account cannot serve the named model. */
+  modelUnavailable: Readonly<{ model: string; detail: string | null }> | null;
 }>;
 
 const skippedRoutingAccount = (
@@ -72,6 +75,7 @@ const skippedRoutingAccount = (
   blockedAccount,
   activeTransitionReason,
   capacityExhausted: false,
+  modelUnavailable: null,
 });
 
 const routedRoutingAccount = (routedAccount: CodexRoutedAccount): CodexRoutingAccountEvaluation => ({
@@ -83,6 +87,7 @@ const routedRoutingAccount = (routedAccount: CodexRoutedAccount): CodexRoutingAc
   blockedAccount: null,
   activeTransitionReason: null,
   capacityExhausted: false,
+  modelUnavailable: null,
 });
 
 /** A stale capacity record is not an observation; only a fresh one may override a circuit. */
@@ -154,7 +159,8 @@ const evaluateCodexRoutingAccount = (
   mapped: CodexRoutingSlotIdentity,
   model: string | null,
   observationsByAccount: ReadonlyMap<string, CodexCapacityRoutingObservation>,
-  now: number
+  now: number,
+  modelUnavailable: ReadonlyMap<string, string | null> = codexModelUnavailableAccounts(model)
 ): CodexRoutingAccountEvaluation => {
   const account: RoutingAccount = {
     auth,
@@ -177,6 +183,15 @@ const evaluateCodexRoutingAccount = (
   const routedAccount: CodexRoutedAccount = { ...account, quotaHeadroom: capacity.quotaHeadroom, routingGeneration: slot.generation };
   if (slot.invalid_credential_version === account.credentialVersion) {
     return skippedRoutingAccount(routedAccount, mapped.slot + 1, null, null, null, "credential_invalid");
+  }
+  // A model this account provably cannot serve is not a quota or credential
+  // observation: skip it without touching any fence and let an entitled sibling
+  // take the request. Unknown availability never skips.
+  if (model !== null && modelUnavailable.has(auth.account_id)) {
+    return {
+      ...skippedRoutingAccount(routedAccount, mapped.slot + 1, null, null, null, "model_unavailable"),
+      modelUnavailable: { model, detail: modelUnavailable.get(auth.account_id) ?? null },
+    };
   }
   const quotaSkip = quotaBlockedSkipFor(requestedClassBlock, routedAccount, now, capacity.capacityOverride);
   if (quotaSkip !== null) {
@@ -203,6 +218,8 @@ type CodexRoutingAccumulation = Readonly<{
   retryAt: number | null;
   hasQuotaBlock: boolean;
   hasUpstreamTimeoutBlock: boolean;
+  /** The first account skipped because it cannot serve the requested model. */
+  modelUnavailable: Readonly<{ model: string; detail: string | null }> | null;
 }>;
 
 type CodexRoutingAccumulator = {
@@ -212,6 +229,7 @@ type CodexRoutingAccumulator = {
   retryAt: number | null;
   hasQuotaBlock: boolean;
   hasUpstreamTimeoutBlock: boolean;
+  modelUnavailable: Readonly<{ model: string; detail: string | null }> | null;
 };
 
 /** Fold one evaluated account into the running selection accumulator. */
@@ -223,6 +241,7 @@ const foldCodexRoutingEvaluation = (accumulator: CodexRoutingAccumulator, evalua
   if (evaluated.skippedSlot !== null) accumulator.skipped.push(evaluated.skippedSlot);
   if (evaluated.blockedCircuit === "upstream_timeout") accumulator.hasUpstreamTimeoutBlock = true;
   if (evaluated.blockedCircuit === "quota") accumulator.hasQuotaBlock = true;
+  if (evaluated.modelUnavailable !== null && accumulator.modelUnavailable === null) accumulator.modelUnavailable = evaluated.modelUnavailable;
   if (evaluated.retryAtMs !== null) {
     accumulator.retryAt = accumulator.retryAt === null ? evaluated.retryAtMs : Math.min(accumulator.retryAt, evaluated.retryAtMs);
   }
@@ -245,11 +264,13 @@ const accumulateCodexRoutingAccounts = (
     retryAt: null,
     hasQuotaBlock: false,
     hasUpstreamTimeoutBlock: false,
+    modelUnavailable: null,
   };
+  const unavailableAccounts = codexModelUnavailableAccounts(model);
   for (const auth of orderedAccounts) {
     const mapped = byId.get(auth.account_id);
     if (!mapped) continue;
-    foldCodexRoutingEvaluation(accumulator, evaluateCodexRoutingAccount(state, auth, mapped, model, observationsByAccount, now));
+    foldCodexRoutingEvaluation(accumulator, evaluateCodexRoutingAccount(state, auth, mapped, model, observationsByAccount, now, unavailableAccounts));
   }
   return { ...accumulator };
 };
@@ -261,7 +282,7 @@ const classifyCodexRouteSelection = (
   poolSnapshotJson: string | null = null,
   capacitySnapshotJson: string | null = null
 ): RouteSelection => {
-  const { available, blockedAccounts, skipped, retryAt, hasQuotaBlock, hasUpstreamTimeoutBlock } = accumulated;
+  const { available, blockedAccounts, skipped, retryAt, hasQuotaBlock, hasUpstreamTimeoutBlock, modelUnavailable } = accumulated;
   if (available.length) return { kind: "eligible", accounts: available, skippedSlots: skipped, blockedAccounts };
   if (hasUpstreamTimeoutBlock) {
     return { kind: "upstream_blocked", skippedSlots: skipped, retryAtMs: retryAt, blockedAccounts: [] };
@@ -277,6 +298,11 @@ const classifyCodexRouteSelection = (
       poolSnapshotJson,
       capacitySnapshotJson,
     };
+  }
+  // No account is even entitled to serve the named model: answer the model
+  // itself rather than a retryable quota or credential failure.
+  if (modelUnavailable !== null) {
+    return { kind: "model_unavailable", model: modelUnavailable.model, detail: modelUnavailable.detail, skippedSlots: skipped };
   }
   return { kind: "credentials_invalid", skippedSlots: skipped };
 };

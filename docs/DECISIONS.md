@@ -6,6 +6,36 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## Codex model availability follows the per-account pool - 2026-10-02
+
+The Codex-native catalog `GET /v1/models?client_version=X.Y.Z` and the normalized `["ubq_ai","codex_models"]` snapshot
+are built from the union of every pool account's own `/codex/models` answer: rows deduplicate by `slug` in pool order,
+the first-in-pool-order row is kept verbatim, and a single configured account keeps the previous single-account response
+including its conditional-request and 304 revalidation contract. Per-account catalog rows and learned account+model
+rejections live in `["uos_ai","codex_account_models","v1"]` as a non-secret routing hint; the operator whitelist filter
+stays downstream and unchanged, so it still narrows whatever the union advertises.
+
+A named model an account provably cannot serve — a learned rejection, or a stored catalog for the same client version
+that lacks a model a sibling's same-version catalog lists — is skipped in routing without touching quota fences,
+invalidating a credential, or opening an upstream-timeout circuit; unknown availability never skips. When the durable
+active account is skipped for that reason and an entitled sibling exists, the ordinary election advances once with the
+new transition reason `model_unavailable`, and when no account is entitled the gateway answers a graceful OpenAI-shaped
+404 `model_not_found` naming the model rather than 429 or 503.
+
+Upstream's `The '<model>' model is not supported when using Codex with a ChatGPT account.` 400 is the one learned
+eligibility signal: that account+model pair is recorded and the request makes exactly one bounded sibling attempt
+through the existing reselection machinery before falling back to the same graceful 404. Every other 400 passes through
+byte-for-byte with no retry and no new state. Single-active-account admission, quota and credential fencing, and
+paid-fallback authorization are otherwise unchanged.
+
+Reason: on 2026-10-02 the catalog refresh stored one account's answer, so `gpt-daybreak-blue-latest` — served only by
+pool account `54e77f76-...` — disappeared from both the versioned catalog and the normalized snapshot, and the gateway's
+own model validation rejected the client's request while its entitled account was healthy.
+
+Reversal risk: reverting to a single account's catalog hides per-account entitlements again; treating an ineligible
+account as quota-exhausted or credential-invalid writes fences, unlocks paid fallback, or wedges routing; learning from
+any 400 other than the exact upstream shape misattributes ordinary request errors and can skip a capable account.
+
 ## The Codex-native catalog honors the operator whitelist for every assembled provider - 2026-10-02
 
 On 2026-10-02 the user's intent is that the enabled-model policy, the operator's model whitelist, controls what a Codex

@@ -174,6 +174,55 @@ const withFixture = async (whitelistModelIds: readonly string[], run: () => Prom
 const codexCatalogRequest = (): Request =>
   new Request("https://ai.ubq.fi/v1/models?client_version=0.100.0", { headers: { Authorization: "Bearer gateway-client-token" } });
 
+/** Two pooled accounts whose catalogs differ only by the daybreak row. */
+const pooledAccounts = [
+  { access_token: "pool-a-access", refresh_token: "pool-a-refresh", account_id: "pool-account-a", updated_at_ms: Date.now() },
+  { access_token: "pool-b-access", refresh_token: "pool-b-refresh", account_id: "pool-account-b", updated_at_ms: Date.now() },
+];
+
+const seedPooledAccounts = (): void => {
+  kvStore.set(keyToString([...CODEX_AUTH_POOL_KV_KEY]), {
+    value: { accounts: pooledAccounts, updated_at_ms: Date.now() },
+    versionstamp: nextVersion(),
+  });
+  resetCodexAuthCacheForTest();
+};
+
+/** The pooled upstream: only account A advertises the daybreak id. */
+const pooledCodexCatalogFetch =
+  (): typeof fetch =>
+  (_input, init): Promise<Response> => {
+    const accountId = new Headers(init?.headers).get("ChatGPT-Account-ID");
+    const models = accountId === "pool-account-a" ? [{ slug: "gpt-daybreak-blue-latest" }, { slug: "pooled-shared" }] : [{ slug: "pooled-shared" }];
+    return Promise.resolve(Response.json({ models }, { headers: { "Content-Type": "application/json" } }));
+  };
+
+Deno.test("codex catalog: the versioned catalog advertises the pooled union narrowed by the operator whitelist", async () => {
+  await withFixture(["pooled-shared"], async () => {
+    seedPooledAccounts();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = pooledCodexCatalogFetch();
+    try {
+      const hidden = await handleCodexCatalogModels(codexCatalogRequest(), "0.100.0");
+      assert.equal(hidden.status, 200);
+      const hiddenSlugs = ((await hidden.json()) as { models: { slug: string }[] }).models.map((model) => model.slug);
+      assert.equal(hiddenSlugs.includes("pooled-shared"), true, "the pooled row both accounts serve is advertised");
+      assert.equal(hiddenSlugs.includes("gpt-daybreak-blue-latest"), false, "a daybreak id the operator did not enable stays out");
+
+      kvStore.set(keyToString([...CODEX_MODELS_WHITELIST_KV_KEY]), {
+        value: { model_ids: ["pooled-shared", "gpt-daybreak-blue-latest"], updated_at_ms: 2 },
+        versionstamp: nextVersion(),
+      });
+      const enabled = await handleCodexCatalogModels(codexCatalogRequest(), "0.100.0");
+      assert.equal(enabled.status, 200);
+      const enabledSlugs = ((await enabled.json()) as { models: { slug: string }[] }).models.map((model) => model.slug);
+      assert.equal(enabledSlugs.includes("gpt-daybreak-blue-latest"), true, "enabling the id advertises the pooled union row");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 Deno.test("codex catalog: OpenRouter rows follow the operator whitelist and keep their snapshot metadata", async () => {
   await withFixture(["gpt-0.100.0", "vendor/beta"], async () => {
     const originalFetch = globalThis.fetch;
