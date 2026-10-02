@@ -119,8 +119,10 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   // OpenRouter serves its own dynamic catalogue on both OpenAI wires; its rows
   // are appended before the operator whitelist below, which is the final say.
   const openRouterEnabled = isProviderEnabled("openrouter", selection) && readOpenRouterApiKey() !== null;
-  const catalogKv = await getKv();
-  const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
+  // `loadCodexModelsWhitelist` treats an unavailable KV as no whitelist, so the
+  // read stays one statement and keeps this handler's measured complexity at
+  // the level it had before the whitelist correction.
+  const catalogWhitelist = await loadCodexModelsWhitelist(await getKv());
   const [metered, surplus] = await enabledPaidCatalogSources(selection);
   const nowMs = Date.now();
   if (metered) refreshExpiredModelList(nowMs, metered.updated_at_ms, METERED_MODELS_CACHE_TTL_MS, fetchMeteredModels);
