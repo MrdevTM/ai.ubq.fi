@@ -247,20 +247,48 @@ const collapseCerebrasRootObjectUnion = (value: unknown): unknown => {
 export const projectCerebrasToolSchema = (value: unknown): unknown => collapseCerebrasRootObjectUnion(projectCerebrasSchemaValue(value));
 
 /**
- * Cerebras applies the model's chat template strictly: a role it does not know
- * fails the ENTIRE turn with "Failed to apply chat template to messages due to
- * error: Unexpected message role" instead of being ignored. OpenAI's newer
- * `developer` role is not one Cerebras accepts, and DeepSeek Harness uses it
- * for system instructions, so an unprojected harness turn can never succeed on
- * this route (verified live 2026-09-26: `system` 200, `developer` 400).
+ * Projects one message onto the Cerebras wire.
  *
- * The role is mapped onto the `system` role Cerebras does accept, preserving
- * message order and content. Messages are copied rather than mutated so the
- * caller's own request record is never rewritten in place.
+ * The `developer` role is mapped onto the `system` role Cerebras accepts: the
+ * chat template rejects an unknown role instead of ignoring it (verified live
+ * 2026-09-26: `system` 200, `developer` 400), and DeepSeek Harness sends
+ * `developer` for system instructions, so an unprojected harness turn can
+ * never succeed on this route.
+ *
+ * `reasoning_content` is removed from an assistant turn. Cerebras validates
+ * every message field instead of ignoring the ones it does not implement, so
+ * the reasoning this gateway's shared Responses translation replays on
+ * assistant turns fails the whole request before the model is reached:
+ *
+ *   HTTP 400 wrong_api_format: messages.3.assistant.reasoning_content and
+ *   messages.4.assistant.reasoning_content are unsupported
+ *
+ * (Codex session 01a0fea8-58df-7d93-af95-49f80cec6a1b, 2026-10-02, model
+ * qwen-3.8-27b: the first tool-bearing turn dispatched, and the continuation
+ * carrying the replayed reasoning item failed on both attempts, so the thread
+ * could never continue.) The field is still required by DeepSeek's own wire in
+ * thinking mode, so the removal belongs here, at the provider-bound copy
+ * rather than in the shared translation: this transport is the one seam both
+ * Cerebras wires (Chat Completions and the Responses adapter) dispatch
+ * through, and DeepSeek/LithosAI bodies are untouched. Reasoning the provider
+ * returns is unaffected.
+ *
+ * A message of any other role is returned as it stands; a `developer` or
+ * assistant message is copied before it is projected, so the caller's own
+ * request record and every other message object survive untouched.
  */
+const projectCerebrasMessage = (message: unknown): unknown => {
+  if (!isRecord(message) || Array.isArray(message)) return message;
+  const developer = message.role === "developer";
+  if (!developer && message.role !== "assistant") return message;
+  const projected: Record<string, unknown> = developer ? { ...message, role: "system" } : { ...message };
+  delete projected.reasoning_content;
+  return projected;
+};
+
 const projectCerebrasMessages = (messages: unknown): unknown => {
   if (!Array.isArray(messages)) return messages;
-  return messages.map((message) => (isRecord(message) && !Array.isArray(message) && message.role === "developer" ? { ...message, role: "system" } : message));
+  return messages.map((message) => projectCerebrasMessage(message));
 };
 
 const isCerebrasSystemMessage = (message: unknown): message is Record<string, unknown> =>
