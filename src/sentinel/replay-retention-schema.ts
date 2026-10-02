@@ -35,7 +35,7 @@ export const SENTINEL_REPLAY_ACCOUNTING_REASON = "storage_accounting_in_progress
 export const SENTINEL_REPLAY_STATUS_NOT_RETAINED = "status_not_retained";
 export const SENTINEL_REPLAY_CLEAN_TARGET_RATIO = 0.9;
 /** Chunks written per bounded, fence-guarded staging batch. */
-export const SENTINEL_REPLAY_STAGING_BATCH_CHUNKS = 32;
+export const SENTINEL_REPLAY_STAGING_BATCH_CHUNKS = 12;
 export const EVICTION_BATCH_RECORDS = 16;
 export const EVICTION_MAX_CHUNK_DELETES = 512;
 export const BOOTSTRAP_BATCH_ENTRIES = 32;
