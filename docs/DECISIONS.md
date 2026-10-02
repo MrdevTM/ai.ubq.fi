@@ -6,6 +6,25 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## Admin Analytics quota panels refresh on a visible poll and on app resume - 2026-10-02
+
+The admin console's Analytics quota panels (provider health, provider capacity, and the quota runway) keep the existing
+30-second visible poll, and `bindForegroundRefresh` now also refreshes them immediately when a resume is observed:
+window `focus`, `visibilitychange` to visible, or a bfcache `pageshow` (`event.persisted === true`; the first load's
+`pageshow` is ignored). The helper coalesces those events into one scheduled refresh and each loader returns early while
+its own request is in flight, so focusing a window, returning to the tab, and restoring from bfcache cannot stack
+duplicate requests or timers. The quota-projection request keeps its 30-day window and the capacity endpoint keeps
+serving the persisted snapshot, so this client lifecycle change adds no upstream polling: the metered quota snapshot
+still refreshes upstream only at its own `METERED_QUOTA_FRESH_MS` (5 minute) boundary.
+
+Reason: Analytics is the authenticated default view, but the foreground-refresh binding only refreshed the Defaults
+view, so an app resumed from background or bfcache kept showing a stale quota until the next visible poll tick, which
+mobile background timer suspension can delay indefinitely, or until a full reload.
+
+Reversal risk: removing the resume hook restores the stale-after-resume display; removing the `pageshow` initial-load
+guard refreshes on every ordinary page load; adding a second interval instead of reusing the existing poll duplicates
+requests.
+
 ## Codex model availability follows the per-account pool - 2026-10-02
 
 The Codex-native catalog `GET /v1/models?client_version=X.Y.Z` and the normalized `["ubq_ai","codex_models"]` snapshot

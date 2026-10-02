@@ -9689,9 +9689,23 @@ setAuthBadge("unknown", "Checking...");
 setAdminAccessState({ checked: false, isAdmin: false, isSuperAdmin: false });
 scheduleTokenCheck();
 
+const refreshAnalyticsView = () => {
+  // Every loader returns early while its own request is in flight, so the
+  // visible poll and a resume refresh can never stack duplicate requests.
+  void loadProviders();
+  void loadProviderCapacity();
+  void loadQuotaProjection();
+};
+
 bindForegroundRefresh(() => {
-  if (currentAdminView !== "defaults" || !adminAccessState.isAdmin || !hasAdminCredential()) return;
-  void loadDefaults({ preserveInputs: true });
+  if (!adminAccessState.isAdmin || !hasAdminCredential()) return;
+  if (currentAdminView === "analytics") {
+    // Resume refreshes the quota panels immediately instead of waiting for
+    // the next visible poll tick or a full reload.
+    refreshAnalyticsView();
+  } else if (currentAdminView === "defaults") {
+    void loadDefaults({ preserveInputs: true });
+  }
 });
 
 authWidgetToggle.addEventListener("click", () => {
@@ -10016,9 +10030,7 @@ bindTablistKeyboard(keysTabActive.closest('[role="tablist"]'));
 
 globalThis.setInterval(() => {
   if (currentAdminView !== "analytics" || document.visibilityState !== "visible") return;
-  void loadProviders();
-  void loadProviderCapacity();
-  void loadQuotaProjection();
+  refreshAnalyticsView();
 }, 30_000);
 
 createKeyBtn.addEventListener("click", () => {
