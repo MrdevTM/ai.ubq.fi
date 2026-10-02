@@ -547,7 +547,9 @@ Deno.test({
       const fence = admission.accounting.fence;
 
       const firstAdvance = await advanceSentinelReplayStagingFence(kv, { accounting_key: key, fence, now_ms: now, budget_bytes: TEST_BUDGET_BYTES });
-      assert.deepEqual(firstAdvance, { ok: true, stage: 1 });
+      assert.equal(firstAdvance.ok, true);
+      assert.equal(firstAdvance.stage, 1);
+      assert.equal(firstAdvance.versionstamp, (await kv.get(key)).versionstamp);
       await writeChunkRows(kv, "paused-writer", 2);
 
       // The reaper fences the paused writer off. One bounded pass leaves a chunk

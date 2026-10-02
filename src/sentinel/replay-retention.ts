@@ -207,7 +207,7 @@ export const pruneCaptureOwnedStatusMetadata = async (
 export const advanceSentinelReplayStagingFence = async (
   kv: Deno.Kv,
   input: Readonly<{ accounting_key: Deno.KvKey; fence: number; now_ms: number; budget_bytes?: number }>
-): Promise<Readonly<{ ok: true; stage: number }> | Readonly<{ ok: false; reason: "revoked" | "expired" | "missing" }>> => {
+): Promise<Readonly<{ ok: true; stage: number; versionstamp: string }> | Readonly<{ ok: false; reason: "revoked" | "expired" | "missing" }>> => {
   const budgetBytes = Math.max(64 * 1_024, Math.trunc(input.budget_bytes ?? sentinelReplayBudgetBytes()));
   for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt += 1) {
     const entry = await kv.get<SentinelReplayAccountingRow>(input.accounting_key);
@@ -228,7 +228,7 @@ export const advanceSentinelReplayStagingFence = async (
       .check({ key: input.accounting_key, versionstamp: entry.versionstamp })
       .set(input.accounting_key, next)
       .commit();
-    if (committed.ok) return { ok: true, stage: next.stage };
+    if (committed.ok) return { ok: true, stage: next.stage, versionstamp: committed.versionstamp };
   }
   return { ok: false, reason: "missing" };
 };

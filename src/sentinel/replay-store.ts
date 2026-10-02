@@ -416,9 +416,9 @@ const readIncidentIndexEntry = async (
  * SENTINEL_REPLAY_STAGING_BATCH_CHUNKS chunks, one atomic commit checks the
  * accounting row's exact versionstamp and requires state==="reserved",
  * fence===this writer's fence and an unexpired row, incrementing `stage`. Only
- * after that commit succeeds may the batch be written. A reaper revoking the row
- * increments the fence, so a paused writer that resumes can never advance its
- * fence again and can never publish.
+ * after that commit succeeds may one chunk transaction check its committed
+ * versionstamp and write the batch. Revoke or release changes that row, so a
+ * paused writer cannot append chunks after cleanup has released its charge.
  */
 const storeReplayEnvelope = async (
   context: Readonly<{
@@ -465,11 +465,13 @@ const storeReplayEnvelope = async (
         return { status: "incomplete", reason: SENTINEL_REPLAY_STORAGE_FULL_REASON };
       }
       const batch = chunks.slice(offset, offset + SENTINEL_REPLAY_STAGING_BATCH_CHUNKS);
-      const startIndex = offset;
-      for (let index = 0; index < batch.length; index += 1) {
-        await dependencies.kv.set([...SENTINEL_REPLAY_CHUNK_PREFIX, captureId, startIndex + index], batch[index], {
-          expireIn: SENTINEL_REPLAY_TTL_MS,
-        });
+      const operation = batch.reduce(
+        (atomic, chunk, index) => atomic.set([...SENTINEL_REPLAY_CHUNK_PREFIX, captureId, offset + index], chunk, { expireIn: SENTINEL_REPLAY_TTL_MS }),
+        dependencies.kv.atomic().check({ key: context.accountingKey, versionstamp: fence.versionstamp })
+      );
+      if (!(await operation.commit()).ok) {
+        await abandon();
+        return { status: "incomplete", reason: SENTINEL_REPLAY_STORAGE_FULL_REASON };
       }
     }
     let committed: Deno.KvCommitResult | Deno.KvCommitError | null = null;
