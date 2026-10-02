@@ -6,6 +6,25 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## `/v1/live` calls are bound to the authenticated gateway principal that created them - 2026-10-02
+
+Call creation resolves the authenticated principal (`resolveIdempotencyPrincipal`, e.g. `api-key:<key_id>`) and persists
+it alongside the account in the `codex_live_calls` v1 mapping; the sideband join must present the same principal. A join
+by a different valid principal, and a legacy mapping that records no principal at all, are both refused with 403 before
+the WebSocket upgrade, with no permissive compatibility fallback; a reconnect by the creating principal still upgrades
+and rejoins on the mapped upstream account. The mapping TTL is unchanged at one hour.
+
+Reason: `/v1/live` authenticated the request but bound the call only to the upstream account, so any valid gateway
+principal that learned a call id could attach to another principal's call and use the creator's upstream credentials.
+
+Status: implemented and locally tested (focused loopback HTTP/WebSocket regression and changed-file lint, receipts
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/58ac6b41-8949-40a6-9eff-46f2de4d9bcf` and
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/e08bfb68-25ca-48fd-ab60-3be8a56082aa`); not deployed.
+
+Reversal risk: dropping the principal comparison restores cross-principal sideband attachment and creator-credential
+use; treating an absent `principal_id` as authorized would reopen it for every mapping written before this change, and
+extending the TTL would lengthen that window.
+
 ## Codex model availability follows the per-account pool - 2026-10-02
 
 The Codex-native catalog `GET /v1/models?client_version=X.Y.Z` and the normalized `["ubq_ai","codex_models"]` snapshot

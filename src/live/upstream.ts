@@ -114,31 +114,46 @@ export const liveCallLocation = (callId: string): string => `/v1/live/${encodeUR
 
 export const liveCallAccountKey = (callId: string): Deno.KvKey => [...LIVE_CALL_ACCOUNT_KV_PREFIX, callId];
 
+/** The account that created a call and the authenticated principal it was created for. */
+export type LiveCallMapping = Readonly<{ accountId: string; principalId: string | null }>;
+
 /**
- * Records the creating account for a call. The write is best effort: an
- * unavailable KV leaves the call unjoinable rather than failing a call that
- * upstream already created.
+ * Records the creating account and gateway principal for a call. The write is
+ * best effort: an unavailable KV leaves the call unjoinable rather than failing
+ * a call that upstream already created.
  */
-export const writeLiveCallAccount = async (callId: string, accountId: string): Promise<void> => {
+export const writeLiveCallAccount = async (callId: string, accountId: string, principalId: string): Promise<void> => {
   const kv = await getKv();
   if (!kv) {
     console.warn("[ai.ubq.fi] live_call_account_mapping_skipped", JSON.stringify({ call_id: callId, reason: "kv_unavailable" }));
     return;
   }
   try {
-    await kv.set(liveCallAccountKey(callId), { account_id: accountId, created_at_ms: Date.now() }, { expireIn: LIVE_CALL_ACCOUNT_TTL_MS });
+    await kv.set(
+      liveCallAccountKey(callId),
+      { account_id: accountId, principal_id: principalId, created_at_ms: Date.now() },
+      { expireIn: LIVE_CALL_ACCOUNT_TTL_MS }
+    );
   } catch (error) {
     console.warn("[ai.ubq.fi] live_call_account_mapping_failed", JSON.stringify({ call_id: callId, reason: error instanceof Error ? error.name : "unknown" }));
   }
 };
 
-/** The account that created the call, or null when the mapping expired or is absent. */
-export const readLiveCallAccountId = async (callId: string): Promise<string | null> => {
+/**
+ * The account and principal that created the call, or null when the mapping
+ * expired or is absent. A legacy record written before principal binding has no
+ * `principal_id` and yields `principalId: null`; callers fail closed on it
+ * rather than joining a call whose creating principal cannot be proven.
+ */
+export const readLiveCallMapping = async (callId: string): Promise<LiveCallMapping | null> => {
   const kv = await getKv();
   if (!kv) return null;
   try {
     const entry = await kv.get(liveCallAccountKey(callId));
-    return isRecord(entry.value) ? getString(entry.value.account_id) : null;
+    if (!isRecord(entry.value)) return null;
+    const accountId = getString(entry.value.account_id);
+    if (accountId === null) return null;
+    return { accountId, principalId: getString(entry.value.principal_id) };
   } catch {
     return null;
   }
