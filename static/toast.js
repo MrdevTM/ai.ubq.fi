@@ -92,8 +92,8 @@ const showToast = (options = {}) => {
   toastEl.appendChild(closeEl);
 
   host.appendChild(toastEl);
-  while (host.querySelectorAll("[data-toast]").length > MAX_VISIBLE) {
-    const oldest = host.querySelector("[data-toast]");
+  while (host.querySelectorAll("[data-toast]:not([data-exiting])").length > MAX_VISIBLE) {
+    const oldest = host.querySelector("[data-toast]:not([data-exiting])");
     if (oldest === toastEl) break;
     dismissToastEl(oldest, null);
   }
