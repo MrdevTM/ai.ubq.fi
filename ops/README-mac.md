@@ -40,8 +40,8 @@ A read-only listener/process snapshot captured at 2026-10-02 19:29:45 UTC (recei
 unauthenticated forwarding path to this listener; it does not prove that none can exist.
 
 - The only 7999 listener was this service (`deno`, PID 61796). A keyless-boundary request to `/uos/auth` answered 200 on
-  loopback, 401 from the LAN address, and 401 from the LAN with a forged `Host: localhost`; `/health` identities were
-  `mac-d239b10…` on the Mac and `vps-d239b10…` publicly.
+  loopback, 401 from the LAN address, and 401 from the LAN with a forged `Host: 127.0.0.1:7999`; `/health` identities
+  were `mac-d239b10…` on the Mac and `vps-d239b10…` publicly.
 - PID 996 (`deno`, `*:8787`, all interfaces, no caller authentication of its own) is the fast-jev-compaction Codex
   adapter (`codex/jev-compaction-proxy.ts` in `/Users/nv/repos/0x4007/fast-jev-compaction`). Its product entrypoint
   fixes the upstream at `http://127.0.0.1:8000` and forwards ordinary requests there byte-transparently; it does not
