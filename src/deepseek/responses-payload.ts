@@ -180,7 +180,11 @@ export const deepSeekTerminalEnvelope = (
   return { type: "response.failed", response };
 };
 
-/** Output items for one Chat choice: reasoning, message, then any tool calls. */
+/**
+ * Output items for one Chat choice: reasoning, message, then any tool calls.
+ * Item ids carry the official type prefix (`rs_`, `msg_`, `fc_`, `ctc_`) so a
+ * history replayed to a Codex upstream passes its id validation.
+ */
 const outputItemsForChoice = (
   message: Record<string, unknown>,
   choiceIndex: number,
@@ -190,11 +194,11 @@ const outputItemsForChoice = (
 ): Record<string, unknown>[] => {
   const items: Record<string, unknown>[] = [];
   if (typeof message.reasoning_content === "string" && message.reasoning_content) {
-    items.push(reasoningItem(`${responseId}_rs_${choiceIndex}`, message.reasoning_content));
+    items.push(reasoningItem(`rs_${responseId}_${choiceIndex}`, message.reasoning_content));
   }
   const text = typeof message.content === "string" ? message.content : "";
   const refusal = typeof message.refusal === "string" ? message.refusal : "";
-  if (text || refusal) items.push(responseMessageItem(`${responseId}_msg_${choiceIndex}`, text, refusal));
+  if (text || refusal) items.push(responseMessageItem(`msg_${responseId}_${choiceIndex}`, text, refusal));
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   for (const [callIndex, call] of toolCalls.entries()) {
     if (!isRecord(call) || Array.isArray(call) || !isRecord(call.function) || Array.isArray(call.function)) continue;
@@ -203,10 +207,10 @@ const outputItemsForChoice = (
     const name = originalToolName(chatName, toolNames);
     const args = typeof call.function.arguments === "string" ? call.function.arguments : "";
     if (customToolNames.has(chatName)) {
-      items.push(customToolCallItem(`${responseId}_ctc_${choiceIndex}_${callIndex}`, callId, name, freeformInputFromArguments(args)));
+      items.push(customToolCallItem(`ctc_${responseId}_${choiceIndex}_${callIndex}`, callId, name, freeformInputFromArguments(args)));
       continue;
     }
-    items.push(functionCallItem(`${responseId}_fc_${choiceIndex}_${callIndex}`, callId, name, args));
+    items.push(functionCallItem(`fc_${responseId}_${choiceIndex}_${callIndex}`, callId, name, args));
   }
   return items;
 };

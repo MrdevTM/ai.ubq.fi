@@ -599,7 +599,7 @@ Deno.test("m04 parity: a normalized refusal delta reaches the streamed translato
   // other translator event uses (this translator emits no `sequence_number`).
   const refusalDelta = events.find((event) => event.type === "response.refusal.delta");
   assert.ok(refusalDelta);
-  assert.equal(refusalDelta.item_id, "resp_refusal_norm_msg_0");
+  assert.equal(refusalDelta.item_id, "msg_resp_refusal_norm_0");
   assert.equal(refusalDelta.output_index, 0);
   assert.equal(refusalDelta.content_index, 0);
   assert.equal(refusalDelta.delta, refusal);

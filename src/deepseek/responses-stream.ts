@@ -13,7 +13,7 @@ import {
 } from "./responses-payload.ts";
 import { getString, isRecord } from "../utils.ts";
 
-type StreamToolCall = { id: string; callId: string; name: string; arguments: string; announced: boolean; outputIndex: number };
+type StreamToolCall = { key: number; id: string; callId: string; name: string; arguments: string; announced: boolean; outputIndex: number };
 
 /**
  * The accumulated translated output facts a terminal-validity decision needs.
@@ -47,7 +47,7 @@ type StreamState = {
    * The output slot the most recently announced reasoning item owns. The
    * provider's normal order opens it at the first reasoning delta, before any
    * later item advances the index; the item id is derived from that slot
-   * (`${responseId}_rs_${reasoningIndex}`), matching the buffered transport's
+   * (`rs_${responseId}_${reasoningIndex}`), matching the buffered transport's
    * first-choice name.
    */
   reasoningIndex: number;
@@ -128,11 +128,16 @@ export const deepSeekResponsesTerminalKind = (
   return "failed";
 };
 
-/** Merges one tool-call delta into the accumulated call for its index. */
+/**
+ * Merges one tool-call delta into the accumulated call for its index. The item
+ * id is assigned when the call is announced, the point at which its official
+ * kind (`fc_` or `ctc_`) is known, so every event for the call names one id.
+ */
 const mergeToolCallDelta = (state: StreamState, responseId: string, raw: Record<string, unknown>, position: number): StreamToolCall => {
   const key = typeof raw.index === "number" ? raw.index : position;
   const existing = state.toolCalls.get(key) ?? {
-    id: `${responseId}_fc_${key}`,
+    key,
+    id: "",
     callId: getString(raw.id) ?? `${responseId}_call_${key}`,
     name: "",
     arguments: "",
@@ -164,10 +169,10 @@ export const createDeepSeekResponsesStreamTranslator = (
   profile: ChatOnlyResponsesProfile = DEEPSEEK_RESPONSES_PROFILE
 ) => {
   const state = newStreamState();
-  const messageId = `${responseId}_msg_0`;
+  const messageId = `msg_${responseId}_0`;
   // The buffered transport names its first-choice reasoning item the same way
-  // (`${responseId}_rs_${choiceIndex}` with choice index 0).
-  const reasoningItemId = (): string => `${responseId}_rs_${state.reasoningIndex}`;
+  // (`rs_${responseId}_${choiceIndex}` with choice index 0).
+  const reasoningItemId = (): string => `rs_${responseId}_${state.reasoningIndex}`;
 
   /**
    * Closes the open reasoning item at the index it was announced at, using the
@@ -339,6 +344,7 @@ export const createDeepSeekResponsesStreamTranslator = (
     call.announced = true;
     call.outputIndex = state.nextOutputIndex++;
     const custom = isCustomCall(call);
+    call.id = `${custom ? "ctc" : "fc"}_${responseId}_${call.key}`;
     return [
       ...events,
       {

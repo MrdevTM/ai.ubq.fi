@@ -189,13 +189,13 @@ Deno.test("cerebras responses: a qwen-3.8-27b round trip translates the body and
     assert.equal(payload.incomplete_details, null);
     assert.deepEqual(payload.output, [
       {
-        id: "resp_cerebrasreq1_rs_0",
+        id: "rs_resp_cerebrasreq1_0",
         type: "reasoning",
         status: "completed",
         summary: [{ type: "summary_text", text: "The request asked for one word." }],
       },
       {
-        id: "resp_cerebrasreq1_msg_0",
+        id: "msg_resp_cerebrasreq1_0",
         type: "message",
         status: "completed",
         role: "assistant",
@@ -373,13 +373,13 @@ Deno.test("cerebras responses: a streamed request replays the buffered completio
     assert.equal(terminal.status, "completed");
     assert.deepEqual(terminal.output, [
       {
-        id: "resp_cerebrasreq1_rs_0",
+        id: "rs_resp_cerebrasreq1_0",
         type: "reasoning",
         status: "completed",
         summary: [{ type: "summary_text", text: "The request asked for one word." }],
       },
       {
-        id: "resp_cerebrasreq1_msg_0",
+        id: "msg_resp_cerebrasreq1_0",
         type: "message",
         status: "completed",
         role: "assistant",
