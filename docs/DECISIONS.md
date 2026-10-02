@@ -6,6 +6,26 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## Normal capacity reads revalidate Codex quota on a 30-second freshness window - 2026-10-02
+
+`GET /admin/providers/capacity` serves the persisted snapshot only while it is younger than
+`PROVIDER_CAPACITY_READ_FRESH_MS` (30 s, matching the Analytics visible poll) and otherwise awaits the existing
+lease-guarded `refreshProviderCapacity()` probe before responding. Concurrent stale reads coalesce through the same
+lease and its bounded cold wait, so one refresh serves them all and no request stacks a duplicate upstream call.
+`?refresh=live` keeps its documented force-probe semantics. Durable history keeps its fifteen-minute bucket:
+`PROVIDER_CAPACITY_HISTORY_BUCKET_MS` is unchanged and a same-bucket refresh overwrites that bucket's point rather than
+adding one. A refresh that throws keeps the last known persisted snapshot; a refresh that reaches upstream but fails
+leaves the affected source unavailable instead of reporting a fabricated percentage.
+
+Reason: the default read was persisted-only, so the Analytics quota cards could show a fifteen-minute-bucket-old Codex
+percentage, or an unbounded older one on a quiet gateway, while the client already polled every 30 seconds. The
+displayed value therefore did not change even though the poll and render path were correct.
+
+Reversal risk: restoring the persisted-only default read brings back the stale display; shortening the window below the
+poll cadence only repeats upstream probes, and making the read await an unbounded probe would reintroduce the latency
+the persisted-only boundary avoided. The probe itself stays read-only: usage reads with existing credentials, no OAuth
+refresh, inference, account, provider-selection, or quota-accounting change.
+
 ## `/v1/live` calls are bound to the authenticated gateway principal that created them - 2026-10-02
 
 Call creation resolves the authenticated principal (`resolveIdempotencyPrincipal`, e.g. `api-key:<key_id>`) and persists
