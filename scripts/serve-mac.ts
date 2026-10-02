@@ -6,7 +6,8 @@ const releasePath = await Deno.realPath(release);
 for (const name of ["DENO_DEPLOY", "DENO_DEPLOYMENT_ID", "DENO_DEPLOY_BUILD_ID", "DENO_REGION", "DENO_TIMELINE"]) {
   Deno.env.delete(name);
 }
-// Scheduled production billing stays on the VPS. Local capacity sampling uses this Mac's KV.
+// Scheduled production billing stays on the VPS. Local billing and analytics
+// maintenance below runs against this Mac's KV without enabling the production timeline.
 const { runtimeGitSha } = await import(new URL("src/config.ts", release).href);
 const gitSha = runtimeGitSha();
 if (!/^[0-9a-f]{40}$/.test(gitSha) || !releasePath.endsWith(`/releases/${gitSha}`)) {
@@ -16,7 +17,7 @@ Deno.chdir(root);
 const kv = await Deno.openKv(new URL(".data/kv.sqlite3", root).pathname);
 const { initializeKv } = await import(new URL("src/kv.ts", release).href);
 initializeKv(kv);
-const { default: handler, shutdownOptionalTelemetry } = (await import(new URL("serve.ts", release).href)) as typeof import("../serve.ts");
+const { default: handler, shutdownOptionalTelemetry, startMacMaintenance } = (await import(new URL("serve.ts", release).href)) as typeof import("../serve.ts");
 const { configureAdminAuthPeerForRequest, configureMacLocalAdminAuthBypassForListener } = await import(new URL("src/auth/local-admin.ts", release).href);
 // The Mac service answers LAN clients, so it provisions the unlimited local
 // development key that loopback inference authenticates as; LAN clients keep
@@ -29,6 +30,7 @@ try {
 } catch (error) {
   console.warn("[ai.ubq.fi] Local development key provisioning failed:", error instanceof Error ? error.message : String(error));
 }
+const stopMacMaintenance = startMacMaintenance(kv);
 const server = Deno.serve(
   {
     hostname: "0.0.0.0",
@@ -49,12 +51,14 @@ const shutdown = () => {
   if (stopping) return;
   stopping = true;
   console.log("[ai.ubq.fi] Draining local requests before shutdown");
+  void stopMacMaintenance();
   void server.shutdown();
 };
 Deno.addSignalListener("SIGTERM", shutdown);
 Deno.addSignalListener("SIGINT", shutdown);
 console.log(`[ai.ubq.fi] Mac serving Git revision ${gitSha}`);
 await server.finished;
+await stopMacMaintenance();
 // The bounded optional-analytics drain runs after in-flight work settles and
 // before the KV handle closes, so a stalled optional write cannot outlive it.
 await shutdownOptionalTelemetry();
