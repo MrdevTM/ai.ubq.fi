@@ -14,7 +14,9 @@ export const SUPERVISOR_SECRET_PATTERNS: readonly RegExp[] = [
   /github_pat_\w{12,}/g,
   /\bu_[0-9a-fA-F]{32,}\b/g,
   /\b\w*(?:key|token|secret|password)\w*["']?\s*[:=]\s*"(?:\\.|[^"\\])*"/gi,
-  /\b\w*(?:key|token|secret|password)\w*["']?\s*[:=]\s*'(?:\\.|[^'\\])*'/gi,
+  // YAML doubles a quote inside a single-quoted scalar, so '' is consumed as an
+  // escape here; stopping at the first closing quote would leave the tail behind.
+  /\b\w*(?:key|token|secret|password)\w*["']?\s*[:=]\s*'(?:\\.|''|[^'\\])*'/gi,
   /\b\w*(?:key|token|secret|password)\w*\s*[:=]\s*\S{8,}/gi,
 ];
 

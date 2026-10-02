@@ -103,6 +103,19 @@ Deno.test("redactBriefText recognizes quoted JSON credential keys and real GitHu
   assert.match(result.text, /\[redacted\]/);
 });
 
+Deno.test("redactBriefText consumes a YAML single-quoted scalar across a doubled quote", () => {
+  // YAML escapes a quote inside a single-quoted scalar by doubling it; a match
+  // that stops at the first closing quote leaves the credential tail behind.
+  const head = "zqalpha-zqbravo";
+  const tail = "zqcharlie-zqdelta";
+  const result = redactBriefText(`client_secret: '${head}''${tail}'`);
+  assert.equal(result.text, "[redacted]", "the whole scalar, doubled quote included, must collapse to one marker");
+  assert.equal(result.redactions, 1);
+  for (const fragment of [...head.split("-"), ...tail.split("-")]) {
+    assert.equal(result.text.includes(fragment), false, `${fragment} must be redacted`);
+  }
+});
+
 Deno.test("the brief's Cerebras payload carries no quoted-JSON or GitHub credential canaries", async () => {
   const classicTokens = [
     "ghp_syntheticcanary0000000000000011",
@@ -118,11 +131,14 @@ Deno.test("the brief's Cerebras payload carries no quoted-JSON or GitHub credent
     secret: 'zqvenus zqdelta "zqecho" \\ zqfoxtrot',
   };
   const singleQuotedValue = "zqterra zqgolf zqhotel zqindia";
-  const credentialValues = [...Object.values(quotedCredentials), singleQuotedValue];
-  const whitespaceCanaries = [quotedCredentials.password, quotedCredentials.secret, singleQuotedValue];
+  // YAML escapes a quote inside a single-quoted scalar by doubling it.
+  const doubledQuotedValue = "zquniform''zqvictor zqwhiskey";
+  const credentialValues = [...Object.values(quotedCredentials), singleQuotedValue, doubledQuotedValue];
+  const whitespaceCanaries = [quotedCredentials.password, quotedCredentials.secret, singleQuotedValue, doubledQuotedValue];
   const secretFragments = whitespaceCanaries.flatMap((value) => value.split(/[^A-Za-z0-9]+/)).filter((fragment) => fragment.length > 0);
   const injectedSecretCount = classicTokens.length + 2 + credentialValues.length;
   const quoted = `credentials:\n${JSON.stringify(quotedCredentials, null, 1)}\nclient_secret: '${singleQuotedValue}'`;
+  const doubledQuotedLine = `sudo_password: '${doubledQuotedValue}'`;
   const straddling = `${"A".repeat(1_180)}ghp_syntheticcanary0000000000000016${"Z".repeat(200)}`;
   const context = await collectWith({
     read: threadRead,
@@ -132,7 +148,7 @@ Deno.test("the brief's Cerebras payload carries no quoted-JSON or GitHub credent
         id: "turn-credentials",
         status: "completed",
         items: [
-          { type: "userMessage", id: "u1", content: [{ type: "text", text: `${quoted}\nprogress: the panel renders again` }] },
+          { type: "userMessage", id: "u1", content: [{ type: "text", text: `${quoted}\n${doubledQuotedLine}\nprogress: the panel renders again` }] },
           { type: "agentMessage", id: "a1", text: `Rotated ${classicTokens.join(", ")} and ${fineGrained}; deno task test passed` },
           { type: "agentMessage", id: "a2", text: straddling },
         ],
