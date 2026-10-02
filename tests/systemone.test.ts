@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
+import { apiKeyHashKey } from "../src/api-keys.ts";
+import {
+  type ApiKeyPolicy,
+  apiKeyPolicyFromHashRecord,
+  apiKeyUsageV3RequestKey,
+  apiKeyUsageV3WindowKey,
+  type ApiKeyUsageReservation,
+  reserveApiKeyUsageV3,
+} from "../src/api-key-policy.ts";
 import { kernelQuotaRouteForRequest, terminalRouteForRequest } from "../src/handler/http.ts";
-import { getResponseTelemetry } from "../src/openai-telemetry.ts";
+import { getResponseTelemetry, type UsageContext } from "../src/openai-telemetry.ts";
 import { OPENROUTER_SYSTEMONE_URL } from "../src/provider/openrouter.ts";
 import { handleSystemOne, SYSTEMONE_DEFAULT_MODEL } from "../src/systemone/handlers.ts";
+import type { ApiKeyHashRecord, ApiKeyUsageRequestV3, ApiKeyUsageWindowV3 } from "../src/types.ts";
+import { CountingKv } from "./helpers/counting-kv.ts";
 
 const urlOf = (input: RequestInfo | URL): string => {
   if (typeof input === "string") return input;
@@ -44,6 +55,107 @@ const answerPayload = {
   answers: { candidate: { type: "choice", choice: "g-industry", confidence: 0.99 } },
   usage: { input_tokens: 1118, output_tokens: 117, cost: 4.6956e-5 },
 };
+
+/**
+ * The bounded V3 API-key ledger the terminal wrapper admits requests into: an
+ * in-memory KV holding the hash record `reserveApiKeyUsageV3` reads, plus the
+ * policy the reservation is built from.
+ */
+const ledgerFixture = (id: string, usageLimitRequests: number, nowMs = Date.now()): Readonly<{ kv: CountingKv; policy: ApiKeyPolicy }> => {
+  const tokenHash = `systemone-${id}`;
+  const record: ApiKeyHashRecord = {
+    id,
+    expires_at_ms: -1,
+    revoked_at_ms: null,
+    usage_limit_requests: usageLimitRequests,
+    usage_requests: 0,
+    usage_reset_at_ms: nowMs + 60 * 60_000,
+    window_ms: 60 * 60_000,
+    usage_quota_version: 3,
+    paid_fallback_enabled: false,
+    paid_fallback_limit_microcredits: 0,
+    paid_fallback_spent_microcredits: 0,
+    paid_fallback_reserved_microcredits: 0,
+    paid_fallback_reservation_request_id: null,
+  };
+  const policy = apiKeyPolicyFromHashRecord(tokenHash, record, nowMs);
+  if (!policy) throw new Error("test API key policy must be valid");
+  const kv = new CountingKv();
+  kv.seed(apiKeyHashKey(tokenHash), record);
+  return { kv, policy };
+};
+
+/** Admits one request through the same deferred path the terminal wrapper uses. */
+const admissionFor = async (kv: CountingKv, policy: ApiKeyPolicy, requestId: string): Promise<ApiKeyUsageReservation> => {
+  const decision = await reserveApiKeyUsageV3(policy, requestId, "systemone", { kv: kv as unknown as Deno.Kv, deferWhenFull: true });
+  if (!decision.ok) throw new Error(`unexpected admission failure: ${decision.response.status}`);
+  return decision.reservation;
+};
+
+const usageContextWith = (reservation: ApiKeyUsageReservation): UsageContext => ({
+  keyId: null,
+  kernelRepo: null,
+  kernelOrg: null,
+  beforeProviderDispatch: reservation.beforeProviderDispatch,
+});
+
+const storedWindow = (kv: CountingKv, policy: ApiKeyPolicy): ApiKeyUsageWindowV3 => {
+  const window = kv.entries.get(JSON.stringify(apiKeyUsageV3WindowKey(policy)))?.value as ApiKeyUsageWindowV3 | undefined;
+  if (!window) throw new Error("expected a V3 usage window");
+  return window;
+};
+
+const storedRequest = (kv: CountingKv, policy: ApiKeyPolicy, requestId: string): ApiKeyUsageRequestV3 | null =>
+  (kv.entries.get(JSON.stringify(apiKeyUsageV3RequestKey(policy, requestId)))?.value as ApiKeyUsageRequestV3 | undefined) ?? null;
+
+Deno.test("systemone commits the api-key request reservation exactly once before dispatch", async () => {
+  const { kv, policy } = ledgerFixture("commit-once", 2);
+  const reservation = await admissionFor(kv, policy, "systemone-commit-once");
+  let fetchCalls = 0;
+  const fetcher = (() => {
+    fetchCalls += 1;
+    return Promise.resolve(Response.json(answerPayload));
+  }) as typeof fetch;
+
+  const response = await handleSystemOne(request({ state, questions }), usageContextWith(reservation), { fetcher, apiKey: () => "or-test-key" });
+
+  assert.equal(response.status, 200);
+  assert.equal(fetchCalls, 1);
+  const window = storedWindow(kv, policy);
+  assert.equal(window.committed_requests, 1);
+  assert.equal(window.reserved_requests, 0);
+  const row = storedRequest(kv, policy, "systemone-commit-once");
+  assert.ok(row);
+  assert.equal(row.state, "dispatched");
+  assert.equal(row.provider, "openrouter");
+});
+
+Deno.test("systemone refuses an exhausted api-key window before the upstream fetch", async () => {
+  const { kv, policy } = ledgerFixture("exhausted", 1);
+  const first = await admissionFor(kv, policy, "systemone-exhausted-1");
+  await first.beforeProviderDispatch("openrouter");
+  const second = await admissionFor(kv, policy, "systemone-exhausted-2");
+  let fetchCalls = 0;
+  const fetcher = (() => {
+    fetchCalls += 1;
+    return Promise.resolve(Response.json(answerPayload));
+  }) as typeof fetch;
+
+  const response = await handleSystemOne(request({ state, questions }), usageContextWith(second), { fetcher, apiKey: () => "or-test-key" });
+
+  assert.equal(response.status, 429);
+  const body = await response.json();
+  assert.equal(body.error.code, "rate_limit_exceeded");
+  assert.equal(body.error.type, "rate_limit_error");
+  assert.equal(response.headers.get("ratelimit-limit"), "1");
+  assert.equal(response.headers.get("ratelimit-remaining"), "0");
+  assert.ok(Number(response.headers.get("retry-after")) >= 1);
+  assert.equal(fetchCalls, 0);
+  const window = storedWindow(kv, policy);
+  assert.equal(window.committed_requests, 1);
+  assert.equal(window.reserved_requests, 0);
+  assert.equal(storedRequest(kv, policy, "systemone-exhausted-2"), null);
+});
 
 Deno.test("systemone proxies one typed question set upstream with the server key", async () => {
   const captured: { url: string; headers: Headers | null; body: unknown } = {

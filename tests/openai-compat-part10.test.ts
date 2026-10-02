@@ -34,6 +34,10 @@ Deno.test("openai: DeepSeek official Chat Completions adapter streams natively a
     { role: "developer", content: "Answer in one short sentence." },
     { role: "user", content: "Summarize the deployment status." },
   ];
+  // The DeepSeek Chat wire projection translates the caller's developer message
+  // to the provider's system role. `messages` stays the caller's own request
+  // fixture; only the expected upstream bodies use this projected wire form.
+  const wireMessages = [{ role: "system", content: "Answer in one short sentence." }, ...messages.slice(1)];
   const tools = [
     {
       type: "function",
@@ -118,7 +122,7 @@ Deno.test("openai: DeepSeek official Chat Completions adapter streams natively a
       // the OpenAI output cap becomes DeepSeek's documented `max_tokens`.
       assert.deepEqual(upstreamCalls[0].body, {
         model: DEEPSEEK_FLASH_MODEL,
-        messages,
+        messages: wireMessages,
         tools,
         tool_choice: "auto",
         parallel_tool_calls: false,
@@ -242,7 +246,7 @@ Deno.test("openai: DeepSeek official Chat Completions adapter streams natively a
         () => handleChatCompletions(request({ model: DEEPSEEK_FLASH_MODEL, messages, stream: false }))
       );
       assert.equal(response.status, 200);
-      assert.deepEqual(forwarded, { model: DEEPSEEK_FLASH_MODEL, messages, stream: false, reasoning_effort: "high" });
+      assert.deepEqual(forwarded, { model: DEEPSEEK_FLASH_MODEL, messages: wireMessages, stream: false, reasoning_effort: "high" });
       assert.equal(getResponseTelemetry(response)?.reasoning, "high");
     });
 
@@ -363,7 +367,7 @@ Deno.test("openai: DeepSeek official Chat Completions adapter streams natively a
       assert.deepEqual(upstreamCalls, [
         {
           url: DEEPSEEK_CHAT_COMPLETIONS_URL,
-          body: { model: DEEPSEEK_FLASH_MODEL, messages, reasoning_effort: "high", stream: true, stream_options: { include_usage: true } },
+          body: { model: DEEPSEEK_FLASH_MODEL, messages: wireMessages, reasoning_effort: "high", stream: true, stream_options: { include_usage: true } },
         },
       ]);
 

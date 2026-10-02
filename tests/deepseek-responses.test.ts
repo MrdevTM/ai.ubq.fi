@@ -995,6 +995,62 @@ Deno.test("deepseek responses: a truncated stream reports response.incomplete in
   );
 });
 
+Deno.test("deepseek responses: a length-truncated tool call closes incomplete before the terminal", () => {
+  // A `length` stop can land mid-arguments. Closing the item as `completed`
+  // before the `response.incomplete` terminal hands a status-aware consumer a
+  // partial call it may execute, so the terminal disposition is decided first
+  // and both tool kinds carry the official non-completed status in the done
+  // event and in the delivered output.
+  const translator = createDeepSeekResponsesStreamTranslator(
+    "deepseek-flash",
+    "resp_len_tool",
+    echo,
+    1_780_000_000,
+    new Map<string, string>(),
+    new Set(["exec"])
+  );
+  const events: Record<string, unknown>[] = [];
+  events.push(
+    ...translator.push(
+      chatChunk(
+        {
+          role: "assistant",
+          tool_calls: [
+            { index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: '{"cmd":"echo hi' } },
+            { index: 1, id: "call_2", type: "function", function: { name: "exec", arguments: '{"input":"print(' } },
+          ],
+        },
+        { finish_reason: "length" }
+      )
+    )
+  );
+  events.push(...translator.finish());
+
+  const doneIndexes = events.flatMap((event, index) => (event.type === "response.output_item.done" ? [index] : []));
+  assert.equal(doneIndexes.length, 2);
+  const itemDones = doneIndexes.map((index) => events[index] as { item: Record<string, unknown> });
+  assert.deepEqual(
+    itemDones.map((done) => done.item),
+    [
+      { id: "fc_resp_len_tool_0", type: "function_call", status: "incomplete", call_id: "call_1", name: "shell", arguments: '{"cmd":"echo hi' },
+      { id: "ctc_resp_len_tool_1", type: "custom_tool_call", status: "incomplete", call_id: "call_2", name: "exec", input: '{"input":"print(' },
+    ]
+  );
+  // The terminal output carries the exact items the done events announced, and
+  // every item closes before the terminal it now agrees with.
+  const terminal = events.at(-1) as { type: string; response: Record<string, unknown> };
+  assert.equal(terminal.type, "response.incomplete");
+  assert.deepEqual(
+    terminal.response.output,
+    itemDones.map((done) => done.item)
+  );
+  assert.equal(doneIndexes[1] < events.length - 1, true);
+  assert.equal(
+    events.some((event) => event.type === "response.completed"),
+    false
+  );
+});
+
 Deno.test("deepseek responses: a provider interruption is a failed terminal, not a completion", () => {
   for (const [reason, code] of [
     ["insufficient_system_resource", "insufficient_system_resource"],

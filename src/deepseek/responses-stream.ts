@@ -490,7 +490,13 @@ export const createDeepSeekResponsesStreamTranslator = (
     return [...events, ...closeReasoning()];
   };
 
-  const closeToolCalls = (): Record<string, unknown>[] => {
+  /**
+   * Closes every accumulated tool call with the status its decided terminal
+   * allows. Only a normal completion may advertise a call as `completed`; a
+   * truncation or interruption closes it with the official `incomplete` status,
+   * so a status-aware consumer never receives a partial call as executable.
+   */
+  const closeToolCalls = (status: "completed" | "incomplete"): Record<string, unknown>[] => {
     const events: Record<string, unknown>[] = [];
     const ordered = [...state.toolCalls.entries()].sort(([left], [right]) => left - right).map(([, call]) => call);
     for (const call of ordered) {
@@ -500,7 +506,7 @@ export const createDeepSeekResponsesStreamTranslator = (
       }
       if (isCustomCall(call)) {
         const input = freeformInputFromArguments(call.arguments);
-        const item = customToolCallItem(call.id, call.callId, originalToolName(call.name, toolNames), input);
+        const item = { ...customToolCallItem(call.id, call.callId, originalToolName(call.name, toolNames), input), status };
         if (input) {
           events.push({ type: "response.custom_tool_call_input.delta", item_id: call.id, output_index: call.outputIndex, call_id: call.callId, delta: input });
         }
@@ -509,7 +515,7 @@ export const createDeepSeekResponsesStreamTranslator = (
         continue;
       }
       events.push({ type: "response.function_call_arguments.done", item_id: call.id, output_index: call.outputIndex, arguments: call.arguments });
-      const item = functionCallItem(call.id, call.callId, originalToolName(call.name, toolNames), call.arguments);
+      const item = { ...functionCallItem(call.id, call.callId, originalToolName(call.name, toolNames), call.arguments), status };
       state.output[call.outputIndex] = item;
       events.push({ type: "response.output_item.done", output_index: call.outputIndex, item });
     }
@@ -568,12 +574,18 @@ export const createDeepSeekResponsesStreamTranslator = (
     /**
      * Emits the remaining item events plus the terminal event the provider's
      * own stop reason implies. The terminal is derived at the one decision
-     * point, so a truncated or interrupted generation cannot be reported as a
-     * clean completion.
+     * point before any item closes, so a truncated or interrupted generation is
+     * neither reported as a clean completion nor allowed to close its tool
+     * calls as completed ones.
      */
     finish: (): Record<string, unknown>[] => {
       if (state.completed) return [];
       state.completed = true;
+      // The terminal disposition is decided before the items close: the status
+      // a tool item is advertised with and stored in the delivered output must
+      // match the terminal the client is about to receive.
+      const terminal = terminalEnvelope();
+      const toolItemStatus = terminal.type === "response.completed" ? "completed" : "incomplete";
       // Items are stored at the position they were assigned an `output_index`
       // for, so `response.output[output_index]` is the item the client
       // accumulated at that index even when fragmented tool calls announced
@@ -584,8 +596,7 @@ export const createDeepSeekResponsesStreamTranslator = (
       // the tool call it belongs to in the delivered output, so history replay
       // attaches it to that assistant tool-call turn, and no two Codex-visible
       // items are ever open at once.
-      const events = [...startEvents(), ...closeMessage(), ...flushPendingReasoning(), ...closeToolCalls(), ...closeReasoning()];
-      const terminal = terminalEnvelope();
+      const events = [...startEvents(), ...closeMessage(), ...flushPendingReasoning(), ...closeToolCalls(toolItemStatus), ...closeReasoning()];
       terminal.response.output = state.output;
       terminal.response.usage = state.usage;
       events.push({ type: terminal.type, response: terminal.response });
