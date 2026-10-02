@@ -42,11 +42,15 @@ const evaluateSerialRoutingAccounts = async (
   pool: CodexAuthPoolState,
   model: string | null,
   capacityObservations: readonly CodexCapacityRoutingObservation[],
-  now: number
+  now: number,
+  slotPool: CodexAuthPoolState = pool
 ): Promise<SerialRoutingEvaluations> => {
-  const identities = await Promise.all(pool.accounts.map(routingAccountIdentity));
+  // Slot identity is a durable position in the full configured pool. Resolving
+  // it from a narrowed admission cohort would renumber the surviving accounts,
+  // commit an active row no full-pool slot owns, and fail the final fence.
+  const identities = await Promise.all(slotPool.accounts.map(routingAccountIdentity));
   const byId = new Map<string, CodexRoutingSlotIdentity>();
-  for (const [slot, auth] of pool.accounts.entries()) {
+  for (const [slot, auth] of slotPool.accounts.entries()) {
     const identity = identities.at(slot);
     if (identity !== undefined) byId.set(auth.account_id, { slot, accountIdHash: identity.accountIdHash, credentialVersion: identity.credentialVersion });
   }
@@ -310,8 +314,10 @@ const prepareCodexSerialAdmissionRows = async (
   const observations = parseStoredCapacityObservationStore(rows.capacityEntry.value);
   // The admission pool and the decision pool must be the same pool, or a
   // switched-off subscription could still be elected as the active account.
+  // Slot identity stays the full pool's, so the narrowed cohort cannot
+  // renumber the slot the decision commits and the final fence resolves.
   const routingPool = await selectedCodexSubscriptionPool(durablePool);
-  const evaluations = await evaluateSerialRoutingAccounts(normalized, routingPool, model, observations, now);
+  const evaluations = await evaluateSerialRoutingAccounts(normalized, routingPool, model, observations, now, durablePool);
   return {
     active,
     durablePool: routingPool,

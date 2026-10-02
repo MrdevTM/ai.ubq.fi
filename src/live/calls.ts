@@ -183,16 +183,17 @@ const captureLiveCallAttempt = async (response: Response, signal: AbortSignal | 
 /**
  * Relays the upstream status and SDP answer verbatim. A `Location` whose last
  * parseable segment is a call id is rewritten to the gateway's own origin, and
- * the creating account is mapped to that call so the sideband can rejoin it.
+ * the creating account and principal are mapped to that call so the sideband
+ * can rejoin it only for the principal that created it.
  */
-const relayLiveCallResponse = async (response: Response, accountId: string): Promise<Response> => {
+const relayLiveCallResponse = async (response: Response, accountId: string, principal: string): Promise<Response> => {
   const headers = new Headers();
   const contentType = response.headers.get("content-type");
   if (contentType !== null) headers.set("content-type", contentType);
   const upstreamLocation = response.headers.get("location");
   const callId = upstreamLocation === null ? null : parseLiveCallIdFromLocation(upstreamLocation);
   if (upstreamLocation !== null) headers.set("location", callId === null ? upstreamLocation : liveCallLocation(callId));
-  if (callId !== null && response.ok) await writeLiveCallAccount(callId, accountId);
+  if (callId !== null && response.ok) await writeLiveCallAccount(callId, accountId, principal);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 };
 
@@ -200,9 +201,10 @@ const relayLiveCallResponse = async (response: Response, accountId: string): Pro
  * Creates one realtime call. The client's multipart offer becomes the backend
  * JSON shape, one eligible Codex account serves it, and a 401/403 admits a
  * single retry with the next eligible account before the upstream answer (or
- * the captured credential failure) is relayed unchanged.
+ * the captured credential failure) is relayed unchanged. The creating
+ * principal is persisted with the account so only it can join the sideband.
  */
-export const handleLiveCallCreate = async (req: Request): Promise<Response> => {
+export const handleLiveCallCreate = async (req: Request, principal: string): Promise<Response> => {
   const parsed = await parseLiveCallCreate(req);
   if (!parsed.ok) return parsed.response;
 
@@ -228,7 +230,7 @@ export const handleLiveCallCreate = async (req: Request): Promise<Response> => {
     await recordCodexResponseHealth(accountId, upstream, selection.account.auth, "success");
 
     const credentialFailure = upstream.status === 401 || upstream.status === 403;
-    if (!credentialFailure || attempt === LIVE_CALL_MAX_UPSTREAM_ATTEMPTS) return await relayLiveCallResponse(upstream, accountId);
+    if (!credentialFailure || attempt === LIVE_CALL_MAX_UPSTREAM_ATTEMPTS) return await relayLiveCallResponse(upstream, accountId, principal);
     // The retry re-evaluates durable routing, so any transition the recorded
     // failure started must be observable first. The serial selector exposes one
     // eligible account at a time, and only a reselection that offers a different

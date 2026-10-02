@@ -3,7 +3,7 @@
 
 import { authenticateClient } from "../auth/index.ts";
 import { withCors } from "../http.ts";
-import { normalizePath, withRequestId } from "../handler/http.ts";
+import { normalizePath, resolveIdempotencyPrincipal, withRequestId } from "../handler/http.ts";
 import { handleLiveCallCreate } from "./calls.ts";
 import { liveRouteForRequest } from "./routes.ts";
 import { handleLiveSideband } from "./sideband.ts";
@@ -17,7 +17,9 @@ import { handleLiveSideband } from "./sideband.ts";
  * 101 upgrade response must be returned exactly as `Deno.upgradeWebSocket`
  * produced it: wrapping it in a new `Response` drops the associated socket.
  * Authentication runs before either arm, and before the sideband upgrade reads
- * nothing but headers - reading the request body would fail the handshake.
+ * nothing but headers - reading the request body would fail the handshake. The
+ * resolved principal is passed to both arms so the call is bound to the one
+ * credential that created it and only that principal may join its sideband.
  */
 export const handleLiveRoute = async (req: Request, requestId: string): Promise<Response | null> => {
   const route = liveRouteForRequest(req.method, normalizePath(new URL(req.url).pathname));
@@ -26,7 +28,8 @@ export const handleLiveRoute = async (req: Request, requestId: string): Promise<
   const authResult = await authenticateClient(req);
   if (!authResult.ok) return withRequestId(withCors(authResult.response, req), requestId);
 
-  const response = route.kind === "call" ? await handleLiveCallCreate(req) : await handleLiveSideband(req, route.callId);
+  const principal = await resolveIdempotencyPrincipal(authResult);
+  const response = route.kind === "call" ? await handleLiveCallCreate(req, principal) : await handleLiveSideband(req, route.callId, principal);
   if (response.status === 101) return response;
   return withRequestId(withCors(response, req), requestId);
 };
