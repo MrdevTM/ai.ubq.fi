@@ -406,10 +406,11 @@ export const buildResponsesUpstreamBodies = (
   ];
   applyPassthroughToCodexRequest(codexBody, rawRecord, passthroughKeys);
   codexBody.model = model;
-  codexBody.input = input;
   codexBody.stream = true;
   codexBody.store = false;
-  const removedProviderBody = { ...codexBody };
+  // The Codex body keeps the repaired replay; the removed-provider fallback
+  // gets the client's exact input back, including the gateway's own item ids.
+  const removedProviderBody: Record<string, unknown> = { ...codexBody, input };
   // Preserve official controls supported by RemovedProvider even when Codex does
   // not currently accept them on its compatibility transport.
   for (const key of ["max_output_tokens", "max_tool_calls", "metadata", "safety_identifier", "service_tier", "temperature", "top_p", "truncation", "user"]) {
