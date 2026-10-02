@@ -275,6 +275,9 @@ export const runBootstrapBatch = async (
   const prefixes = bootstrapPrefixes();
   // A fresh sweep clears the sticky error so a removed corrupt row can resolve it.
   let error = ledger.bootstrap_cursor === null ? null : ledger.accounting_error;
+  // A failed full sweep retained its deltas. Rebuild live counters on restart;
+  // cursor continuations still accumulate, and cumulative history stays intact.
+  const live = ledger.bootstrap_cursor === null && ledger.accounting_error !== null ? emptyDelta() : ledger;
   let delta = emptyDelta();
   let scanned = 0;
   while (index < prefixes.length && scanned < BOOTSTRAP_BATCH_ENTRIES) {
@@ -294,16 +297,16 @@ export const runBootstrapBatch = async (
   const next: SentinelReplayBudgetLedger = {
     ...ledger,
     budget_bytes: budgetBytes,
-    stored_bytes: ledger.stored_bytes + delta.stored_bytes,
-    reserved_bytes: ledger.reserved_bytes + delta.reserved_bytes,
-    records: ledger.records + delta.records,
-    status_records: ledger.status_records + delta.status_records,
-    metadata_bytes: ledger.metadata_bytes + delta.metadata_bytes,
+    stored_bytes: live.stored_bytes + delta.stored_bytes,
+    reserved_bytes: live.reserved_bytes + delta.reserved_bytes,
+    records: live.records + delta.records,
+    status_records: live.status_records + delta.status_records,
+    metadata_bytes: live.metadata_bytes + delta.metadata_bytes,
     bootstrap_complete: complete && error === null,
     bootstrap_cursor: complete ? null : `${index}|${inner ?? ""}`,
     accounting_error: error,
-    over_budget: ledger.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes),
-    last_warning_at_ms: ledger.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes) ? nowMs : ledger.last_warning_at_ms,
+    over_budget: live.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes),
+    last_warning_at_ms: live.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes) ? nowMs : ledger.last_warning_at_ms,
   };
   fault("commit");
   let operation = kv.atomic().check({ key: SENTINEL_REPLAY_BUDGET_LEDGER_KEY, versionstamp });
