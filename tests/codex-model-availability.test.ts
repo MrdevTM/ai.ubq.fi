@@ -316,10 +316,10 @@ Deno.test("codex account models: malformed durable values are rejected or droppe
 
 Deno.test("codex account models: a fresh catalog clears a learned rejection and the unsupported map is bounded", async () => {
   clearAvailabilityKv();
-  await recordCodexModelUnsupported("store-a", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs: 1_000 });
-  assert.equal(codexModelUnavailableAccounts(MODEL).get("store-a"), UNSUPPORTED_DETAIL);
+  await recordCodexModelUnsupported("store-a", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs: Date.now() });
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["store-a"]).get("store-a"), UNSUPPORTED_DETAIL);
   await recordCodexAccountCatalogs([{ accountId: "store-a", clientVersion: "0.160.0", slugs: [MODEL] }]);
-  assert.equal(codexModelUnavailableAccounts(MODEL).has("store-a"), false, "a model now present clears its rejection");
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["store-a"]).has("store-a"), false, "a model now present clears its rejection");
 
   let store = emptyCodexAccountModelsStore();
   for (let index = 0; index < 40; index += 1) store = withCodexModelUnsupported(store, "store-a", `model-${index}`, 1_000 + index, 1_000 + index);
@@ -341,7 +341,7 @@ Deno.test("codex account models: a stale cache keeps serving and refreshes in th
   clearAvailabilityKv();
   const staleStore = mergeCodexAccountCatalogs(emptyCodexAccountModelsStore(), [{ accountId: "cache-a", clientVersion: "0.160.0", slugs: ["other"] }], 1);
   setCodexAccountModelsStoreForTest(staleStore, Date.now());
-  assert.equal(codexModelUnavailableAccounts(MODEL).size, 0);
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["cache-a"]).size, 0);
   assert.equal(getCodexAccountModelsCacheForTest().refreshing, false, "a fresh cache performs no KV read");
 
   writeKv(CODEX_ACCOUNT_MODELS_KV_KEY, {
@@ -352,11 +352,11 @@ Deno.test("codex account models: a stale cache keeps serving and refreshes in th
     unsupported: {},
   });
   setCodexAccountModelsStoreForTest(staleStore, Date.now() - CODEX_ACCOUNT_MODELS_CACHE_TTL_MS - 1);
-  assert.equal(codexModelUnavailableAccounts(MODEL).size, 0, "the stale snapshot serves the decision before the refresh lands");
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["cache-a"]).size, 0, "the stale snapshot serves the decision before the refresh lands");
   assert.equal(getCodexAccountModelsCacheForTest().refreshing, true, "an expired snapshot schedules one background read");
   await awaitCodexAccountModelsRefreshForTest();
   assert.equal(getCodexAccountModelsCacheForTest().refreshing, false);
-  assert.equal(codexModelUnavailableAccounts(MODEL).has("cache-a"), true, "the refreshed durable store replaces the stale snapshot");
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["cache-a", "cache-b"]).has("cache-a"), true, "the refreshed durable store replaces the stale snapshot");
 });
 
 Deno.test("codex account models: catalog absence counts only against a sibling's same client version", () => {
@@ -369,7 +369,11 @@ Deno.test("codex account models: catalog absence counts only against a sibling's
     unsupported: {},
   };
   setCodexAccountModelsStoreForTest(differentVersion, Date.now());
-  assert.equal(codexModelUnavailableAccounts(MODEL).size, 0, "a version-specific absence is not authoritative against another version");
+  assert.equal(
+    codexModelUnavailableAccounts(MODEL, ["version-a", "version-b"]).size,
+    0,
+    "a version-specific absence is not authoritative against another version"
+  );
 
   const sameVersion = {
     accounts: {
@@ -379,8 +383,135 @@ Deno.test("codex account models: catalog absence counts only against a sibling's
     unsupported: {},
   };
   setCodexAccountModelsStoreForTest(sameVersion, Date.now());
-  assert.equal(codexModelUnavailableAccounts(MODEL).get("version-a"), null);
-  assert.equal(codexModelUnavailableAccounts(MODEL).has("version-b"), false);
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["version-a", "version-b"]).get("version-a"), null);
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["version-a", "version-b"]).has("version-b"), false);
+});
+
+Deno.test("codex account models: a rejection older than the max age reads as unknown while a fresh one still skips", () => {
+  clearAvailabilityKv();
+  const nowMs = Date.now();
+  // The aged account's catalog omits the model and no sibling lists it, so only
+  // the learned rejection could ever skip it: expiry must age it back to unknown.
+  // The fresh observation sits one second inside the bound, far more than the
+  // read latency this synchronous assertion can accumulate.
+  setCodexAccountModelsStoreForTest(
+    {
+      accounts: { "aged-a": { client_version: "0.160.0", slugs: ["other-model"], updated_at_ms: 1 } },
+      unsupported: {
+        "aged-a": { [MODEL]: nowMs - CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_AGE_MS - 1 },
+        "fresh-b": { [MODEL]: nowMs - CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_AGE_MS + 1_000 },
+      },
+    },
+    nowMs
+  );
+  const unavailable = codexModelUnavailableAccounts(MODEL, ["aged-a", "fresh-b"]);
+  assert.equal(unavailable.has("aged-a"), false, "one millisecond past the max age is unknown availability again, never permanent");
+  assert.equal(unavailable.get("fresh-b"), null, "one second inside the max age still skips");
+});
+
+Deno.test("codex account models: only current pool accounts are returned and only their catalogs are sibling evidence", async () => {
+  clearAvailabilityKv();
+  await recordCodexAccountCatalogs([
+    { accountId: "pool-a", clientVersion: "0.160.0", slugs: ["other-model"] },
+    { accountId: "removed-b", clientVersion: "0.160.0", slugs: [MODEL] },
+  ]);
+  assert.equal(
+    codexModelUnavailableAccounts(MODEL, ["pool-a"]).has("pool-a"),
+    false,
+    "a removed account's catalog no longer turns a current account's omission into an exclusion"
+  );
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["pool-a", "removed-b"]).get("pool-a"), null, "the same catalog still skips an in-pool sibling");
+
+  await recordCodexModelUnsupported("removed-b", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs: Date.now() });
+  const currentPool = codexModelUnavailableAccounts(MODEL, ["pool-a"]);
+  assert.equal(currentPool.size, 0, "an account outside the pool is never reported unavailable");
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["pool-a", "removed-b"]).get("removed-b"), UNSUPPORTED_DETAIL);
+});
+
+Deno.test("codex account models: a racing rejection write and catalog write both survive the versionstamp check", async () => {
+  clearAvailabilityKv();
+  const nowMs = Date.now();
+  const raceCatalog = { client_version: "0.160.0", slugs: ["other-model"], updated_at_ms: 1 };
+  await recordCodexAccountCatalogs([{ accountId: "race-a", clientVersion: "0.160.0", slugs: [MODEL] }]);
+  // Another isolate commits its own merged catalog while this rejection write is
+  // in flight: the read hands back the pre-race entry, so the first commit must
+  // lose its versionstamp check before the writer retries against the fresh value.
+  const raced = { reads: 0 };
+  const raceKv = {
+    ...(kvStub as unknown as Record<string, unknown>),
+    get: (key: Deno.KvKey) => {
+      const entry = entryFor(key);
+      if (keyToString(key) === keyToString(CODEX_ACCOUNT_MODELS_KV_KEY)) {
+        raced.reads += 1;
+        if (raced.reads === 1) {
+          writeKv([...CODEX_ACCOUNT_MODELS_KV_KEY], {
+            accounts: {
+              "race-a": { client_version: "0.160.0", slugs: [MODEL], updated_at_ms: 1 },
+              "race-b": raceCatalog,
+            },
+            unsupported: {},
+          });
+        }
+      }
+      return Promise.resolve(entry);
+    },
+  } as unknown as Deno.Kv;
+
+  await recordCodexModelUnsupported("race-c", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs, kv: raceKv });
+  assert.equal(raced.reads, 2, "the stale commit failed its versionstamp check and the writer retried");
+  const stored = readKv(CODEX_ACCOUNT_MODELS_KV_KEY) as {
+    accounts: Record<string, { client_version: string; slugs: string[]; updated_at_ms: number }>;
+    unsupported: Record<string, Record<string, number>>;
+  };
+  assert.deepEqual(
+    Object.keys(stored.accounts).sort((left, right) => left.localeCompare(right)),
+    ["race-a", "race-b"],
+    "no concurrent catalog row is discarded"
+  );
+  assert.deepEqual(stored.unsupported["race-c"], { [MODEL]: nowMs }, "the rejection survives the same merge");
+  const cached = getCodexAccountModelsCacheForTest().store;
+  assert.deepEqual(cached, stored, "the cache holds exactly the committed value");
+
+  await recordCodexAccountCatalogs([{ accountId: "race-c", clientVersion: "0.160.0", slugs: [MODEL] }], raceKv);
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["race-a", "race-b", "race-c"]).has("race-c"), false, "a fresh catalog still clears the rejection");
+  assert.equal((readKv(CODEX_ACCOUNT_MODELS_KV_KEY) as { unsupported: Record<string, unknown> }).unsupported["race-c"], undefined);
+});
+
+Deno.test("codex account models: a learned rejection merges on the fresh durable value, not a stale cache snapshot", async () => {
+  clearAvailabilityKv();
+  const nowMs = Date.now();
+  setCodexAccountModelsStoreForTest(
+    mergeCodexAccountCatalogs(emptyCodexAccountModelsStore(), [{ accountId: "stale-a", clientVersion: "0.160.0", slugs: ["other-model"] }], 1),
+    nowMs
+  );
+  writeKv(CODEX_ACCOUNT_MODELS_KV_KEY, {
+    accounts: { "durable-b": { client_version: "0.160.0", slugs: ["other-model"], updated_at_ms: 1 } },
+    unsupported: {},
+  });
+  await recordCodexModelUnsupported("learn-c", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs });
+
+  const stored = readKv(CODEX_ACCOUNT_MODELS_KV_KEY) as {
+    accounts: Record<string, unknown>;
+    unsupported: Record<string, Record<string, number>>;
+  };
+  assert.deepEqual(Object.keys(stored.accounts), ["durable-b"], "the newer durable catalog is the merge base");
+  assert.equal(stored.accounts["stale-a"], undefined, "the older cache snapshot is never written back");
+  assert.deepEqual(stored.unsupported["learn-c"], { [MODEL]: nowMs });
+  assert.deepEqual(Object.keys(getCodexAccountModelsCacheForTest().store?.accounts ?? {}), ["durable-b"], "the cache holds the committed value");
+});
+
+Deno.test("codex account models: an unavailable or unwritable KV keeps both writers best effort", async () => {
+  clearAvailabilityKv();
+  const nowMs = Date.now();
+  await recordCodexModelUnsupported("nolocal-a", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs, kv: null });
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["nolocal-a"]).get("nolocal-a"), UNSUPPORTED_DETAIL, "without KV the local hint still serves");
+  assert.equal(readKv(CODEX_ACCOUNT_MODELS_KV_KEY), undefined, "no durable write without KV");
+
+  const rejected = { check: () => rejected, set: () => rejected, commit: () => Promise.resolve({ ok: false } as const) };
+  const rejectingKv = { ...(kvStub as unknown as Record<string, unknown>), atomic: () => rejected } as unknown as Deno.Kv;
+  await recordCodexAccountCatalogs([{ accountId: "fail-a", clientVersion: "0.160.0", slugs: [MODEL] }], rejectingKv);
+  await recordCodexModelUnsupported("fail-b", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs, kv: rejectingKv });
+  assert.equal(readKv(CODEX_ACCOUNT_MODELS_KV_KEY), undefined, "a commit that never succeeds writes nothing and throws nothing");
 });
 
 // ── B3: eligibility-aware routing ────────────────────────────────────────────
@@ -432,9 +563,10 @@ Deno.test("codex routing: no entitled account answers a graceful model_not_found
   await seedActiveRow(accounts[0], poolVersionstamp, 0, 1);
   clearAvailabilityKv();
   let store = emptyCodexAccountModelsStore();
-  store = withCodexModelUnsupported(store, "blocked-a", MODEL, 1_000);
-  store = withCodexModelUnsupported(store, "blocked-b", MODEL, 1_000);
-  setCodexAccountModelsStoreForTest(store, Date.now());
+  const nowMs = Date.now();
+  store = withCodexModelUnsupported(store, "blocked-a", MODEL, nowMs);
+  store = withCodexModelUnsupported(store, "blocked-b", MODEL, nowMs);
+  setCodexAccountModelsStoreForTest(store, nowMs);
 
   const selection = await selectCodexRoutingAccountsStrong({ accounts, updated_at_ms: 1 }, accounts, Date.now(), MODEL);
   assert.equal(selection.kind, "model_unavailable");
@@ -500,7 +632,7 @@ Deno.test("codex dispatch: a learned rejection is attributed to the admitted acc
 
   const learned = await learnCodexModelUnavailable(response);
   assert.deepEqual(learned, { accountId: "learn-a", model: MODEL, detail: UNSUPPORTED_DETAIL });
-  assert.equal(codexModelUnavailableAccounts(MODEL).get("learn-a"), UNSUPPORTED_DETAIL);
+  assert.equal(codexModelUnavailableAccounts(MODEL, ["learn-a", "learn-b"]).get("learn-a"), UNSUPPORTED_DETAIL);
   assert.equal(await response.text(), JSON.stringify({ detail: UNSUPPORTED_DETAIL }), "the original response is not consumed");
   assert.equal(readKv(CODEX_ACCOUNT_ROUTING_KV_KEY), undefined, "learning writes no routing fence");
   assert.equal(parseCodexActiveAccountSelection(readKv(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY))?.generation, 1, "learning does not move the election");

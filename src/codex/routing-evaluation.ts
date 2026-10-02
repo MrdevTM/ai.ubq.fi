@@ -160,7 +160,7 @@ const evaluateCodexRoutingAccount = (
   model: string | null,
   observationsByAccount: ReadonlyMap<string, CodexCapacityRoutingObservation>,
   now: number,
-  modelUnavailable: ReadonlyMap<string, string | null> = codexModelUnavailableAccounts(model)
+  modelUnavailable: ReadonlyMap<string, string | null>
 ): CodexRoutingAccountEvaluation => {
   const account: RoutingAccount = {
     auth,
@@ -266,7 +266,10 @@ const accumulateCodexRoutingAccounts = (
     hasUpstreamTimeoutBlock: false,
     modelUnavailable: null,
   };
-  const unavailableAccounts = codexModelUnavailableAccounts(model);
+  const unavailableAccounts = codexModelUnavailableAccounts(
+    model,
+    orderedAccounts.map((auth) => auth.account_id)
+  );
   for (const auth of orderedAccounts) {
     const mapped = byId.get(auth.account_id);
     if (!mapped) continue;
