@@ -3,6 +3,8 @@ export type CodexAuthState = Readonly<{
   refresh_token: string;
   account_id: string;
   updated_at_ms: number;
+  /** Local native Codex owns this account's rotating credential lineage. */
+  native_owner?: Readonly<{ codex_home: string; generation_hash: string; native_refreshed_at?: string }>;
 }>;
 
 export type CodexAuthPoolState = Readonly<{
