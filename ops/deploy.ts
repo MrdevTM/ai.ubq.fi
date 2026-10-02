@@ -2,10 +2,64 @@
 import { pruneReleases } from "./release-retention.ts";
 const canonicalRoot = "/home/codex/repos/ubiquity/ai.ubq.fi";
 
+/**
+ * The public route `AGENTS.md` makes part of the deployment acceptance. The
+ * loopback listener can report the new release while Caddy still proxies the
+ * previous upstream, so the deploy proves this route too before it reports
+ * success.
+ */
+export const PUBLIC_HEALTH_URL = "https://ai.ubq.fi/health";
+
 async function command(program: string, args: string[]): Promise<string> {
   const result = await new Deno.Command(program, { args, stdout: "piped", stderr: "piped" }).output();
   if (!result.success) throw new Error(`${program} failed: ${new TextDecoder().decode(result.stderr)}`);
   return new TextDecoder().decode(result.stdout).trim();
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * The release-identity contract shared by the loopback listener and the public
+ * route: HTTP 200, the full Git revision and its `vps-<revision>` deployment id
+ * in the body, and the same two values in the identity headers.
+ */
+function healthServesRelease(response: Response, health: unknown, sha: string): boolean {
+  const release = isRecord(health) && isRecord(health.release) ? health.release : undefined;
+  const deploymentId = `vps-${sha}`;
+  return (
+    response.status === 200 &&
+    release?.git_sha === sha &&
+    release.deployment_id === deploymentId &&
+    response.headers.get("x-uos-git-sha") === sha &&
+    response.headers.get("x-uos-deployment-id") === deploymentId
+  );
+}
+
+/**
+ * Apply the configuration `ensureCaddyIngressReady` validated. Caddy keeps
+ * serving its previously loaded configuration when a reload fails, which is
+ * exactly the state a port cutover must not leave behind: the loopback health
+ * check passes while the public route keeps answering 502 from the old upstream.
+ * The runner is a parameter so the exact command contract stays testable.
+ */
+export async function reloadCaddyIngress(run: (program: string, args: string[]) => Promise<string> = command): Promise<void> {
+  await run("sudo", ["-n", "systemctl", "reload", "caddy"]);
+  console.log(JSON.stringify({ caddy_ingress: "reloaded", service: "caddy" }));
+}
+
+/**
+ * Prove the public route serves the candidate release before the deploy reports
+ * success or prunes anything. It is the same identity contract as the loopback
+ * listener, read through the reloaded proxy and Cloudflare, so a Caddy that kept
+ * the previous upstream fails here.
+ */
+export async function assertPublicRelease(sha: string, url: string = PUBLIC_HEALTH_URL): Promise<void> {
+  const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+  const health = await response.json().catch(() => undefined);
+  if (!healthServesRelease(response, health, sha)) {
+    throw new Error(`The public route ${url} did not serve release ${sha} (HTTP ${response.status})`);
+  }
+  console.log(JSON.stringify({ public_health_verified: true, public_health_url: url, git_sha: sha, deployment_id: `vps-${sha}` }));
 }
 
 /**
@@ -40,8 +94,9 @@ async function assertDeployableCheckout(): Promise<string> {
  * unreadable to that user, Caddy's own `ExecStartPre` validation fails and a
  * reload silently keeps the previous configuration serving while the gateway
  * has already moved. Prove the composed proxy config is valid as Caddy before
- * the service is restarted, and fail closed otherwise; never repair the
- * checkout mode, which would hide the real permission fault.
+ * the service is restarted, then apply it with a reload so the validated
+ * configuration is the one actually serving. Fail closed otherwise; never
+ * repair the checkout mode, which would hide the real permission fault.
  */
 async function ensureCaddyIngressReady(): Promise<void> {
   const mode = (await Deno.stat("ops/Caddyfile")).mode ?? 0;
@@ -72,83 +127,95 @@ async function ensureCaddyIngressReady(): Promise<void> {
     "caddyfile",
   ]);
   console.log(JSON.stringify({ ingress_preflight: "caddy_config_valid", caddy_pid: mainPid }));
+  // Validation alone leaves the previously loaded configuration serving, so a
+  // host upgrading across the port cutover would keep the old upstream even
+  // though this deploy verified the new release on loopback.
+  await reloadCaddyIngress();
 }
 
-let lock: Deno.FsFile | undefined;
-try {
-  // The canonical-root boundary stays before any Git subprocess: running Git in
-  // an arbitrary checkout can execute configured helpers, so an unvalidated
-  // directory is rejected first. The read-only checkout preflight then runs
-  // before `.data` exists, and again under the deployment lock before the
-  // candidate SHA is used.
-  const root = await Deno.realPath(".");
-  if (root !== canonicalRoot) throw new Error("Run from the canonical VPS repository root");
-  await assertDeployableCheckout();
-  await Deno.mkdir(".data/releases", { recursive: true, mode: 0o700 });
-  lock = await Deno.open(".data/deploy.lock", { create: true, write: true, mode: 0o600 });
-  await lock.lock(true);
-  // Capture the candidate only after the lock: a deployment that waited for it
-  // must not release a revision from before the wait.
-  const sha = await assertDeployableCheckout();
-  const release = `.data/releases/${sha}`;
+async function deploy(): Promise<void> {
+  let lock: Deno.FsFile | undefined;
   try {
-    await Deno.stat(release);
-    throw new Error("This release already exists; use systemctl restart to restart the installed release");
-  } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
-  }
-  const staging = await Deno.makeTempDir({ dir: ".data/releases", prefix: ".staging-" });
-  const archive = `${staging}.tar`;
-  await command("git", ["archive", "--format=tar", `--output=${archive}`, sha]);
-  await command("tar", ["-xf", archive, "-C", staging]);
-  await Deno.writeTextFile(`${staging}/src/release.ts`, `// Generated for this immutable VPS release.\nexport const RELEASE_GIT_SHA = "${sha}";\n`);
-  const archiveDigest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await Deno.readFile(archive))))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  await Deno.writeTextFile(`${staging}/.uos-release.json`, JSON.stringify({ git_sha: sha, source_archive_sha256: archiveDigest }) + "\n");
-  await Deno.rename(staging, release);
-  await Deno.remove(archive);
-  const next = `.data/current-${crypto.randomUUID()}`;
-  await Deno.symlink(`releases/${sha}`, next);
-  await Deno.rename(next, ".data/current");
-  await ensureCaddyIngressReady();
-  // Repository-owned unit files are linked from `/etc/systemd/system`, so the
-  // checkout update above changes their content, but systemd keeps the
-  // previously loaded definition until `daemon-reload`. Reload before the
-  // restart so changes to `ExecStart`, environment, or sandbox settings are
-  // active for the run the health check validates.
-  await command("sudo", ["-n", "systemctl", "daemon-reload"]);
-  console.log(JSON.stringify({ systemd_daemon_reload: "before-restart", service: "ai-ubq-fi.service" }));
-  await command("sudo", ["-n", "systemctl", "restart", "ai-ubq-fi.service"]);
-
-  for (let attempt = 0; attempt < 30; attempt++) {
+    // The canonical-root boundary stays before any Git subprocess: running Git in
+    // an arbitrary checkout can execute configured helpers, so an unvalidated
+    // directory is rejected first. The read-only checkout preflight then runs
+    // before `.data` exists, and again under the deployment lock before the
+    // candidate SHA is used.
+    const root = await Deno.realPath(".");
+    if (root !== canonicalRoot) throw new Error("Run from the canonical VPS repository root");
+    await assertDeployableCheckout();
+    await Deno.mkdir(".data/releases", { recursive: true, mode: 0o700 });
+    lock = await Deno.open(".data/deploy.lock", { create: true, write: true, mode: 0o600 });
+    await lock.lock(true);
+    // Capture the candidate only after the lock: a deployment that waited for it
+    // must not release a revision from before the wait.
+    const sha = await assertDeployableCheckout();
+    const release = `.data/releases/${sha}`;
     try {
-      const response = await fetch("http://127.0.0.1:7999/health", { signal: AbortSignal.timeout(2000) });
-      const health = await response.json();
-      if (
-        response.status === 200 &&
-        health.release?.git_sha === sha &&
-        health.release?.deployment_id === `vps-${sha}` &&
-        response.headers.get("x-uos-git-sha") === sha &&
-        response.headers.get("x-uos-deployment-id") === `vps-${sha}`
-      ) {
-        // Retention runs only after the health check proves the release is live, so a
-        // pruning fault cannot turn a verified deployment into a failed one.
-        let releasesPruned: number | "failed" = "failed";
-        try {
-          releasesPruned = (await pruneReleases()).removed.length;
-        } catch (error) {
-          console.error(`[deploy] Release retention was not applied: ${error instanceof Error ? error.message : String(error)}`);
-        }
-        console.log(JSON.stringify({ git_sha: sha, deployment_id: `vps-${sha}`, release, health_verified: true, releases_pruned: releasesPruned }));
-        Deno.exit(0);
-      }
-    } catch {
-      /* The listener may still be starting. */
+      await Deno.stat(release);
+      throw new Error("This release already exists; use systemctl restart to restart the installed release");
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const staging = await Deno.makeTempDir({ dir: ".data/releases", prefix: ".staging-" });
+    const archive = `${staging}.tar`;
+    await command("git", ["archive", "--format=tar", `--output=${archive}`, sha]);
+    await command("tar", ["-xf", archive, "-C", staging]);
+    await Deno.writeTextFile(`${staging}/src/release.ts`, `// Generated for this immutable VPS release.\nexport const RELEASE_GIT_SHA = "${sha}";\n`);
+    const archiveDigest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await Deno.readFile(archive))))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    await Deno.writeTextFile(`${staging}/.uos-release.json`, JSON.stringify({ git_sha: sha, source_archive_sha256: archiveDigest }) + "\n");
+    await Deno.rename(staging, release);
+    await Deno.remove(archive);
+    const next = `.data/current-${crypto.randomUUID()}`;
+    await Deno.symlink(`releases/${sha}`, next);
+    await Deno.rename(next, ".data/current");
+    await ensureCaddyIngressReady();
+    // Repository-owned unit files are linked from `/etc/systemd/system`, so the
+    // checkout update above changes their content, but systemd keeps the
+    // previously loaded definition until `daemon-reload`. Reload before the
+    // restart so changes to `ExecStart`, environment, or sandbox settings are
+    // active for the run the health check validates.
+    await command("sudo", ["-n", "systemctl", "daemon-reload"]);
+    console.log(JSON.stringify({ systemd_daemon_reload: "before-restart", service: "ai-ubq-fi.service" }));
+    await command("sudo", ["-n", "systemctl", "restart", "ai-ubq-fi.service"]);
+
+    let loopbackVerified = false;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      try {
+        const response = await fetch("http://127.0.0.1:7999/health", { signal: AbortSignal.timeout(2000) });
+        const health = await response.json();
+        if (healthServesRelease(response, health, sha)) {
+          loopbackVerified = true;
+          break;
+        }
+      } catch {
+        /* The listener may still be starting. */
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    if (!loopbackVerified) {
+      throw new Error("The VPS did not serve the expected release; inspect journalctl -u ai-ubq-fi.service");
+    }
+    // The loopback listener proves this host runs the new release, but the public
+    // route is the acceptance surface. A Caddy still loaded with the previous
+    // upstream answers 502 there while the loopback check passed, so verify the
+    // public identity before the success record and before retention prunes.
+    await assertPublicRelease(sha);
+    // Retention runs only after both health checks prove the release is live, so
+    // a pruning fault cannot turn a verified deployment into a failed one.
+    let releasesPruned: number | "failed" = "failed";
+    try {
+      releasesPruned = (await pruneReleases()).removed.length;
+    } catch (error) {
+      console.error(`[deploy] Release retention was not applied: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    console.log(JSON.stringify({ git_sha: sha, deployment_id: `vps-${sha}`, release, health_verified: true, releases_pruned: releasesPruned }));
+    Deno.exit(0);
+  } finally {
+    lock?.close();
   }
-  throw new Error("The VPS did not serve the expected release; inspect journalctl -u ai-ubq-fi.service");
-} finally {
-  lock?.close();
 }
+
+if (import.meta.main) await deploy();
