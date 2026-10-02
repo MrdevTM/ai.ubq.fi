@@ -1045,6 +1045,49 @@ Deno.test("openai: an empty provider selection keeps Codex as the primary provid
   }
 });
 
+Deno.test("openai: a switched-off DeepSeek provider is not dispatched on the Responses route", async () => {
+  const originalApiKey = Deno.env.get("DEEPSEEK_API_KEY");
+  const originalOpenRouterApiKey = Deno.env.get("OPENROUTER_API_KEY");
+  Deno.env.set("DEEPSEEK_API_KEY", "deepseek-test-key");
+  // The following sibling branch resolves OpenRouter's catalogue before it
+  // consults the selection; without a key it answers not-served without a fetch.
+  Deno.env.delete("OPENROUTER_API_KEY");
+  resetMeteredModelsCacheForTest();
+  resetSurplusModelsCacheForTest();
+  try {
+    await withDiscoveryKeys(null, async () => {
+      await withProviderSelection(["cerebras"], async () => {
+        // Both transports take the same gate before transport selection, so one
+        // loop covers the buffered and streamed branches without extra nesting.
+        for (const stream of [false, true]) {
+          const dispatched: string[] = [];
+          const response = await withFetchMock(
+            (url) => {
+              dispatched.push(url);
+              throw new Error(`a switched-off DeepSeek provider must not be dispatched to: ${url}`);
+            },
+            () => handleResponses(deepSeekResponsesRequest({ model: DEEPSEEK_FLASH_MODEL, input: "hi", stream }))
+          );
+          assert.deepEqual(dispatched, [], `stream=${stream}: the DeepSeek upstream must not be reached`);
+          assert.equal(response.headers.get("x-uos-upstream"), null, `stream=${stream}: the ordinary availability path answers, not the DeepSeek handler`);
+          assert.equal(response.status, 404);
+          const payload = (await response.json()) as { error?: { code?: unknown; param?: unknown } };
+          assert.ok(payload.error, `stream=${stream}: a terminal availability error must carry an error body`);
+          assert.equal(payload.error.code, "model_not_found");
+          assert.equal(payload.error.param, "model");
+        }
+      });
+    });
+  } finally {
+    resetMeteredModelsCacheForTest();
+    resetSurplusModelsCacheForTest();
+    if (originalApiKey === undefined) Deno.env.delete("DEEPSEEK_API_KEY");
+    else Deno.env.set("DEEPSEEK_API_KEY", originalApiKey);
+    if (originalOpenRouterApiKey === undefined) Deno.env.delete("OPENROUTER_API_KEY");
+    else Deno.env.set("OPENROUTER_API_KEY", originalOpenRouterApiKey);
+  }
+});
+
 /** Seeds both paid catalogs for the model the fallthrough fixtures route. */
 
 Deno.test("openai: transient first-tier paid failures fall through to OpenLux", async (t) => {

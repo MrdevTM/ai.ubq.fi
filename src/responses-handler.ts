@@ -782,9 +782,10 @@ const handleResponsesInternal = async (req: Request, usageContext?: UsageContext
   // DeepSeek official models are dispatched from the Responses adapter before
   // the Codex catalog lookup, exactly as the Chat Completions route is
   // dispatched before Codex model validation. Only an explicit DeepSeek id
-  // takes this branch; every other request is unchanged.
+  // takes this branch; a switched-off DeepSeek provider leaves its ids to the
+  // ordinary availability check.
   const requestedModel = getString(rawRecord.model)?.trim();
-  if (requestedModel && deepSeekUpstreamModelFor(requestedModel)) {
+  if (requestedModel && deepSeekUpstreamModelFor(requestedModel) && isProviderEnabled("deepseek", await loadProviderSelectionCached())) {
     return await handleDeepSeekResponses(req, rawRecord, requestedModel, usageContext);
   }
   // LithosAI has no Responses endpoint of its own, so this route is served by
