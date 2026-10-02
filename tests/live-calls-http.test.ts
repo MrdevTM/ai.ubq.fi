@@ -14,6 +14,8 @@ const BOUNDARY = "codex-realtime-call-boundary";
 const ACCOUNT_A = "live-calls-http-account-a";
 const ACCOUNT_B = "live-calls-http-account-b";
 const CALL_ID = "rtc_live_calls_http";
+/** The authenticated principal the fixture's API key resolves to. */
+const PRINCIPAL = "api-key:live-calls-http-key";
 const SDP_OFFER = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
 const SDP_ANSWER = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
 const SESSION = { model: "gpt-live-1-codex", instructions: "be brief", delegation: { type: "client" }, audio: { output: { voice: "cove" } } };
@@ -275,6 +277,7 @@ Deno.test({
       const mapping = fixture.kv.entries.get(JSON.stringify(["uos_ai", "codex_live_calls", "v1", CALL_ID]))?.value;
       assert.ok(mapping && typeof mapping === "object", "the call id is mapped to its creating account");
       assert.equal((mapping as { account_id?: unknown }).account_id, ACCOUNT_A);
+      assert.equal((mapping as { principal_id?: unknown }).principal_id, PRINCIPAL, "the call is bound to its creating principal");
     } finally {
       await fixture.close();
     }
@@ -376,6 +379,7 @@ Deno.test({
       assert.equal(response.headers.get("location"), `/v1/live/${CALL_ID}`);
       const mapping = fixture.kv.entries.get(JSON.stringify(["uos_ai", "codex_live_calls", "v1", CALL_ID]))?.value;
       assert.equal((mapping as { account_id?: unknown } | undefined)?.account_id, ACCOUNT_B, "the call is mapped to the account that created it");
+      assert.equal((mapping as { principal_id?: unknown } | undefined)?.principal_id, PRINCIPAL, "the call stays bound to its creating principal");
     } finally {
       await fixture.close();
     }

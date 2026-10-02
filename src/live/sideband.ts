@@ -15,7 +15,7 @@ import {
   LIVE_SIDEBAND_PREOPEN_MAX_FRAMES,
   liveSidebandUpstreamHeaders,
   liveSidebandUrl,
-  readLiveCallAccountId,
+  readLiveCallMapping,
 } from "./upstream.ts";
 
 type DownstreamSocket = ReturnType<typeof Deno.upgradeWebSocket>["socket"];
@@ -232,18 +232,26 @@ const liveCallAccountToken = async (accountId: string): Promise<LiveCallAccountT
 /**
  * Joins one call's sideband.
  *
- * A call id with no durable mapping is answered with 404 *before* upgrading:
- * the mapping is the gateway's only routing signal for the upstream account,
- * and the Codex client stops reconnecting on 404/410 exactly as it would for a
- * finished upstream call.
+ * The durable mapping binds the call to the account and gateway principal that
+ * created it. A call id with no mapping is answered with 404 *before*
+ * upgrading: the mapping is the gateway's only routing signal for the upstream
+ * account, and the Codex client stops reconnecting on 404/410 exactly as it
+ * would for a finished upstream call. A join from any other principal - or a
+ * legacy record with no recorded principal, which can never be authorized - is
+ * refused with 403 *before* the upgrade, deliberately without a permissive
+ * compatibility fallback.
  */
-export const handleLiveSideband = async (req: Request, callId: string): Promise<Response> => {
-  const accountId = await readLiveCallAccountId(callId);
-  if (accountId === null) {
+export const handleLiveSideband = async (req: Request, callId: string, principal: string): Promise<Response> => {
+  const mapping = await readLiveCallMapping(callId);
+  if (mapping === null) {
     logLiveSideband("rejected", { call_id: callId, reason: "unknown_call" });
     return openaiError(404, "Unknown realtime call.", "invalid_request_error");
   }
-  const account = await liveCallAccountToken(accountId);
+  if (mapping.principalId === null || mapping.principalId !== principal) {
+    logLiveSideband("rejected", { call_id: callId, reason: mapping.principalId === null ? "principal_missing" : "principal_mismatch" });
+    return openaiError(403, "The realtime call was not created by this gateway principal.", "forbidden");
+  }
+  const account = await liveCallAccountToken(mapping.accountId);
   if (!account.ok) {
     logLiveSideband("rejected", { call_id: callId, reason: "account_unavailable" });
     return account.response;
@@ -253,6 +261,6 @@ export const handleLiveSideband = async (req: Request, callId: string): Promise<
   }
 
   const upgrade = Deno.upgradeWebSocket(req);
-  void bridgeLiveSideband({ downstream: upgrade.socket, callId, accountId, accessToken: account.accessToken });
+  void bridgeLiveSideband({ downstream: upgrade.socket, callId, accountId: mapping.accountId, accessToken: account.accessToken });
   return upgrade.response;
 };

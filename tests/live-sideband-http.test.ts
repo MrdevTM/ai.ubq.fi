@@ -23,7 +23,12 @@ Object.defineProperty(process, "env", {
 });
 
 const ACCOUNT_A = "live-sideband-http-account-a";
+const KEY_ID = "live-sideband-http-key";
+const KEY_ID_B = "live-sideband-http-key-b";
+/** The principal the fixture's first API key resolves to; the mapping records it. */
+const PRINCIPAL = `api-key:${KEY_ID}`;
 const CALL_ID = "rtc_live_sideband_http";
+const LEGACY_CALL_ID = "rtc_live_sideband_legacy";
 const UNKNOWN_CALL_ID = "rtc_live_sideband_unknown";
 const CLIENT_FRAME = JSON.stringify({ type: "input_audio.append", audio: "AAAA" });
 const UPSTREAM_FRAME = JSON.stringify({ type: "output_audio.delta", audio: "BBBB" });
@@ -35,7 +40,7 @@ const codexAccount = (accountId: string, nowMs: number): CodexAuthState => ({
   updated_at_ms: nowMs,
 });
 
-const seedApiKey = async (kv: CountingKv, token: string, nowMs: number): Promise<void> => {
+const seedApiKey = async (kv: CountingKv, keyId: string, name: string, token: string, nowMs: number): Promise<void> => {
   const tokenHash = await sha256Base64Url(token);
   const commonPolicy = {
     expires_at_ms: -1,
@@ -52,8 +57,8 @@ const seedApiKey = async (kv: CountingKv, token: string, nowMs: number): Promise
     paid_fallback_reservation_request_id: null,
   } satisfies Omit<ApiKeyHashRecord, "id">;
   const keyRecord: ApiKeyRecord = {
-    id: "live-sideband-http-key",
-    name: "Live sideband HTTP key",
+    id: keyId,
+    name,
     prefix: token.slice(0, 10),
     hash: tokenHash,
     created_at_ms: nowMs,
@@ -78,9 +83,10 @@ type UpstreamSideband = {
 type SidebandFixture = {
   readonly kv: CountingKv;
   readonly token: string;
+  readonly tokenB: string;
   readonly gatewayWsBaseUrl: string;
   readonly upstreamSidebands: UpstreamSideband[];
-  waitForUpstreamSideband: () => Promise<UpstreamSideband>;
+  waitForUpstreamSideband: (index?: number) => Promise<UpstreamSideband>;
   close: () => Promise<void>;
 };
 
@@ -111,9 +117,18 @@ const startSidebandFixture = async (): Promise<SidebandFixture> => {
 
   const now = Date.now();
   await kv.set(["ubq_ai", "codex_auth"], { accounts: [codexAccount(ACCOUNT_A, now)], updated_at_ms: now });
-  await kv.set(["uos_ai", "codex_live_calls", "v1", CALL_ID], { account_id: ACCOUNT_A, created_at_ms: now }, { expireIn: 60 * 60_000 });
+  await kv.set(
+    ["uos_ai", "codex_live_calls", "v1", CALL_ID],
+    { account_id: ACCOUNT_A, principal_id: PRINCIPAL, created_at_ms: now },
+    { expireIn: 60 * 60_000 }
+  );
+  // A record written before principal binding: no `principal_id`, so no join
+  // can ever be authorized against it.
+  await kv.set(["uos_ai", "codex_live_calls", "v1", LEGACY_CALL_ID], { account_id: ACCOUNT_A, created_at_ms: now }, { expireIn: 60 * 60_000 });
   const token = `u_${"d".repeat(64)}`;
-  await seedApiKey(kv, token, now);
+  const tokenB = `u_${"e".repeat(64)}`;
+  await seedApiKey(kv, KEY_ID, "Live sideband HTTP key", token, now);
+  await seedApiKey(kv, KEY_ID_B, "Live sideband HTTP key B", tokenB, now);
 
   const upstreamServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, (request) => {
     const url = new URL(request.url);
@@ -149,11 +164,12 @@ const startSidebandFixture = async (): Promise<SidebandFixture> => {
   return {
     kv,
     token,
+    tokenB,
     gatewayWsBaseUrl: `ws://127.0.0.1:${(gatewayServer.addr as Deno.NetAddr).port}/v1/live`,
     upstreamSidebands,
-    waitForUpstreamSideband: async () => {
+    waitForUpstreamSideband: async (index = 0) => {
       for (let attempt = 0; attempt < 200; attempt += 1) {
-        const sideband = upstreamSidebands.at(0);
+        const sideband = upstreamSidebands.at(index);
         if (sideband !== undefined) return sideband;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
@@ -443,6 +459,70 @@ Deno.test({
     try {
       await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${UNKNOWN_CALL_ID}`, { authorization: `Bearer ${fixture.token}` }, 404);
       assert.equal(fixture.upstreamSidebands.length, 0);
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> answers 403 for a different valid principal without dialing upstream",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.tokenB}` }, 403);
+      assert.equal(fixture.upstreamSidebands.length, 0, "an unauthorized principal never reaches the upstream");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> fails closed for a mapping with no recorded principal",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      await expectHandshakeStatus(`${fixture.gatewayWsBaseUrl}/${LEGACY_CALL_ID}`, { authorization: `Bearer ${fixture.token}` }, 403);
+      assert.equal(fixture.upstreamSidebands.length, 0, "a legacy mapping is never joined on an unproven principal");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> lets the creating principal reconnect on the same upstream account",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture();
+    try {
+      const first = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+      const firstUpstream = await fixture.waitForUpstreamSideband(0);
+      assert.equal(firstUpstream.headers.get("authorization"), `Bearer ${ACCOUNT_A}-access-token`);
+      assert.equal(firstUpstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+
+      const firstClosed = nextClose(first);
+      first.close(1000, "reconnect");
+      await firstClosed;
+
+      const second = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+      try {
+        const secondUpstream = await fixture.waitForUpstreamSideband(1);
+        assert.equal(secondUpstream.path, `/v1/live/${CALL_ID}`);
+        assert.equal(secondUpstream.headers.get("authorization"), `Bearer ${ACCOUNT_A}-access-token`, "the reconnect maps the same upstream account");
+        assert.equal(secondUpstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+      } finally {
+        second.terminate();
+      }
     } finally {
       await fixture.close();
     }
