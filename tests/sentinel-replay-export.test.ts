@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { config } from "../src/config.ts";
 import { setKvForTest } from "../src/kv.ts";
+import { OPENROUTER_CHAT_COMPLETIONS_URL } from "../src/provider/openrouter.ts";
 import {
   type AcceptedSentinelReplayInput,
   decryptExportedSentinelReplay,
@@ -9,9 +10,17 @@ import {
   type SentinelFailureObservation,
 } from "../src/sentinel/replay-capture.ts";
 import { handleAdminSentinelReplayCaptures } from "../src/sentinel/replay-admin.ts";
-import { createSentinelUpstreamRecorder, SENTINEL_UPSTREAM_MAX_CHUNKS, type SentinelUpstreamTrace } from "../src/sentinel/upstream-capture.ts";
+import {
+  createSentinelUpstreamRecorder,
+  SENTINEL_UPSTREAM_MAX_BYTES,
+  SENTINEL_UPSTREAM_MAX_CHUNKS,
+  type SentinelUpstreamProvider,
+  type SentinelUpstreamTrace,
+} from "../src/sentinel/upstream-capture.ts";
 import { PASSKEY_RELAY_COOKIE_NAME, passkeyHandleKey, passkeySessionKey, passkeyUserKey } from "../src/auth/passkeys.ts";
 import { linkSentinelReplayToIncident } from "../src/sentinel/incident-outbox.ts";
+import type { SentinelClientFailureObservation } from "../src/sentinel/replay-model.ts";
+import { createRecordedUpstreamReplay } from "./helpers/sentinel-recorded-upstream.ts";
 
 const { default: handler } = await import("../src/handler/index.ts");
 
@@ -63,6 +72,102 @@ const recordUpstreamTrace = async (bytes: Uint8Array<ArrayBuffer>, chunkBytes: n
   const trace = recorder.snapshotAndSeal();
   recorder.dispose();
   return trace;
+};
+
+/** One 64 KiB recorder chunk: the shape every large bound case is assembled from. */
+const UPSTREAM_CHUNK_BYTES = 64 * 1_024;
+
+/**
+ * Distinct exact HTTPS endpoints, one per provider enum, for the trusted
+ * recorded-upstream replay transport. Nothing here is contacted: the transport
+ * only matches the recorded provider route and serves the recorded chunks.
+ */
+const REPLAY_ROUTES: Readonly<Record<SentinelUpstreamProvider, string>> = Object.freeze({
+  chatgpt_codex: "https://recorded-upstream.invalid/codex/responses",
+  surplus: "https://recorded-upstream.invalid/surplus/v1/responses",
+  metered: "https://recorded-upstream.invalid/metered/v1/responses",
+  cerebras: "https://recorded-upstream.invalid/cerebras/v1/chat/completions",
+  deepseek: "https://recorded-upstream.invalid/deepseek/v1/chat/completions",
+  lithos: "https://recorded-upstream.invalid/lithos/v1/chat/completions",
+  openrouter: OPENROUTER_CHAT_COMPLETIONS_URL,
+});
+
+/** Deterministic synthetic bytes: the value at every offset is its position modulo 251. */
+const patternedBytes = (byteLength: number): Uint8Array<ArrayBuffer> => {
+  const bytes: Uint8Array<ArrayBuffer> = new Uint8Array(byteLength);
+  for (let index = 0; index < byteLength; index += 1) bytes[index] = index % 251;
+  return bytes;
+};
+
+/** A client-visible failure observation whose downstream terminal body was retained. */
+const retainedBodyObservation = (): SentinelClientFailureObservation => ({
+  status: 502,
+  stream: false,
+  completed: false,
+  terminal_type: "http.error",
+  failure_kind: "upstream_timeout",
+  framing_valid: true,
+  provider_route: "test-provider",
+  error_code: null,
+  error_param: null,
+  terminal_body_base64: btoa("upstream timed out"),
+  terminal_body_truncated: false,
+});
+
+/**
+ * Bounded byte comparison: a mismatch reports its first offset and the two
+ * lengths, never a multi-megabyte array spread through an assertion diagnostic.
+ */
+const firstDifferingOffset = (actual: Uint8Array, expected: Uint8Array): number | null => {
+  const shared = Math.min(actual.byteLength, expected.byteLength);
+  for (let index = 0; index < shared; index += 1) {
+    if (actual[index] !== expected[index]) return index;
+  }
+  return actual.byteLength === expected.byteLength ? null : shared;
+};
+
+const assertBytesEqual = (actual: Uint8Array, expected: Uint8Array, label: string): void => {
+  assert.equal(actual.byteLength, expected.byteLength, `${label}: byte length`);
+  assert.equal(firstDifferingOffset(actual, expected), null, `${label}: first differing offset`);
+};
+
+/** Decode one recorded chunk's canonical padded base64 without materializing the whole trace. */
+const decodeStandardBase64 = (encoded: string): Uint8Array<ArrayBuffer> => {
+  const binary = atob(encoded);
+  const bytes: Uint8Array<ArrayBuffer> = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+};
+
+/**
+ * Replay a decrypted trace through the trusted recorded-upstream transport and
+ * require every original byte to arrive at its exact recorded chunk boundary:
+ * a merged, split, reordered, substituted or missing chunk fails this check.
+ */
+const assertReplayedUpstream = async (trace: SentinelUpstreamTrace, expected: Uint8Array<ArrayBuffer>, label: string): Promise<void> => {
+  const replay = createRecordedUpstreamReplay(trace, REPLAY_ROUTES);
+  const provider = trace.attempts[0]?.provider;
+  assert.ok(provider, `${label}: the trace must carry the replayed attempt`);
+  const response = await replay.fetch(REPLAY_ROUTES[provider]);
+  assert.equal(response.status, 200, `${label}: replayed status`);
+  assert.equal(response.headers.get("content-type"), "text/event-stream", `${label}: replayed content type`);
+  const reader = response.body?.getReader();
+  assert.ok(reader, `${label}: the replay must expose a body stream`);
+  let offset = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const expectedLength = Math.min(UPSTREAM_CHUNK_BYTES, expected.byteLength - offset);
+    assert.equal(value.byteLength, expectedLength, `${label}: replayed boundary at ${offset}`);
+    assertBytesEqual(value, expected.subarray(offset, offset + expectedLength), `${label}: replayed bytes at ${offset}`);
+    offset += value.byteLength;
+  }
+  assert.equal(offset, expected.byteLength, `${label}: every recorded byte must be replayed`);
+  replay.assertComplete();
+  const snapshot = replay.snapshot();
+  assert.equal(snapshot.failed, false, `${label}: replay failure`);
+  assert.equal(snapshot.chunksConsumed, snapshot.chunksTotal, `${label}: every recorded chunk consumed`);
+  assert.equal(snapshot.chunksTotal, Math.ceil(expected.byteLength / UPSTREAM_CHUNK_BYTES), `${label}: recorded chunk count`);
 };
 
 const expectStored = (result: Awaited<ReturnType<typeof persistEncryptedSentinelReplay>>) => {
@@ -234,8 +339,92 @@ Deno.test({
   },
 });
 
+/**
+ * The advertised upstream capture bound is `SENTINEL_UPSTREAM_MAX_BYTES` (4 MiB),
+ * yet the earlier regression only exercised 256 KiB + 1 byte: well past the
+ * ~192 KiB of upstream bytes the legacy fixed metadata bound could carry once
+ * base64-encoded, but nowhere near the boundary the bound actually advertises.
+ * Both sizes now run the whole record -> persist -> export -> decrypt -> replay
+ * chain, so a capture the recorder accepted is proven exportable and replayable
+ * byte for byte at the representative size and at the exact upper bound.
+ */
+const CAPTURE_BOUND_CASES: readonly Readonly<{ label: string; byteLength: number }>[] = [
+  { label: "256 KiB + 1 byte above the legacy fixed metadata bound", byteLength: 256 * 1_024 + 1 },
+  { label: "exactly the advertised 4 MiB capture bound", byteLength: SENTINEL_UPSTREAM_MAX_BYTES },
+];
+
+for (const boundCase of CAPTURE_BOUND_CASES) {
+  Deno.test({
+    name: `replay capture exports and replays an upstream capture at ${boundCase.label}`,
+    ignore: !kvAvailable,
+    sanitizeResources: false,
+    sanitizeOps: false,
+    async fn() {
+      const kv = await Deno.openKv(":memory:");
+      setKvForTest(kv);
+      const adminTokens = config.adminTokens as Set<string>;
+      adminTokens.add(SUPER_ADMIN_TOKEN);
+      try {
+        const keyBytes = crypto.getRandomValues(new Uint8Array(32)).slice() as Uint8Array<ArrayBuffer>;
+        const nowMs = 1_400_000_000_000;
+        const requestId = `synthetic-envelope-${boundCase.byteLength}-request`;
+        const upstreamBytes = patternedBytes(boundCase.byteLength);
+        const expectedChunks = Math.ceil(boundCase.byteLength / UPSTREAM_CHUNK_BYTES);
+        const trace = await recordUpstreamTrace(upstreamBytes, UPSTREAM_CHUNK_BYTES);
+        assert.equal(trace.attempts[0]?.chunks_base64.length, expectedChunks, `${boundCase.label}: recorded chunk count`);
+        assert.equal(trace.bytes_truncated, false, `${boundCase.label}: recorded byte truncation`);
+        assert.equal(trace.chunks_truncated, false, `${boundCase.label}: recorded chunk truncation`);
+        assert.equal(trace.attempts_truncated, false, `${boundCase.label}: recorded attempt truncation`);
+
+        const input: AcceptedSentinelReplayInput = {
+          ...syntheticInput(encoder.encode(JSON.stringify({ model: "gpt-5.6-sol", stream: false })), requestId),
+          upstream: trace,
+        };
+        const stored = expectStored(
+          await persistEncryptedSentinelReplay(
+            input,
+            failureObservation(),
+            { kv, keyBytes, now: () => nowMs, randomUuid: () => `synthetic-envelope-capture-${boundCase.byteLength}`, randomBytes: twelveByteIv },
+            retainedBodyObservation()
+          )
+        );
+
+        const response = await handler(new Request(exportUrl({ request_id: requestId }), { headers: superAdminHeaders }));
+        assert.equal(response.status, 200);
+        const body = (await response.json()) as { data: ExportedSentinelReplayCapture[] };
+        assert.equal(body.data.length, 1);
+        assert.equal(body.data[0]?.manifest.fingerprint, stored.manifest.fingerprint);
+        const plaintext = await decryptExportedSentinelReplay(firstCapture(body), keyBytes);
+
+        // A capture the recorder accepted must stay exactly the capture the
+        // envelope bound admits: no truncation flag and no unavailable reason
+        // may appear, so incompleteness is never silently dropped.
+        assert.deepEqual(plaintext.unavailable, [], `${boundCase.label}: unavailable evidence`);
+        assert.equal(plaintext.capture_status, "ready", `${boundCase.label}: capture status`);
+        assert.equal(plaintext.replay_coverage, "full", `${boundCase.label}: replay coverage`);
+        assert.equal(plaintext.upstream.attempts_truncated, false, `${boundCase.label}: decrypted attempt truncation`);
+        assert.equal(plaintext.upstream.bytes_truncated, false, `${boundCase.label}: decrypted byte truncation`);
+        assert.equal(plaintext.upstream.chunks_truncated, false, `${boundCase.label}: decrypted chunk truncation`);
+        assert.equal(plaintext.upstream.attempts.length, 1);
+        assert.equal(plaintext.upstream.attempts[0]?.chunks_base64.length, expectedChunks, `${boundCase.label}: decrypted chunk count`);
+
+        // Byte preservation: the accepted request body and the recorded upstream
+        // bytes are reconstructed from the encrypted export alone, and the
+        // replay transport must hand back every original chunk boundary.
+        assert.equal(plaintext.body_bytes, input.body.byteLength, `${boundCase.label}: recorded body length`);
+        assertBytesEqual(plaintext.body, input.body, `${boundCase.label}: request body`);
+        await assertReplayedUpstream(plaintext.upstream, upstreamBytes, boundCase.label);
+      } finally {
+        adminTokens.delete(SUPER_ADMIN_TOKEN);
+        kv.close();
+        setKvForTest(null);
+      }
+    },
+  });
+}
+
 Deno.test({
-  name: "replay capture exports an upstream capture past the legacy fixed metadata bound",
+  name: "replay capture marks an upstream capture over the advertised 4 MiB bound as explicitly incomplete",
   ignore: !kvAvailable,
   sanitizeResources: false,
   sanitizeOps: false,
@@ -246,31 +435,29 @@ Deno.test({
     adminTokens.add(SUPER_ADMIN_TOKEN);
     try {
       const keyBytes = crypto.getRandomValues(new Uint8Array(32)).slice() as Uint8Array<ArrayBuffer>;
-      const nowMs = 1_400_000_000_000;
-      // 256 KiB + 1 byte in four full 64 KiB chunks plus a one-byte tail: well
-      // past the ~192 KiB of upstream bytes the legacy fixed metadata bound
-      // could carry once base64-encoded, and shaped so per-chunk base64 padding
-      // is part of the envelope size.
-      const upstreamBytes = new Uint8Array(256 * 1_024 + 1);
-      for (let index = 0; index < upstreamBytes.byteLength; index += 1) upstreamBytes[index] = index % 251;
-      const trace = await recordUpstreamTrace(upstreamBytes, 64 * 1_024);
-      assert.equal(trace.attempts[0]?.chunks_base64.length, 5);
-      assert.equal(trace.bytes_truncated, false);
+      const nowMs = 1_410_000_000_000;
+      const requestId = "synthetic-over-limit-envelope-request";
+      // One full 64 KiB chunk beyond the advertised bound: the recorder keeps
+      // exactly the bound and permanently flags the dropped bytes.
+      const upstreamBytes = patternedBytes(SENTINEL_UPSTREAM_MAX_BYTES + UPSTREAM_CHUNK_BYTES);
+      const retainedChunks = Math.ceil(SENTINEL_UPSTREAM_MAX_BYTES / UPSTREAM_CHUNK_BYTES);
+      const trace = await recordUpstreamTrace(upstreamBytes, UPSTREAM_CHUNK_BYTES);
+      assert.equal(trace.attempts[0]?.chunks_base64.length, retainedChunks);
+      assert.equal(trace.bytes_truncated, true);
       assert.equal(trace.chunks_truncated, false);
+      assert.equal(trace.attempts_truncated, false);
 
-      const requestId = "synthetic-envelope-request";
       const input: AcceptedSentinelReplayInput = {
         ...syntheticInput(encoder.encode(JSON.stringify({ model: "gpt-5.6-sol", stream: false })), requestId),
         upstream: trace,
       };
       const stored = expectStored(
-        await persistEncryptedSentinelReplay(input, failureObservation(), {
-          kv,
-          keyBytes,
-          now: () => nowMs,
-          randomUuid: () => "synthetic-envelope-capture",
-          randomBytes: twelveByteIv,
-        })
+        await persistEncryptedSentinelReplay(
+          input,
+          failureObservation(),
+          { kv, keyBytes, now: () => nowMs, randomUuid: () => "synthetic-over-limit-envelope-capture", randomBytes: twelveByteIv },
+          retainedBodyObservation()
+        )
       );
 
       const response = await handler(new Request(exportUrl({ request_id: requestId }), { headers: superAdminHeaders }));
@@ -279,10 +466,31 @@ Deno.test({
       assert.equal(body.data.length, 1);
       assert.equal(body.data[0]?.manifest.fingerprint, stored.manifest.fingerprint);
       const plaintext = await decryptExportedSentinelReplay(firstCapture(body), keyBytes);
-      // The whole permitted capture survives the envelope byte for byte,
-      // including every per-chunk base64 string.
-      assert.deepEqual(plaintext.upstream, trace);
-      assert.deepEqual([...plaintext.body], [...input.body]);
+
+      // The over-limit loss is itself evidence, never a silent success: the
+      // capture is flagged, classified incomplete and reported as partial.
+      assert.equal(plaintext.upstream.bytes_truncated, true);
+      assert.deepEqual(plaintext.unavailable, ["upstream_trace_truncated"]);
+      assert.equal(plaintext.capture_status, "incomplete");
+      assert.equal(plaintext.replay_coverage, "partial");
+
+      const attempt = plaintext.upstream.attempts[0];
+      assert.ok(attempt);
+      assert.equal(attempt.chunks_base64.length, retainedChunks);
+      let offset = 0;
+      for (const chunk of attempt.chunks_base64) {
+        const decoded = decodeStandardBase64(chunk);
+        assertBytesEqual(decoded, upstreamBytes.subarray(offset, offset + decoded.byteLength), `retained upstream prefix at ${offset}`);
+        offset += decoded.byteLength;
+      }
+      assert.equal(offset, SENTINEL_UPSTREAM_MAX_BYTES, "exactly the advertised bound is retained");
+
+      // The replay transport refuses truncated evidence instead of replaying a
+      // prefix as if it were the whole capture.
+      assert.throws(
+        () => createRecordedUpstreamReplay(plaintext.upstream, REPLAY_ROUTES),
+        (error: unknown) => error instanceof Error && error.message === "Sentinel recorded upstream trace is truncated"
+      );
     } finally {
       adminTokens.delete(SUPER_ADMIN_TOKEN);
       kv.close();

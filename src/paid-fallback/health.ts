@@ -377,19 +377,19 @@ export const resolvePaidRoutingState = (
 const isAuthoritativeCapacityStatus = (status: number | null): boolean => status === 402 || status === 429;
 
 /**
- * A paid-tier attempt may only fall through to the next enabled paid tier when
- * it produced no usable answer for the client:
- * - 402 and 429 are the authoritative capacity signals.
- * - A missing status is a transport failure or this attempt's own first-headers
- *   deadline, and any 5xx is an upstream fault; both are transient and must not
- *   consume the request while a cheaper tier is still available.
- * Every other status, including a definitive 400, is the provider's answer and
- * stays delivered as the final response.
+ * The provider fallback chain is ordered by cost and may advance only after an
+ * authoritative upstream quota or capacity signal, so 402 and 429 are the only
+ * statuses that hand the request to the next enabled paid tier. A missing
+ * status (transport failure or this attempt's own first-headers deadline), a
+ * network or read error, and any 5xx are transient faults, not quota
+ * exhaustion: they stay on the tier that failed instead of spending a later
+ * tier. A local API-key quota rejection never reaches this classification; it
+ * is an admission/dispatch guard, not an upstream capacity signal. Every other
+ * status, including a definitive 400, is the provider's answer and stays
+ * delivered as the final response.
  */
-const isTransientPaidProviderStatus = (status: number | null): boolean => isAuthoritativeCapacityStatus(status) || status === null || status >= 500;
-
 export const isIntermediatePaidProviderAttempt = (providerIndex: number, providerCount: number, status: number | null): boolean =>
-  providerIndex < providerCount - 1 && isTransientPaidProviderStatus(status);
+  providerIndex < providerCount - 1 && isAuthoritativeCapacityStatus(status);
 
 export const paidFallbackAbortReason = (fallbackSignal: AbortSignal | undefined): Error =>
   fallbackSignal?.reason instanceof Error ? fallbackSignal.reason : new DOMException("The request was aborted.", "AbortError");
