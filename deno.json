@@ -55,7 +55,7 @@
     "size:update": "deno run --allow-read --allow-write=file-size-baseline.json scripts/file-size-ratchet.ts --update",
     "verify": "sh scripts/verify.sh",
     "prune:releases": "deno run --allow-read --allow-write ops/prune-releases.ts",
-    "deploy:vps": "deno run --allow-read --allow-write --allow-run=git,tar,sudo --allow-net=127.0.0.1:7999 ops/deploy.ts",
+    "deploy:vps": "deno run --allow-read --allow-write --allow-run=git,tar,sudo --allow-net=127.0.0.1:7999,ai.ubq.fi ops/deploy.ts",
     "deploy:mac": "deno run --allow-read --allow-write --allow-run=git,tar,id,launchctl,ps --allow-net=127.0.0.1:7999 ops/deploy-mac.ts"
   },
   "nodeModulesDir": "none",
