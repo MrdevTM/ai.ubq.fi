@@ -19,6 +19,12 @@
  * one. A refresh token is therefore never exercised, so a check cannot rotate
  * a shared refresh token and cannot break the host the credential came from.
  *
+ * A probe that cannot decide an account — a timeout, or any status other than
+ * 200/429/401 — leaves that account exactly as it is and is reported as
+ * inconclusive. Only an explicit rejection or an already-expired access token
+ * makes a slot repair-eligible, and an inconclusive slot never pays for SSH
+ * reads or candidate probes on its own.
+ *
  * `ssh` is the only transport for remote credentials, and the remote program
  * is streamed over stdin so nothing has to be installed on the other host.
  * Nothing on the remote host is ever written.
@@ -33,6 +39,7 @@ import {
   codexAuthCandidateFromAuthJson,
   codexAuthCandidateKey,
   codexAuthCandidatesFromPool,
+  needsCodexAuthReplacement,
   planCodexAuthRepair,
 } from "../src/codex/auth-repair.ts";
 import { getJwtExpMs, parseCodexAuthPool } from "../src/codex/index.ts";
@@ -126,7 +133,8 @@ adopts a working credential from another host.
   --codex-base-url <url>
   --ssh <path>         ssh binary (default ssh).
 
-Exit codes: 0 healthy or repaired, 1 repair needed but not applied, 2 blocked.`);
+Exit codes: 0 healthy or repaired, 1 repair needed but not applied or a probe was
+inconclusive, 2 blocked.`);
 };
 
 const sha256Prefix = async (value: string): Promise<string> => {
@@ -362,7 +370,7 @@ const collectCandidates = async (flags: Flags, warn: (message: string) => void):
 };
 
 type Report = Readonly<{
-  status: "healthy" | "repaired" | "repair_available" | "blocked";
+  status: "healthy" | "repaired" | "repair_available" | "inconclusive" | "blocked";
   applied: boolean;
   accounts: readonly Readonly<{
     slot: number;
@@ -395,18 +403,25 @@ const describeRejection = (item: Readonly<{ source: CodexAuthCandidateSource; ou
   return `${item.source}=${item.outcome}${status}`;
 };
 
-const accountAction = (
+export const accountAction = (
   selection: ReturnType<typeof planCodexAuthRepair>["selections"][number] | undefined,
   blocked: ReturnType<typeof planCodexAuthRepair>["unrepairable"][number] | undefined,
+  inconclusive: ReturnType<typeof planCodexAuthRepair>["inconclusive"][number] | undefined,
   applied: boolean
 ): string => {
   if (selection) return applied ? "replaced" : "would replace";
   if (blocked) return `blocked:${blocked.reason}`;
+  if (inconclusive) return "inconclusive";
   return "kept";
 };
 
-const reportStatus = (plan: ReturnType<typeof planCodexAuthRepair>, applied: boolean): Report["status"] => {
+/**
+ * An inconclusive probe is its own outcome: the run cannot certify the pool, so
+ * it never reports health, and it never claims a repair was needed either.
+ */
+export const reportStatus = (plan: ReturnType<typeof planCodexAuthRepair>, applied: boolean): Report["status"] => {
   if (plan.unrepairable.length > 0) return "blocked";
+  if (plan.inconclusive.length > 0) return "inconclusive";
   if (plan.selections.length === 0) return "healthy";
   return applied ? "repaired" : "repair_available";
 };
@@ -419,6 +434,7 @@ const buildAccountRow = async (
   const selection = plan.selections.find((candidate) => candidate.slot === entry.slot);
   const blocked = plan.unrepairable.find((candidate) => candidate.slot === entry.slot);
   const healthy = plan.healthy.find((candidate) => candidate.slot === entry.slot);
+  const inconclusive = plan.inconclusive.find((candidate) => candidate.slot === entry.slot);
   const rejected = (selection?.rejected ?? blocked?.rejected ?? []).map(describeRejection);
   return {
     slot: entry.slot,
@@ -426,11 +442,11 @@ const buildAccountRow = async (
     access_sha: await sha256Prefix(entry.account.access_token),
     access_exp: formatTime(getJwtExpMs(entry.account.access_token)),
     probe: describeProbe(entry.probe),
-    action: accountAction(selection, blocked, applied),
+    action: accountAction(selection, blocked, inconclusive, applied),
     adopted_from: selection?.candidate.source ?? null,
     adopted_access_sha: selection ? await sha256Prefix(selection.candidate.access_token) : null,
     adopted_access_exp: selection ? formatTime(getJwtExpMs(selection.candidate.access_token)) : null,
-    refresh_diverged: healthy?.refresh_diverged ?? null,
+    refresh_diverged: healthy?.refresh_diverged ?? inconclusive?.refresh_diverged ?? null,
     rejected,
   };
 };
@@ -458,6 +474,9 @@ const collectNotes = (plan: ReturnType<typeof planCodexAuthRepair>, candidateRow
     }
   }
   if (plan.unrepairable.length > 0) notes.push("at least one account has no credential that authenticates; sign in on a host and re-run");
+  if (plan.inconclusive.length > 0) {
+    notes.push(`${plan.inconclusive.length} account(s) could not be probed (a timeout or a status other than 200/429/401); they were left unchanged`);
+  }
   return notes;
 };
 
@@ -480,16 +499,20 @@ const buildReport = async (
   };
 };
 
+/**
+ * One banner per status, as an exhaustive map instead of a branch chain: the
+ * report path stays flat and a new status cannot be added without its message.
+ */
+const STATUS_BANNERS: Readonly<Record<Report["status"], string>> = {
+  healthy: "codex-auth-repair: every account authenticates; nothing to change",
+  repaired: "codex-auth-repair: replaced credential(s) from another host",
+  repair_available: "codex-auth-repair: a replacement is available; re-run with --apply to adopt it",
+  inconclusive: "codex-auth-repair: INCONCLUSIVE — at least one account could not be probed; no credential was replaced for it",
+  blocked: "codex-auth-repair: BLOCKED — an account has no credential that authenticates",
+};
+
 const printReport = (report: Report): void => {
-  if (report.status === "healthy") {
-    console.log("codex-auth-repair: every account authenticates; nothing to change");
-  } else if (report.status === "repaired") {
-    console.log("codex-auth-repair: replaced credential(s) from another host");
-  } else if (report.status === "repair_available") {
-    console.log("codex-auth-repair: a replacement is available; re-run with --apply to adopt it");
-  } else {
-    console.log("codex-auth-repair: BLOCKED — an account has no credential that authenticates");
-  }
+  console.log(STATUS_BANNERS[report.status]);
   for (const row of report.accounts) {
     console.log(
       `  slot ${row.slot} ${row.account_id} probe=${row.probe} access=${row.access_sha} exp=${row.access_exp} ${row.action}` +
@@ -517,6 +540,17 @@ const probeLocalPool = async (
       probe: await probeAccessToken(account.access_token, account.account_id, baseUrl, fetch),
     }))
   );
+
+/**
+ * True only when a local slot's own evidence justifies reading credential
+ * sources. An inconclusive probe is not evidence, so it never buys SSH reads or
+ * upstream candidate probes by itself; `--diff` remains the explicit way to ask
+ * for a divergence report anyway.
+ */
+export const anyCodexAuthSlotNeedsRepair = (
+  localProbes: readonly Readonly<{ account: CodexAuthState; probe: CodexAuthProbeResult }>[],
+  nowMs: number
+): boolean => localProbes.some((entry) => needsCodexAuthReplacement(entry.probe, getJwtExpMs(entry.account.access_token), nowMs));
 
 const assessCandidates = async (candidates: readonly CodexAuthCandidate[], baseUrl: string): Promise<AssessedCodexAuthCandidate[]> => {
   const assessed: AssessedCodexAuthCandidate[] = [];
@@ -587,10 +621,11 @@ const main = async (): Promise<number> => {
 
   const nowMs = Date.now();
   const localProbes = await probeLocalPool(local.pool, flags.codexBaseUrl);
-  const anyBroken = localProbes.some((entry) => entry.probe.outcome !== "valid");
+  const anyNeedsRepair = anyCodexAuthSlotNeedsRepair(localProbes, nowMs);
   // SSH and every candidate probe are paid only when a slot needs repair, or
-  // when the caller explicitly asked for a divergence report.
-  const readSources = anyBroken || flags.diff;
+  // when the caller explicitly asked for a divergence report. An inconclusive
+  // probe is not a repair need, so it never triggers them on its own.
+  const readSources = anyNeedsRepair || flags.diff;
   const candidates = readSources ? await collectCandidates(flags, warn) : [];
   const assessed = readSources ? await assessCandidates(candidates, flags.codexBaseUrl) : [];
   const accounts = buildRepairAccounts(localProbes, candidates);
@@ -612,7 +647,7 @@ const main = async (): Promise<number> => {
   else printReport(merged);
 
   if (merged.status === "blocked") return 2;
-  if (merged.status === "repair_available") return 1;
+  if (merged.status === "inconclusive" || merged.status === "repair_available") return 1;
   return 0;
 };
 

@@ -11,7 +11,9 @@ import type { CodexAuthPoolState, CodexAuthState } from "../types.ts";
  * re-uploads a credential. This module plans a narrow repair: keep every
  * account that still authenticates, and for an account that does not, adopt a
  * credential read from another host only after that credential has itself been
- * proven to authenticate.
+ * proven to authenticate. A probe that cannot decide an account does not mark
+ * it broken: only an explicit rejection or a verified access-token expiry
+ * establishes that a replacement is warranted.
  *
  * Validation is deliberately read-only. It is an account-bound `GET` against
  * the Codex usage endpoint, so it never runs inference and never reaches the
@@ -79,6 +81,17 @@ export type CodexAuthRepairPlan = Readonly<{
   }>[];
   /** Accounts whose own credential still authenticates. */
   healthy: readonly Readonly<{ slot: number; account_id: string; refresh_diverged: boolean | null }>[];
+  /**
+   * Accounts kept as they are because their own probe could not decide them
+   * and no verified expiry exists: an inconclusive probe is not evidence that
+   * the credential is unusable, so nothing may replace it.
+   */
+  inconclusive: readonly Readonly<{
+    slot: number;
+    account_id: string;
+    probe: Readonly<{ outcome: "inconclusive"; status: number | null }>;
+    refresh_diverged: boolean | null;
+  }>[];
 }>;
 
 const probeStatus = (probe: CodexAuthProbeResult): number | null => probe.status;
@@ -93,6 +106,17 @@ export const isCodexAuthCandidateUsable = (assessed: AssessedCodexAuthCandidate,
   if (assessed.probe.outcome !== "valid") return false;
   return assessed.access_exp_ms === null || assessed.access_exp_ms > nowMs;
 };
+
+/**
+ * True only when the evidence establishes that the local credential is
+ * unusable: the upstream rejected it outright, or the access token's own
+ * expiry has already passed. A probe that answered neither way (a timeout, a
+ * 403, a 5xx) decides nothing, so it never justifies a replacement by itself;
+ * the same predicate gates the CLI's paid candidate reads so an inconclusive
+ * slot cannot trigger them.
+ */
+export const needsCodexAuthReplacement = (probe: CodexAuthProbeResult, accessExpMs: number | null, nowMs: number): boolean =>
+  probe.outcome === "invalid" || (accessExpMs !== null && accessExpMs <= nowMs);
 
 /**
  * Orders usable candidates so the caller can take the first one: most
@@ -130,8 +154,9 @@ export const rankCodexAuthCandidates = (candidates: readonly AssessedCodexAuthCa
 /**
  * Decides, per account, whether to keep the local credential, adopt another
  * host's, or report that the account cannot be repaired. Accounts that still
- * authenticate are never rewritten, so a healthy slot cannot be disturbed by a
- * repair run.
+ * authenticate are never rewritten, and a slot whose probe was inconclusive is
+ * preserved rather than repaired: a healthy slot cannot be disturbed by a
+ * repair run, and neither can a slot whose health is simply unknown.
  */
 export const planCodexAuthRepair = (
   input: Readonly<{
@@ -143,12 +168,21 @@ export const planCodexAuthRepair = (
   const selections: CodexAuthRepairSelection[] = [];
   const unrepairable: CodexAuthRepairPlan["unrepairable"][number][] = [];
   const healthy: CodexAuthRepairPlan["healthy"][number][] = [];
+  const inconclusive: CodexAuthRepairPlan["inconclusive"][number][] = [];
 
   for (const entry of input.accounts) {
     const localExpMs = getJwtExpMs(entry.account.access_token);
-    const localUsable = entry.probe.outcome === "valid" && (localExpMs === null || localExpMs > input.nowMs);
-    if (localUsable) {
-      healthy.push({ slot: entry.slot, account_id: entry.account.account_id, refresh_diverged: entry.refresh_diverged });
+    if (!needsCodexAuthReplacement(entry.probe, localExpMs, input.nowMs)) {
+      if (entry.probe.outcome === "inconclusive") {
+        inconclusive.push({
+          slot: entry.slot,
+          account_id: entry.account.account_id,
+          probe: entry.probe,
+          refresh_diverged: entry.refresh_diverged,
+        });
+      } else {
+        healthy.push({ slot: entry.slot, account_id: entry.account.account_id, refresh_diverged: entry.refresh_diverged });
+      }
       continue;
     }
 
@@ -182,7 +216,7 @@ export const planCodexAuthRepair = (
     });
   }
 
-  return { selections, unrepairable, healthy };
+  return { selections, unrepairable, healthy, inconclusive };
 };
 
 /**
