@@ -1,0 +1,20 @@
+0 verbose cli /usr/local/bin/node /usr/local/bin/npm
+1 info using npm@10.9.9
+2 info using node@v22.23.3
+3 silly config load:file:/usr/local/lib/node_modules/npm/npmrc
+4 silly config load:file:/home/runner/work/sentinel/sentinel/runtime/.sentinel-actions-state/checkouts/044694b1ee35b390360b52f63b6720f5c05736a548b11e3e2c7530141ddf5a11/tools/lint/.npmrc
+5 silly config load:file:/home/runner/work/sentinel/sentinel/runtime/.sentinel-actions-state/checkouts/044694b1ee35b390360b52f63b6720f5c05736a548b11e3e2c7530141ddf5a11/.npmrc
+6 silly config load:file:/usr/local/etc/npmrc
+7 verbose title npm install
+8 verbose argv "install" "--no-audit" "--no-fund"
+9 verbose logfile logs-max:10 dir:/home/runner/work/sentinel/sentinel/runtime/.sentinel-actions-state/checkouts/044694b1ee35b390360b52f63b6720f5c05736a548b11e3e2c7530141ddf5a11/.npm/_logs/2026-10-02T10_54_49_178Z-
+10 verbose logfile /home/runner/work/sentinel/sentinel/runtime/.sentinel-actions-state/checkouts/044694b1ee35b390360b52f63b6720f5c05736a548b11e3e2c7530141ddf5a11/.npm/_logs/2026-10-02T10_54_49_178Z-debug-0.log
+11 silly logfile done cleaning log files
+12 http fetch GET https://registry.npmjs.org/npm attempt 1 failed with EAI_AGAIN
+13 silly packumentCache heap:4345298944 maxSize:1086324736 maxEntrySize:543162368
+14 silly idealTree buildDeps
+15 silly fetch manifest @eslint/js@^10.0.1
+16 silly packumentCache full:https://registry.npmjs.org/@eslint%2fjs cache-miss
+17 http fetch GET https://registry.npmjs.org/@eslint%2fjs attempt 1 failed with EAI_AGAIN
+18 http fetch GET https://registry.npmjs.org/npm attempt 2 failed with EAI_AGAIN
+19 http fetch GET https://registry.npmjs.org/@eslint%2fjs attempt 2 failed with EAI_AGAIN
