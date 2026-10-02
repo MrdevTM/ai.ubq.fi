@@ -28,6 +28,7 @@ import {
   routingStateChangedByNormalization,
 } from "./routing-evaluation.ts";
 import type { CodexRoutingAccountEvaluation, CodexRoutingAccumulation, CodexRoutingAccumulator, CodexRoutingSlotIdentity } from "./routing-evaluation.ts";
+import { codexModelUnavailableAccounts } from "../models/codex-models-availability.ts";
 
 type SerialRoutingEvaluations = Readonly<{
   accumulated: CodexRoutingAccumulation;
@@ -57,12 +58,14 @@ const evaluateSerialRoutingAccounts = async (
     retryAt: null,
     hasQuotaBlock: false,
     hasUpstreamTimeoutBlock: false,
+    modelUnavailable: null,
   };
   const byAccountId = new Map<string, CodexRoutingAccountEvaluation>();
+  const unavailableAccounts = codexModelUnavailableAccounts(model);
   for (const auth of pool.accounts) {
     const mapped = byId.get(auth.account_id);
     if (!mapped) continue;
-    const evaluated = evaluateCodexRoutingAccount(state, auth, mapped, model, observationsByAccount, now);
+    const evaluated = evaluateCodexRoutingAccount(state, auth, mapped, model, observationsByAccount, now, unavailableAccounts);
     byAccountId.set(auth.account_id, evaluated);
     foldCodexRoutingEvaluation(accumulator, evaluated);
   }

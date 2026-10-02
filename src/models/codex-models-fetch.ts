@@ -5,7 +5,7 @@ import { getKv } from "../kv.ts";
 import { buildRuntimeConfig, cacheRuntimeConfig, loadRuntimeConfig, normalizeRuntimeConfig, RUNTIME_CONFIG_V2_KEY } from "../runtime-config.ts";
 import { getString, isRecord } from "../utils.ts";
 import type { CodexAuthState, ResponseInputItem } from "../types.ts";
-import type { CodexAuthAccountEntry } from "../codex/auth.ts";
+import type { CodexAuthAccountEntry, CodexAuthPoolEntry } from "../codex/auth.ts";
 import { CODEX_CLIENT_VERSION, CODEX_MODELS_KV_KEY, CodexError, getAuthPoolEntry } from "../codex/auth.ts";
 import { awaitWithoutCancellingSharedWork, getCurrentAccountEntry, getValidAuth, refreshAuthCoordinated, refreshAuthStateless } from "../codex/auth-refresh.ts";
 import {
@@ -16,6 +16,7 @@ import {
   recordCodexResponseHealth,
   recordCodexThrownHealth,
 } from "../codex/dispatch.ts";
+import { recordCodexAccountCatalogs } from "./codex-models-availability.ts";
 
 const fetchCodexModelsForAccount = async (
   accountEntry: CodexAuthAccountEntry,
@@ -158,19 +159,200 @@ export const fetchCodexModels = async (
   }> = {}
 ): Promise<Response> => {
   const poolEntry = await getAuthPoolEntry();
-  const accountEntries = randomizedAuthEntries(poolEntry);
   const requestedVersion = options.clientVersion?.trim() ?? null;
   const clientVersion = requestedVersion && parseCodexClientVersion(requestedVersion) ? requestedVersion : CODEX_CLIENT_VERSION;
   const urls = codexModelsBaseUrls(clientVersion);
-  let lastResponse: Response | null = null;
 
-  for (const url of urls) {
-    const outcome = await fetchCodexModelsFromAccounts(url, accountEntries, clientVersion, urls.length > 1, options);
-    if (outcome.kind === "response") return outcome.response;
-    lastResponse = outcome.fallback ?? lastResponse;
+  // One configured account keeps the historical single-account contract exactly,
+  // conditional requests and 304 revalidation included. A pool asks every
+  // account and unions their answers, because one account's catalog cannot
+  // express what its siblings are entitled to serve.
+  if (poolEntry.pool.accounts.length <= 1) {
+    const accountEntries = randomizedAuthEntries(poolEntry);
+    let lastResponse: Response | null = null;
+
+    for (const url of urls) {
+      const outcome = await fetchCodexModelsFromAccounts(url, accountEntries, clientVersion, urls.length > 1, options);
+      if (outcome.kind === "response") return outcome.response;
+      lastResponse = outcome.fallback ?? lastResponse;
+    }
+
+    return lastResponse ?? new Response("Codex upstream models endpoint not found.", { status: 404 });
   }
 
-  return lastResponse ?? new Response("Codex upstream models endpoint not found.", { status: 404 });
+  return await fetchCodexModelsUnion(poolEntry, urls, clientVersion, options);
+};
+
+/** A usable JSON catalog one account advertised, with its rows and slugs. */
+type CodexAccountCatalogContribution = Readonly<{
+  accountId: string;
+  body: Record<string, unknown>;
+  models: readonly unknown[];
+  slugs: readonly string[];
+}>;
+
+const codexModelRowSlug = (value: unknown): string | null => {
+  if (!isRecord(value)) return null;
+  const slug = getString(value.slug) ?? getString(value.id) ?? getString(value.model) ?? getString(value.name);
+  return slug?.trim() ? slug.trim() : null;
+};
+
+const contributionFromBody = (accountId: string, body: Record<string, unknown>): CodexAccountCatalogContribution => {
+  const models = Array.isArray(body.models) ? body.models : [];
+  const slugs: string[] = [];
+  const seen = new Set<string>();
+  for (const model of models) {
+    const slug = codexModelRowSlug(model);
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    slugs.push(slug);
+  }
+  return { accountId, body, models, slugs };
+};
+
+/**
+ * Read one successful models body as JSON. A body without a `models` array is
+ * not a catalog, so it contributes nothing to the union instead of poisoning it.
+ */
+const readCodexModelsJsonBody = async (res: Response): Promise<Record<string, unknown> | null> => {
+  const text = await res.text().catch(() => "");
+  try {
+    await res.body?.cancel();
+  } catch {
+    // The body is already buffered; cancellation is best effort.
+  }
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return isRecord(parsed) && Array.isArray(parsed.models) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+type CodexAccountCatalogAttempt = Readonly<{ catalog: CodexAccountCatalogContribution | null; fallback: Response | null }>;
+
+/**
+ * Walk one account's candidate URLs with the existing 401-refresh, 429 and
+ * 404/400 fallback semantics, but never with `If-None-Match`: a 304 from one
+ * account cannot express another account's rows.
+ */
+const fetchCodexModelsCatalogForAccount = async (
+  accountEntry: CodexAuthAccountEntry,
+  urls: readonly string[],
+  clientVersion: string,
+  options: Readonly<{ signal?: AbortSignal; onProviderTransportFailure?: () => void }>
+): Promise<CodexAccountCatalogAttempt> => {
+  let fallback: Response | null = null;
+  for (const url of urls) {
+    let res: Response;
+    try {
+      res = await fetchCodexModelsForAccount(accountEntry, url, clientVersion, null, options.signal);
+    } catch (error) {
+      reportCodexModelsTransportFailure(error, options.onProviderTransportFailure);
+      await recordCodexThrownHealth(accountEntry.auth.account_id, error);
+      throw error;
+    }
+    if (res.ok) {
+      const body = await readCodexModelsJsonBody(res);
+      if (body) {
+        if (fallback !== null) cancelResponseBody(fallback);
+        return { catalog: contributionFromBody(accountEntry.auth.account_id, body), fallback: null };
+      }
+      fallback = res;
+      continue;
+    }
+    fallback = res;
+    if (codexModelsUrlNotFound(res, urls.length > 1)) continue;
+    break;
+  }
+  return { catalog: null, fallback };
+};
+
+/**
+ * Union every pool account's catalog in pool order. Rows deduplicate by slug and
+ * the first-in-pool-order row is kept verbatim; the first contributing body
+ * supplies the other top-level keys. When no account returns a usable catalog,
+ * the last upstream failure is returned unchanged.
+ */
+type CodexModelsUnionCollection = Readonly<{
+  contributions: CodexAccountCatalogContribution[];
+  fallback: Response | null;
+  transportError: unknown;
+}>;
+
+/** Ask every pool account in pool order, keeping the last failure for the all-failed answer. */
+const collectCodexModelsUnion = async (
+  poolEntry: CodexAuthPoolEntry,
+  urls: readonly string[],
+  clientVersion: string,
+  options: Readonly<{ signal?: AbortSignal; onProviderTransportFailure?: () => void }>
+): Promise<CodexModelsUnionCollection> => {
+  const contributions: CodexAccountCatalogContribution[] = [];
+  let fallback: Response | null = null;
+  let transportError: unknown = null;
+  for (const auth of poolEntry.pool.accounts) {
+    let attempt: CodexAccountCatalogAttempt;
+    try {
+      attempt = await fetchCodexModelsCatalogForAccount({ ...poolEntry, auth }, urls, clientVersion, options);
+    } catch (error) {
+      transportError = error;
+      continue;
+    }
+    if (attempt.catalog) {
+      contributions.push(attempt.catalog);
+      continue;
+    }
+    if (attempt.fallback !== null) {
+      if (fallback !== null) cancelResponseBody(fallback);
+      fallback = attempt.fallback;
+    }
+  }
+  return { contributions, fallback, transportError };
+};
+
+/** The unchanged upstream failure when no account produced a usable catalog. */
+const codexModelsUnionFailureResponse = (fallback: Response | null, transportError: unknown): Response => {
+  if (fallback !== null) return fallback;
+  if (transportError === null) return new Response("Codex upstream models endpoint not found.", { status: 404 });
+  throw transportError instanceof Error ? transportError : new Error("Codex models fetch failed with a non-Error value.", { cause: transportError });
+};
+
+/** Merge the contributing rows by slug, keeping the first-in-pool-order row verbatim. */
+const buildCodexModelsUnionResponse = (contributions: readonly CodexAccountCatalogContribution[]): Response => {
+  const models: unknown[] = [];
+  const seen = new Set<string>();
+  for (const contribution of contributions) {
+    for (const model of contribution.models) {
+      const slug = codexModelRowSlug(model);
+      if (slug !== null) {
+        if (seen.has(slug)) continue;
+        seen.add(slug);
+      }
+      models.push(model);
+    }
+  }
+  const body = { ...contributions[0].body, models };
+  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+};
+
+const fetchCodexModelsUnion = async (
+  poolEntry: CodexAuthPoolEntry,
+  urls: readonly string[],
+  clientVersion: string,
+  options: Readonly<{ signal?: AbortSignal; onProviderTransportFailure?: () => void }>
+): Promise<Response> => {
+  const collected = await collectCodexModelsUnion(poolEntry, urls, clientVersion, options);
+  if (!collected.contributions.length) return codexModelsUnionFailureResponse(collected.fallback, collected.transportError);
+
+  await recordCodexAccountCatalogs(
+    collected.contributions.map((contribution) => ({
+      accountId: contribution.accountId,
+      clientVersion,
+      slugs: contribution.slugs,
+    }))
+  );
+  return buildCodexModelsUnionResponse(collected.contributions);
 };
 
 export const loadCodexModelsSnapshot = async (): Promise<CodexModelsSnapshot | null> => {

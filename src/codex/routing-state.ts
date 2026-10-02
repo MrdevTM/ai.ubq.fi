@@ -62,7 +62,7 @@ export const setRoutingStateCache = (state: CodexAccountRoutingState | null, ver
 
 export const getCachedRoutingState = (): CodexAccountRoutingState | null => routingStateCache.state;
 
-export type CodexActiveAccountTransitionReason = "quota_exhausted" | "credential_invalid" | "account_removed_or_replaced";
+export type CodexActiveAccountTransitionReason = "quota_exhausted" | "credential_invalid" | "account_removed_or_replaced" | "model_unavailable";
 
 /**
  * Durable active-account admission fence. Account identifiers stay hashed and
@@ -266,6 +266,18 @@ export type RouteSelection =
       skippedSlots: readonly number[];
       retryAtMs: number | null;
       blockedAccounts: readonly [];
+    }>
+  | Readonly<{
+      /**
+       * No configured account can serve the named model. This is neither a
+       * quota nor a credential outcome: no fence was written, so the request is
+       * answered as an unavailable model rather than a retryable failure.
+       */
+      kind: "model_unavailable";
+      model: string;
+      /** Upstream's own detail text when a live rejection was observed. */
+      detail: string | null;
+      skippedSlots: readonly number[];
     }>
   | Readonly<{ kind: "credentials_invalid"; skippedSlots: readonly number[] }>
   | Readonly<{ kind: "routing_unavailable" }>;
@@ -561,7 +573,7 @@ export const isVersionstamp = (value: unknown): value is string => typeof value 
 
 const parseActiveTransitionReason = (value: unknown): CodexActiveAccountTransitionReason | null | undefined => {
   if (value === null) return null;
-  if (value === "quota_exhausted" || value === "credential_invalid" || value === "account_removed_or_replaced") return value;
+  if (value === "quota_exhausted" || value === "credential_invalid" || value === "account_removed_or_replaced" || value === "model_unavailable") return value;
   return undefined;
 };
 

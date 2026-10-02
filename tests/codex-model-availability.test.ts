@@ -1,0 +1,599 @@
+// Per-account Codex model availability: the per-account catalog union, the
+// learned account+model rejections, and eligibility-aware routing. The suite
+// uses a disposable in-memory KV and controlled fetch stubs only.
+
+import assert from "node:assert/strict";
+
+const keyToString = (key: Deno.KvKey): string => JSON.stringify(key);
+const kvStore = new Map<string, { value: unknown; versionstamp: string }>();
+let versionCounter = 0;
+const nextVersion = (): string => String(++versionCounter).padStart(20, "0");
+const entryFor = (key: Deno.KvKey): Deno.KvEntryMaybe<unknown> => {
+  const stored = kvStore.get(keyToString(key));
+  return stored ? { key, value: stored.value, versionstamp: stored.versionstamp } : { key, value: null, versionstamp: null };
+};
+const writeKv = (key: Deno.KvKey, value: unknown): string => {
+  const versionstamp = nextVersion();
+  kvStore.set(keyToString(key), { value, versionstamp });
+  return versionstamp;
+};
+const readKv = (key: Deno.KvKey): unknown => kvStore.get(keyToString(key))?.value;
+
+const kvStub = {
+  get: (key: Deno.KvKey) => Promise.resolve(entryFor(key)),
+  getMany: (keys: Deno.KvKey[]) => Promise.resolve(keys.map((key) => entryFor(key))),
+  set: (key: Deno.KvKey, value: unknown) => {
+    writeKv(key, value);
+    return Promise.resolve({ ok: true } as const);
+  },
+  delete: (key: Deno.KvKey) => {
+    kvStore.delete(keyToString(key));
+    return Promise.resolve();
+  },
+  list: async function* (selector: Deno.KvListSelector) {
+    const prefix = "prefix" in selector ? selector.prefix : [];
+    await Promise.resolve();
+    for (const [encodedKey, stored] of kvStore) {
+      const key = JSON.parse(encodedKey) as Deno.KvKey;
+      if (prefix.every((part, index) => key[index] === part)) yield { key, value: stored.value, versionstamp: stored.versionstamp };
+    }
+  },
+  atomic: () => {
+    const checks: Deno.KvEntryMaybe<unknown>[] = [];
+    const ops: { key: Deno.KvKey; value?: unknown; remove?: boolean }[] = [];
+    const chain = {
+      check: (entry: Deno.KvEntryMaybe<unknown>) => {
+        checks.push(entry);
+        return chain;
+      },
+      set: (key: Deno.KvKey, value: unknown) => {
+        ops.push({ key, value });
+        return chain;
+      },
+      delete: (key: Deno.KvKey) => {
+        ops.push({ key, remove: true });
+        return chain;
+      },
+      commit: () => {
+        const valid = checks.every((expected) => entryFor(expected.key).versionstamp === expected.versionstamp);
+        if (!valid) return Promise.resolve({ ok: false } as const);
+        for (const op of ops) {
+          if (op.remove) kvStore.delete(keyToString(op.key));
+          else writeKv(op.key, op.value);
+        }
+        return Promise.resolve({ ok: true } as const);
+      },
+    };
+    return chain;
+  },
+  close: () => {},
+} as unknown as Deno.Kv;
+
+const { setKvForTest } = await import("../src/kv.ts");
+const { CODEX_AUTH_POOL_KV_KEY, resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
+const { setCodexResponseAccountTelemetry, setCodexResponseActiveTelemetry } = await import("../src/codex/auth.ts");
+const { fetchCodexModels } = await import("../src/models/codex-models-fetch.ts");
+const { CODEX_ACCOUNT_ROUTING_KV_KEY, CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, parseCodexActiveAccountSelection } = await import("../src/codex/routing-state.ts");
+const { routingAccountIdentity } = await import("../src/codex/capacity-routing.ts");
+const { selectCodexRoutingAccountsStrong } = await import("../src/codex/account-routing.ts");
+const {
+  codexModelUnsupportedFromResponse,
+  initialCodexSelectionResponse,
+  learnCodexModelUnavailable,
+  parseCodexModelUnsupportedDetail,
+  runCodexSerialAdmissionLoop,
+} = await import("../src/codex/dispatch.ts");
+const {
+  CODEX_ACCOUNT_MODELS_CACHE_TTL_MS,
+  CODEX_ACCOUNT_MODELS_KV_KEY,
+  CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_AGE_MS,
+  CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_COUNT,
+  awaitCodexAccountModelsRefreshForTest,
+  codexModelUnavailableAccounts,
+  emptyCodexAccountModelsStore,
+  getCodexAccountModelsCacheForTest,
+  mergeCodexAccountCatalogs,
+  parseCodexAccountModelsStore,
+  recordCodexAccountCatalogs,
+  recordCodexModelUnsupported,
+  resetCodexAccountModelsCacheForTest,
+  setCodexAccountModelsStoreForTest,
+  withCodexModelUnsupported,
+} = await import("../src/models/codex-models-availability.ts");
+
+type AuthState = Readonly<{ account_id: string; access_token: string; refresh_token: string; updated_at_ms: number }>;
+
+const codexAccount = (accountId: string): AuthState => ({
+  account_id: accountId,
+  access_token: `${accountId}-access-token`,
+  refresh_token: `${accountId}-refresh-token`,
+  updated_at_ms: Date.now(),
+});
+
+const seedPool = (accounts: readonly AuthState[]): string => {
+  const versionstamp = writeKv([...CODEX_AUTH_POOL_KV_KEY], { accounts, updated_at_ms: 1 });
+  resetCodexAuthCacheForTest();
+  return versionstamp;
+};
+
+const seedActiveRow = async (
+  auth: AuthState,
+  poolVersionstamp: string,
+  slot: number,
+  generation: number,
+  transitionReason: string | null = null
+): Promise<void> => {
+  const identity = await routingAccountIdentity(auth);
+  writeKv([...CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY], {
+    v: 1,
+    account_id_hash: identity.accountIdHash,
+    credential_version: identity.credentialVersion,
+    pool_versionstamp: poolVersionstamp,
+    slot,
+    routing_generation: 0,
+    generation,
+    transition_reason: transitionReason,
+    updated_at_ms: 1,
+  });
+};
+
+/** Drop the durable availability evidence so a case starts from a known empty store. */
+const clearAvailabilityKv = (): void => {
+  kvStore.delete(keyToString(CODEX_ACCOUNT_MODELS_KV_KEY));
+  resetCodexAccountModelsCacheForTest();
+};
+
+const MODEL = "gpt-daybreak-blue-latest";
+const UNSUPPORTED_DETAIL = `The '${MODEL}' model is not supported when using Codex with a ChatGPT account.`;
+
+const jsonResponse = (payload: unknown, status = 200): Response =>
+  new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
+
+/** A fetch stub that answers each pool account with its own catalog. */
+const catalogFetch =
+  (byAccount: Readonly<Record<string, unknown>>, seen?: { ifNoneMatch: string | null; calls: number }): typeof fetch =>
+  (_input, init): Promise<Response> => {
+    if (seen) {
+      seen.calls += 1;
+      seen.ifNoneMatch = new Headers(init?.headers).get("If-None-Match");
+    }
+    const accountId = new Headers(init?.headers).get("ChatGPT-Account-ID") ?? "";
+    const body = byAccount[accountId];
+    if (body instanceof Response) return Promise.resolve(body);
+    return Promise.resolve(jsonResponse(body ?? { models: [] }));
+  };
+
+setKvForTest(kvStub);
+clearAvailabilityKv();
+resetCodexAuthCacheForTest();
+
+// ── B1: per-account catalog union ────────────────────────────────────────────
+
+Deno.test("codex models: the pool catalog unions every account in pool order and records each catalog", async () => {
+  seedPool([codexAccount("union-a"), codexAccount("union-b")]);
+  clearAvailabilityKv();
+  const daybreakRow = { slug: MODEL, context_window: 128_000 };
+  const seen: { ifNoneMatch: string | null; calls: number } = { ifNoneMatch: "unset", calls: 0 };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = catalogFetch(
+    {
+      "union-a": { models: [daybreakRow, { slug: "shared-model" }], has_more: true },
+      "union-b": { models: [{ slug: "shared-model" }, { slug: "sibling-only" }], has_more: false },
+    },
+    seen
+  );
+  try {
+    const response = await fetchCodexModels({ clientVersion: "0.160.0", ifNoneMatch: '"cached"' });
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as { models: Record<string, unknown>[]; has_more: boolean };
+    assert.deepEqual(
+      payload.models.map((model) => model.slug),
+      ["gpt-daybreak-blue-latest", "shared-model", "sibling-only"]
+    );
+    assert.deepEqual(payload.models[0], daybreakRow, "the first-in-pool-order row is kept verbatim");
+    assert.equal(payload.has_more, true, "other top-level keys come from the first contributing body");
+    assert.equal(seen.ifNoneMatch, null, "multi-account mode must not send If-None-Match");
+    assert.equal(seen.calls, 2);
+    const store = getCodexAccountModelsCacheForTest().store;
+    assert.ok(store, "the union records its per-account catalogs");
+    assert.deepEqual(store.accounts["union-a"].slugs, [MODEL, "shared-model"]);
+    assert.deepEqual(store.accounts["union-b"].slugs, ["shared-model", "sibling-only"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("codex models: one configured account keeps the upstream response and its conditional request", async () => {
+  seedPool([codexAccount("single-account")]);
+  clearAvailabilityKv();
+  const seen: { ifNoneMatch: string | null; calls: number } = { ifNoneMatch: "unset", calls: 0 };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (_input, init): Promise<Response> => {
+    seen.calls += 1;
+    seen.ifNoneMatch = new Headers(init?.headers).get("If-None-Match");
+    return Promise.resolve(new Response(null, { status: 304, headers: { ETag: '"catalog-1"' } }));
+  };
+  try {
+    const response = await fetchCodexModels({ clientVersion: "0.160.0", ifNoneMatch: '"catalog-1"' });
+    assert.equal(response.status, 304);
+    assert.equal(response.headers.get("ETag"), '"catalog-1"');
+    assert.equal(seen.ifNoneMatch, '"catalog-1"');
+    assert.equal(seen.calls, 1);
+    assert.equal(getCodexAccountModelsCacheForTest().store, null, "a 304 records no catalog");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("codex models: a failing account keeps the sibling's rows, and every account failing returns the fallback", async () => {
+  seedPool([codexAccount("union-a"), codexAccount("union-b")]);
+  clearAvailabilityKv();
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = catalogFetch({
+      "union-a": new Response("a-quota", { status: 429, headers: { "Content-Type": "application/json" } }),
+      "union-b": { models: [{ slug: MODEL }] },
+    });
+    const mixed = await fetchCodexModels({ clientVersion: "0.160.0" });
+    assert.equal(mixed.status, 200);
+    const mixedPayload = (await mixed.json()) as { models: { slug: string }[] };
+    assert.deepEqual(
+      mixedPayload.models.map((model) => model.slug),
+      [MODEL],
+      "the surviving account's rows are served"
+    );
+
+    globalThis.fetch = catalogFetch({
+      "union-a": new Response("a-quota", { status: 429, headers: { "Content-Type": "application/json" } }),
+      "union-b": new Response("b-quota", { status: 429, headers: { "Content-Type": "application/json" } }),
+    });
+    const failed = await fetchCodexModels({ clientVersion: "0.160.0" });
+    assert.equal(failed.status, 429, "all-account failure keeps the existing fallback status");
+    assert.equal(await failed.text(), "b-quota");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("codex models: a malformed account body does not poison the union", async () => {
+  seedPool([codexAccount("union-a"), codexAccount("union-b")]);
+  clearAvailabilityKv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = catalogFetch({
+    "union-a": new Response("not json", { status: 200, headers: { "Content-Type": "application/json" } }),
+    "union-b": { models: [{ slug: MODEL }, { slug: "shared-model" }] },
+  });
+  try {
+    const response = await fetchCodexModels({ clientVersion: "0.160.0" });
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as { models: { slug: string }[] };
+    assert.deepEqual(
+      payload.models.map((model) => model.slug),
+      [MODEL, "shared-model"]
+    );
+    const store = getCodexAccountModelsCacheForTest().store;
+    assert.ok(store, "the surviving account is recorded");
+    assert.equal(store.accounts["union-a"], undefined, "a malformed body records nothing");
+    assert.deepEqual(store.accounts["union-b"].slugs, [MODEL, "shared-model"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ── B2: per-account availability store ───────────────────────────────────────
+
+Deno.test("codex account models: the durable round-trip keeps only non-secret catalog fields", async () => {
+  clearAvailabilityKv();
+  await recordCodexAccountCatalogs([{ accountId: "store-a", clientVersion: "0.160.0", slugs: [MODEL, MODEL, "shared-model"] }]);
+  const stored = readKv(CODEX_ACCOUNT_MODELS_KV_KEY) as {
+    accounts: Record<string, { client_version: string; slugs: string[]; updated_at_ms: number }>;
+    unsupported: Record<string, unknown>;
+  };
+  assert.deepEqual(stored.accounts["store-a"].slugs, [MODEL, "shared-model"]);
+  assert.equal(stored.accounts["store-a"].client_version, "0.160.0");
+  assert.equal(typeof stored.accounts["store-a"].updated_at_ms, "number");
+  const serialized = JSON.stringify(stored);
+  for (const forbidden of ["access_token", "refresh_token", "authorization", "secret"]) {
+    assert.equal(serialized.includes(forbidden), false, `the stored value must not contain ${forbidden}`);
+  }
+  assert.deepEqual(parseCodexAccountModelsStore(stored), stored);
+});
+
+Deno.test("codex account models: malformed durable values are rejected or dropped", () => {
+  assert.equal(parseCodexAccountModelsStore("nope"), null);
+  assert.equal(parseCodexAccountModelsStore(42), null);
+  assert.equal(parseCodexAccountModelsStore({ accounts: "x", unsupported: "y" }), null);
+  const parsed = parseCodexAccountModelsStore({
+    accounts: {
+      good: { client_version: "0.160.0", slugs: ["a", "b"], updated_at_ms: 5 },
+      bad: { client_version: 7, slugs: ["a"], updated_at_ms: 5 },
+    },
+    unsupported: { good: { model: 10, stale: "x" }, broken: "nope" },
+  });
+  assert.deepEqual(Object.keys(parsed?.accounts ?? {}), ["good"]);
+  assert.deepEqual(parsed?.unsupported, { good: { model: 10 } });
+});
+
+Deno.test("codex account models: a fresh catalog clears a learned rejection and the unsupported map is bounded", async () => {
+  clearAvailabilityKv();
+  await recordCodexModelUnsupported("store-a", MODEL, { detail: UNSUPPORTED_DETAIL, nowMs: 1_000 });
+  assert.equal(codexModelUnavailableAccounts(MODEL).get("store-a"), UNSUPPORTED_DETAIL);
+  await recordCodexAccountCatalogs([{ accountId: "store-a", clientVersion: "0.160.0", slugs: [MODEL] }]);
+  assert.equal(codexModelUnavailableAccounts(MODEL).has("store-a"), false, "a model now present clears its rejection");
+
+  let store = emptyCodexAccountModelsStore();
+  for (let index = 0; index < 40; index += 1) store = withCodexModelUnsupported(store, "store-a", `model-${index}`, 1_000 + index, 1_000 + index);
+  const bounded = store.unsupported["store-a"];
+  assert.equal(Object.keys(bounded).length, CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_COUNT);
+  assert.notEqual(bounded["model-39"], undefined, "the newest observations survive");
+  assert.equal(bounded["model-0"], undefined, "the oldest observations are pruned");
+  const aged = withCodexModelUnsupported(
+    emptyCodexAccountModelsStore(),
+    "store-a",
+    "model-old",
+    1_000,
+    1_000 + CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_AGE_MS + 1
+  );
+  assert.deepEqual(aged.unsupported["store-a"], {}, "an observation past the age bound is pruned");
+});
+
+Deno.test("codex account models: a stale cache keeps serving and refreshes in the background", async () => {
+  clearAvailabilityKv();
+  const staleStore = mergeCodexAccountCatalogs(emptyCodexAccountModelsStore(), [{ accountId: "cache-a", clientVersion: "0.160.0", slugs: ["other"] }], 1);
+  setCodexAccountModelsStoreForTest(staleStore, Date.now());
+  assert.equal(codexModelUnavailableAccounts(MODEL).size, 0);
+  assert.equal(getCodexAccountModelsCacheForTest().refreshing, false, "a fresh cache performs no KV read");
+
+  writeKv(CODEX_ACCOUNT_MODELS_KV_KEY, {
+    accounts: {
+      "cache-a": { client_version: "0.160.0", slugs: ["other"], updated_at_ms: 1 },
+      "cache-b": { client_version: "0.160.0", slugs: [MODEL], updated_at_ms: 1 },
+    },
+    unsupported: {},
+  });
+  setCodexAccountModelsStoreForTest(staleStore, Date.now() - CODEX_ACCOUNT_MODELS_CACHE_TTL_MS - 1);
+  assert.equal(codexModelUnavailableAccounts(MODEL).size, 0, "the stale snapshot serves the decision before the refresh lands");
+  assert.equal(getCodexAccountModelsCacheForTest().refreshing, true, "an expired snapshot schedules one background read");
+  await awaitCodexAccountModelsRefreshForTest();
+  assert.equal(getCodexAccountModelsCacheForTest().refreshing, false);
+  assert.equal(codexModelUnavailableAccounts(MODEL).has("cache-a"), true, "the refreshed durable store replaces the stale snapshot");
+});
+
+Deno.test("codex account models: catalog absence counts only against a sibling's same client version", () => {
+  clearAvailabilityKv();
+  const differentVersion = {
+    accounts: {
+      "version-a": { client_version: "0.160.0", slugs: ["other"], updated_at_ms: 1 },
+      "version-b": { client_version: "0.161.0", slugs: [MODEL], updated_at_ms: 1 },
+    },
+    unsupported: {},
+  };
+  setCodexAccountModelsStoreForTest(differentVersion, Date.now());
+  assert.equal(codexModelUnavailableAccounts(MODEL).size, 0, "a version-specific absence is not authoritative against another version");
+
+  const sameVersion = {
+    accounts: {
+      "version-a": { client_version: "0.160.0", slugs: ["other"], updated_at_ms: 1 },
+      "version-b": { client_version: "0.160.0", slugs: [MODEL], updated_at_ms: 1 },
+    },
+    unsupported: {},
+  };
+  setCodexAccountModelsStoreForTest(sameVersion, Date.now());
+  assert.equal(codexModelUnavailableAccounts(MODEL).get("version-a"), null);
+  assert.equal(codexModelUnavailableAccounts(MODEL).has("version-b"), false);
+});
+
+// ── B3: eligibility-aware routing ────────────────────────────────────────────
+
+Deno.test("codex routing: an ineligible active account yields to an entitled sibling with reason model_unavailable", async () => {
+  const accounts = [codexAccount("route-a"), codexAccount("route-b")];
+  const poolVersionstamp = seedPool(accounts);
+  await seedActiveRow(accounts[0], poolVersionstamp, 0, 1);
+  clearAvailabilityKv();
+  setCodexAccountModelsStoreForTest(
+    {
+      accounts: {
+        "route-a": { client_version: "0.160.0", slugs: ["other-model"], updated_at_ms: 1 },
+        "route-b": { client_version: "0.160.0", slugs: [MODEL], updated_at_ms: 1 },
+      },
+      unsupported: {},
+    },
+    Date.now()
+  );
+
+  const selection = await selectCodexRoutingAccountsStrong({ accounts, updated_at_ms: 1 }, accounts, Date.now(), MODEL);
+  assert.equal(selection.kind, "eligible");
+  assert.equal(selection.accounts[0].auth.account_id, "route-b", "the entitled sibling is selected");
+  const active = parseCodexActiveAccountSelection(readKv(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY));
+  assert.ok(active, "the election writes an active row");
+  assert.equal(active.transition_reason, "model_unavailable");
+  assert.equal(active.generation, 2, "an account change advances the active generation");
+  assert.equal(active.account_id_hash, (await routingAccountIdentity(accounts[1])).accountIdHash);
+});
+
+Deno.test("codex routing: unknown availability never skips the active account", async () => {
+  const accounts = [codexAccount("unknown-a"), codexAccount("unknown-b")];
+  const poolVersionstamp = seedPool(accounts);
+  await seedActiveRow(accounts[0], poolVersionstamp, 0, 1);
+  clearAvailabilityKv();
+
+  const selection = await selectCodexRoutingAccountsStrong({ accounts, updated_at_ms: 1 }, accounts, Date.now(), MODEL);
+  assert.equal(selection.kind, "eligible");
+  assert.equal(selection.accounts[0].auth.account_id, "unknown-a", "the durable active account stays");
+  const active = parseCodexActiveAccountSelection(readKv(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY));
+  assert.ok(active);
+  assert.equal(active.transition_reason, null);
+  assert.equal(active.generation, 1);
+});
+
+Deno.test("codex routing: no entitled account answers a graceful model_not_found without any fence", async () => {
+  const accounts = [codexAccount("blocked-a"), codexAccount("blocked-b")];
+  const poolVersionstamp = seedPool(accounts);
+  await seedActiveRow(accounts[0], poolVersionstamp, 0, 1);
+  clearAvailabilityKv();
+  let store = emptyCodexAccountModelsStore();
+  store = withCodexModelUnsupported(store, "blocked-a", MODEL, 1_000);
+  store = withCodexModelUnsupported(store, "blocked-b", MODEL, 1_000);
+  setCodexAccountModelsStoreForTest(store, Date.now());
+
+  const selection = await selectCodexRoutingAccountsStrong({ accounts, updated_at_ms: 1 }, accounts, Date.now(), MODEL);
+  assert.equal(selection.kind, "model_unavailable");
+  assert.equal(selection.model, MODEL);
+  const response = initialCodexSelectionResponse(selection);
+  assert.ok(response, "the selection is terminal");
+  assert.equal(response.status, 404, "an unentitled model is never 429/503");
+  const payload = (await response.json()) as { error: { code: string; message: string; type: string } };
+  assert.equal(payload.error.code, "model_not_found");
+  assert.equal(payload.error.type, "invalid_request_error");
+  assert.equal(payload.error.message.includes(MODEL), true);
+  const routing = readKv(CODEX_ACCOUNT_ROUTING_KV_KEY) as { slots: Record<string, unknown>[] } | undefined;
+  for (const slot of routing?.slots ?? []) {
+    assert.equal(slot.quota_blocked_until_ms, null, "no quota fence is written");
+    assert.equal(slot.quota_block_source, null);
+    assert.equal(slot.invalid_credential_version, null, "no credential is invalidated");
+    assert.equal(slot.upstream_timeout_blocked_until_ms, null, "no upstream-timeout circuit is set");
+  }
+  const active = parseCodexActiveAccountSelection(readKv(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY));
+  assert.equal(active?.generation, 1, "an account with no eligible sibling is not replaced");
+});
+
+// ── B4: learned fallback at dispatch ─────────────────────────────────────────
+
+Deno.test("codex dispatch: only the exact model-not-supported detail is learned", async () => {
+  assert.deepEqual(parseCodexModelUnsupportedDetail({ detail: UNSUPPORTED_DETAIL }), { model: MODEL, detail: UNSUPPORTED_DETAIL });
+  assert.equal(parseCodexModelUnsupportedDetail({ detail: "Some other failure." }), null);
+  assert.equal(parseCodexModelUnsupportedDetail({ detail: `${UNSUPPORTED_DETAIL} extra` }), null);
+  assert.equal(parseCodexModelUnsupportedDetail({ detail: 7 }), null);
+  assert.equal(parseCodexModelUnsupportedDetail("nope"), null);
+  assert.equal(parseCodexModelUnsupportedDetail({ error: { detail: UNSUPPORTED_DETAIL } }), null);
+
+  const matching = jsonResponse({ detail: UNSUPPORTED_DETAIL }, 400);
+  assert.deepEqual(await codexModelUnsupportedFromResponse(matching), { model: MODEL, detail: UNSUPPORTED_DETAIL });
+  assert.equal(await matching.text(), JSON.stringify({ detail: UNSUPPORTED_DETAIL }), "the caller's body is still readable");
+
+  const other = jsonResponse({ detail: "Some other failure." }, 400);
+  assert.equal(await codexModelUnsupportedFromResponse(other), null);
+  assert.equal(await codexModelUnsupportedFromResponse(jsonResponse({ detail: UNSUPPORTED_DETAIL })), null, "a 200 is never learned");
+  assert.equal(await codexModelUnsupportedFromResponse(new Response("not json", { status: 400 })), null);
+});
+
+Deno.test("codex dispatch: a learned rejection is attributed to the admitted account and writes no fence", async () => {
+  const accounts = [codexAccount("learn-a"), codexAccount("learn-b")];
+  const poolVersionstamp = seedPool(accounts);
+  await seedActiveRow(accounts[0], poolVersionstamp, 0, 1);
+  clearAvailabilityKv();
+  kvStore.delete(keyToString([...CODEX_ACCOUNT_ROUTING_KV_KEY]));
+  const identity = await routingAccountIdentity(accounts[0]);
+  const response = jsonResponse({ detail: UNSUPPORTED_DETAIL }, 400);
+  setCodexResponseAccountTelemetry(response, 1, accounts[0].account_id);
+  setCodexResponseActiveTelemetry(response, {
+    auth: accounts[0],
+    slot: 0,
+    accountIdHash: identity.accountIdHash,
+    credentialVersion: identity.credentialVersion,
+    quotaHeadroom: null,
+    probeRequired: false,
+    probeGeneration: null,
+    probeToken: null,
+    activeGeneration: 1,
+  });
+
+  const learned = await learnCodexModelUnavailable(response);
+  assert.deepEqual(learned, { accountId: "learn-a", model: MODEL, detail: UNSUPPORTED_DETAIL });
+  assert.equal(codexModelUnavailableAccounts(MODEL).get("learn-a"), UNSUPPORTED_DETAIL);
+  assert.equal(await response.text(), JSON.stringify({ detail: UNSUPPORTED_DETAIL }), "the original response is not consumed");
+  assert.equal(readKv(CODEX_ACCOUNT_ROUTING_KV_KEY), undefined, "learning writes no routing fence");
+  assert.equal(parseCodexActiveAccountSelection(readKv(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY))?.generation, 1, "learning does not move the election");
+});
+
+Deno.test("codex dispatch: the learned 400 retries exactly one sibling and returns its response", async () => {
+  const unsupported = jsonResponse({ detail: UNSUPPORTED_DETAIL }, 400);
+  const sibling = jsonResponse({ id: "served-by-sibling" });
+  let dispatches = 0;
+  let advances = 0;
+  const response = await runCodexSerialAdmissionLoop({
+    runPendingShortRetry: () => Promise.resolve(null),
+    dispatchActive: () => {
+      dispatches += 1;
+      return Promise.resolve(dispatches === 1 ? unsupported : sibling);
+    },
+    terminalTransportResponse: () => Promise.resolve(null),
+    hasQueuedRetry: () => false,
+    reselectionRequested: () => false,
+    advanceReselection: () => {
+      advances += 1;
+      return Promise.resolve(null);
+    },
+    exhaustedResponse: () => Promise.resolve(new Response("exhausted", { status: 503 })),
+    classifyModelUnavailable: async (candidate) => {
+      const parsed = await codexModelUnsupportedFromResponse(candidate);
+      return parsed === null ? null : { accountId: "loop-a", model: parsed.model, detail: parsed.detail };
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), JSON.stringify({ id: "served-by-sibling" }));
+  assert.equal(dispatches, 2, "one sibling attempt, no more");
+  assert.equal(advances, 1, "exactly one reselection");
+});
+
+Deno.test("codex dispatch: a failing sibling returns the graceful 404 with a bounded attempt count", async () => {
+  const unsupported = jsonResponse({ detail: UNSUPPORTED_DETAIL }, 400);
+  let dispatches = 0;
+  let advances = 0;
+  const response = await runCodexSerialAdmissionLoop({
+    runPendingShortRetry: () => Promise.resolve(null),
+    dispatchActive: () => {
+      dispatches += 1;
+      return Promise.resolve(unsupported);
+    },
+    terminalTransportResponse: () => Promise.resolve(null),
+    hasQueuedRetry: () => false,
+    reselectionRequested: () => false,
+    advanceReselection: () => {
+      advances += 1;
+      return Promise.resolve(null);
+    },
+    exhaustedResponse: () => Promise.resolve(new Response("exhausted", { status: 503 })),
+    classifyModelUnavailable: async (candidate) => {
+      const parsed = await codexModelUnsupportedFromResponse(candidate);
+      return parsed === null ? null : { accountId: "loop-a", model: parsed.model, detail: parsed.detail };
+    },
+  });
+  assert.equal(response.status, 404);
+  const payload = (await response.json()) as { error: { code: string; message: string } };
+  assert.equal(payload.error.code, "model_not_found");
+  assert.equal(payload.error.message.includes(MODEL), true, "the model is named");
+  assert.equal(payload.error.message.includes(UNSUPPORTED_DETAIL), true, "the upstream detail is included");
+  assert.equal(dispatches, 2, "the sibling attempt is bounded to exactly one");
+  assert.equal(advances, 1);
+});
+
+Deno.test("codex dispatch: every other 400 passes through byte-for-byte with no state change", async () => {
+  const other = jsonResponse({ detail: "A different upstream failure." }, 400);
+  let dispatches = 0;
+  let advances = 0;
+  const response = await runCodexSerialAdmissionLoop({
+    runPendingShortRetry: () => Promise.resolve(null),
+    dispatchActive: () => {
+      dispatches += 1;
+      return Promise.resolve(other);
+    },
+    terminalTransportResponse: () => Promise.resolve(null),
+    hasQueuedRetry: () => false,
+    reselectionRequested: () => false,
+    advanceReselection: () => {
+      advances += 1;
+      return Promise.resolve(null);
+    },
+    exhaustedResponse: () => Promise.resolve(new Response("exhausted", { status: 503 })),
+    classifyModelUnavailable: async (candidate) => {
+      const parsed = await codexModelUnsupportedFromResponse(candidate);
+      return parsed === null ? null : { accountId: "loop-a", model: parsed.model, detail: parsed.detail };
+    },
+  });
+  assert.equal(response, other, "the exact response object is returned");
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), JSON.stringify({ detail: "A different upstream failure." }));
+  assert.equal(dispatches, 1);
+  assert.equal(advances, 0, "no reselection and no state write");
+});

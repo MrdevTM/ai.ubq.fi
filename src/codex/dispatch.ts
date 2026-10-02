@@ -1,8 +1,12 @@
 // Codex dispatch primitives and request preparation, split out of src/codex.ts.
 
 import { config } from "../config.ts";
+import { getKv } from "../kv.ts";
+import { readBoundedResponseBody } from "../bounded-response-body.ts";
 import { RoutingAccount } from "./routing-state.ts";
 import { RouteSelection } from "./routing-state.ts";
+import { CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, parseCodexActiveAccountSelection } from "./routing-state.ts";
+import { routingAccountIdentity } from "./capacity-routing.ts";
 import { type CodexBankedResetConfig, type CodexBankedResetTelemetry } from "./banked-reset.ts";
 import { type CodexUsageResetProvider } from "./banked-reset-provider.ts";
 import { type ApiKeyProviderDispatch, ApiKeyQuotaDispatchError } from "../api-key-policy.ts";
@@ -25,9 +29,13 @@ import {
   accessTokenExpired,
   codexProbeTransitionsInFlight,
   codexRoutingErrors,
+  getAuthPoolEntry,
+  getCodexResponseActiveTelemetry,
+  getCodexResponseSlot,
   withCodexAuthWarning,
 } from "./auth.ts";
 import { abortReasonAsError } from "./auth-refresh.ts";
+import { recordCodexModelUnsupported } from "../models/codex-models-availability.ts";
 
 const codexModelsBaseUrls = (clientVersion: string | null): string[] => {
   // Strip trailing slashes without the backtracking `\/+$` pattern: the scan is
@@ -215,13 +223,13 @@ const fetchCodexResponseWithAuth = async (
   }
 };
 
-const routingErrorType = (status: 401 | 429 | 503): string => {
+const routingErrorType = (status: 401 | 404 | 429 | 503): string => {
   if (status === 429) return "rate_limit_error";
   if (status >= 500) return "server_error";
   return "invalid_request_error";
 };
 
-const routingErrorResponse = (status: 401 | 429 | 503, message: string, code: string, retryAtMs: number | null = null): Response => {
+const routingErrorResponse = (status: 401 | 404 | 429 | 503, message: string, code: string, retryAtMs: number | null = null): Response => {
   const headers = new Headers({ "Content-Type": "application/json" });
   if ((status === 429 || status === 503) && retryAtMs !== null) {
     headers.set("Retry-After", String(Math.max(1, Math.ceil((retryAtMs - Date.now()) / 1000))));
@@ -250,6 +258,16 @@ const upstreamTimeoutCircuitResponse = (retryAtMs: number | null): Response =>
     CODEX_UPSTREAM_DEGRADED_ERROR_CODE,
     retryAtMs
   );
+
+/**
+ * No configured account can serve the named model. This is answered as an
+ * unavailable model, never as a retryable quota or credential failure: waiting
+ * changes nothing and this path wrote no fence.
+ */
+const codexModelUnavailableResponse = (model: string, detail: string | null): Response => {
+  const base = `The model '${model}' does not exist or is not available through this gateway. Use /v1/models for supported models.`;
+  return routingErrorResponse(404, detail === null ? base : `${base} Upstream detail: ${detail}`, "model_not_found");
+};
 
 type CodexResponseTimingHooks = Readonly<{
   onDispatch?: () => void;
@@ -552,6 +570,7 @@ const initialCodexSelectionResponse = (selection: RouteSelection): Response | nu
   }
   if (selection.kind === "credentials_invalid") return allCodexCredentialsInvalidResponse();
   if (selection.kind === "upstream_blocked") return upstreamTimeoutCircuitResponse(selection.retryAtMs);
+  if (selection.kind === "model_unavailable") return codexModelUnavailableResponse(selection.model, selection.detail);
   return null;
 };
 
@@ -563,7 +582,157 @@ type CodexSerialAdmissionDrivers = Readonly<{
   reselectionRequested: () => boolean;
   advanceReselection: () => Promise<Response | null>;
   exhaustedResponse: () => Promise<Response>;
+  /**
+   * Learned account+model unavailability for one dispatched response. Real
+   * traffic uses the account-attributed default; a test can supply its own
+   * observation without a live upstream.
+   */
+  classifyModelUnavailable?: (response: Response) => Promise<CodexModelUnavailableAttempt | null>;
 }>;
+
+/** The exact upstream rejection that proves one subscription cannot serve one model. */
+const CODEX_MODEL_UNSUPPORTED_DETAIL_PATTERN = /^The '([^']+)' model is not supported when using Codex with a ChatGPT account\.$/;
+
+export type CodexModelUnavailableAttempt = Readonly<{ accountId: string; model: string; detail: string }>;
+
+/** The model a not-supported detail names, when the detail has exactly that shape. */
+export const parseCodexModelUnsupportedDetail = (payload: unknown): Readonly<{ model: string; detail: string }> | null => {
+  if (!isRecord(payload)) return null;
+  const detail = getString(payload.detail);
+  if (detail === null) return null;
+  const match = CODEX_MODEL_UNSUPPORTED_DETAIL_PATTERN.exec(detail);
+  if (!match?.[1]) return null;
+  return { model: match[1], detail };
+};
+
+/**
+ * A 400 probe must never extend the caller's latency: the clone is read under
+ * the shared byte and time bounds, and an incomplete read is not evidence.
+ */
+const CODEX_MODEL_UNSUPPORTED_PROBE_TIMEOUT_MS = 250;
+
+const boundedResponseText = async (response: Response): Promise<string | null> => {
+  try {
+    const { bytes, complete } = await readBoundedResponseBody(response, {
+      timeoutMs: CODEX_MODEL_UNSUPPORTED_PROBE_TIMEOUT_MS,
+      cancellationReason: "Codex model availability probe",
+    });
+    return complete ? new TextDecoder().decode(bytes) : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Read a 400 body through a bounded clone, so a response that does not match the
+ * learned shape still reaches the caller byte-for-byte with its own stream.
+ */
+export const codexModelUnsupportedFromResponse = async (response: Response): Promise<Readonly<{ model: string; detail: string }> | null> => {
+  if (response.status !== 400) return null;
+  let clone: Response;
+  try {
+    clone = response.clone();
+  } catch {
+    return null;
+  }
+  const text = await boundedResponseText(clone);
+  if (!text) return null;
+  try {
+    return parseCodexModelUnsupportedDetail(JSON.parse(text) as unknown);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Prove which account answered a response through the durable active row it was
+ * admitted under. A learned rejection skips that account for that model, so a
+ * wrong attribution would take capacity from a capable account: both the
+ * admission generation and the opaque account identity must match.
+ */
+const codexResponseAccountId = async (response: Response): Promise<string | null> => {
+  const activeGeneration = getCodexResponseActiveTelemetry(response).activeGeneration;
+  if (activeGeneration === null || getCodexResponseSlot(response) === null) return null;
+  try {
+    const kv = await getKv();
+    if (!kv) return null;
+    const entry = await kv.get(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, { consistency: "strong" });
+    const active = parseCodexActiveAccountSelection(entry.value);
+    if (active?.generation !== activeGeneration) return null;
+    const poolEntry = await getAuthPoolEntry(true, true);
+    if (poolEntry.entry?.versionstamp !== active.pool_versionstamp) return null;
+    for (const auth of poolEntry.pool.accounts) {
+      if ((await routingAccountIdentity(auth)).accountIdHash === active.account_id_hash) return auth.account_id;
+    }
+  } catch {
+    // Attribution is best effort; without it the response is passed through.
+  }
+  return null;
+};
+
+/**
+ * Classify one upstream 400 as learned account+model unavailability and record
+ * it for routing. Every other response, including every other 400, returns null
+ * and leaves both routing state and the response untouched.
+ */
+export const learnCodexModelUnavailable = async (response: Response): Promise<CodexModelUnavailableAttempt | null> => {
+  const unsupported = await codexModelUnsupportedFromResponse(response);
+  if (unsupported === null) return null;
+  const accountId = await codexResponseAccountId(response);
+  if (accountId === null) return null;
+  await recordCodexModelUnsupported(accountId, unsupported.model, { detail: unsupported.detail });
+  return { accountId, model: unsupported.model, detail: unsupported.detail };
+};
+
+type CodexModelUnavailableLoopState = { reselections: number; siblingAttempted: boolean };
+
+/**
+ * One bounded sibling attempt for a learned model-unavailable rejection. The
+ * recorded account+model pair makes the following reselection skip the
+ * ineligible account; when this request has already spent its attempt, the
+ * graceful 404 is the final answer.
+ */
+const advanceCodexModelUnavailable = async (
+  drivers: CodexSerialAdmissionDrivers,
+  attempt: CodexModelUnavailableAttempt,
+  state: CodexModelUnavailableLoopState
+): Promise<Response | null> => {
+  if (state.siblingAttempted || state.reselections >= CODEX_ACTIVE_ADMISSION_RESEELECTION_LIMIT) {
+    return codexModelUnavailableResponse(attempt.model, attempt.detail);
+  }
+  state.siblingAttempted = true;
+  state.reselections += 1;
+  return await drivers.advanceReselection();
+};
+
+type CodexAdmissionPassOutcome = Readonly<{ kind: "return"; response: Response } | { kind: "continue" } | { kind: "exhausted" }>;
+
+/** The terminal-transport, queued-retry and reselection part of one dispatch-less pass. */
+const continueCodexAdmissionWithoutDispatch = async (
+  drivers: CodexSerialAdmissionDrivers,
+  state: CodexModelUnavailableLoopState
+): Promise<CodexAdmissionPassOutcome> => {
+  const terminalTransport = await drivers.terminalTransportResponse();
+  if (terminalTransport) return { kind: "return", response: terminalTransport };
+  if (drivers.hasQueuedRetry()) return { kind: "continue" };
+  if (!drivers.reselectionRequested() || state.reselections >= CODEX_ACTIVE_ADMISSION_RESEELECTION_LIMIT) return { kind: "exhausted" };
+  state.reselections += 1;
+  const advanced = await drivers.advanceReselection();
+  return advanced ? { kind: "return", response: advanced } : { kind: "continue" };
+};
+
+/** One dispatched response: an unchanged pass-through, or the bounded learned rejection. */
+const handleCodexDispatchedResponse = async (
+  drivers: CodexSerialAdmissionDrivers,
+  classifyModelUnavailable: (response: Response) => Promise<CodexModelUnavailableAttempt | null>,
+  dispatched: Response,
+  state: CodexModelUnavailableLoopState
+): Promise<CodexAdmissionPassOutcome> => {
+  const unsupported = await classifyModelUnavailable(dispatched);
+  if (unsupported === null) return { kind: "return", response: dispatched };
+  const advanced = await advanceCodexModelUnavailable(drivers, unsupported, state);
+  return advanced === null ? { kind: "continue" } : { kind: "return", response: advanced };
+};
 
 /**
  * The bounded one-account admission loop. Each pass runs a pending short retry,
@@ -574,21 +743,19 @@ type CodexSerialAdmissionDrivers = Readonly<{
  * retry, then one reselection advance, and finally the exhausted response.
  */
 const runCodexSerialAdmissionLoop = async (drivers: CodexSerialAdmissionDrivers): Promise<Response> => {
-  for (let reselections = 0; ;) {
+  const classifyModelUnavailable = drivers.classifyModelUnavailable ?? learnCodexModelUnavailable;
+  const state: CodexModelUnavailableLoopState = { reselections: 0, siblingAttempted: false };
+  for (;;) {
     const retried = await drivers.runPendingShortRetry();
     if (retried) return retried;
 
     const dispatched = await drivers.dispatchActive();
-    if (dispatched) return dispatched;
-
-    const terminalTransport = await drivers.terminalTransportResponse();
-    if (terminalTransport) return terminalTransport;
-
-    if (drivers.hasQueuedRetry()) continue;
-    if (!drivers.reselectionRequested() || reselections >= CODEX_ACTIVE_ADMISSION_RESEELECTION_LIMIT) break;
-    reselections += 1;
-    const advanced = await drivers.advanceReselection();
-    if (advanced) return advanced;
+    const outcome =
+      dispatched === null
+        ? await continueCodexAdmissionWithoutDispatch(drivers, state)
+        : await handleCodexDispatchedResponse(drivers, classifyModelUnavailable, dispatched, state);
+    if (outcome.kind === "return") return outcome.response;
+    if (outcome.kind === "exhausted") break;
   }
   return await drivers.exhaustedResponse();
 };
@@ -601,6 +768,7 @@ export {
   awaitPendingCodexProbeTransitions,
   cancelResponseBody,
   codexErrorClass,
+  codexModelUnavailableResponse,
   codexModelsBaseUrls,
   codexStatusClass,
   createCodexProviderDispatchCoordinator,
