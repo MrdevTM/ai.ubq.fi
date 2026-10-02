@@ -201,14 +201,43 @@ const currentCodexAccountModelsStore = (nowMs: number): CodexAccountModelsStore 
   return cache.store;
 };
 
-/** Persist one write, never letting an availability failure affect serving. */
-const storeCodexAccountModels = async (next: CodexAccountModelsStore, kvOverride?: Deno.Kv | null): Promise<void> => {
-  cache.store = next;
-  cache.loadedAtMs = Date.now();
+/** A bounded retry budget, mirroring the catalog snapshot writer's commit loop. */
+const CODEX_ACCOUNT_MODELS_COMMIT_ATTEMPTS = 3;
+
+/**
+ * Persist one merged update with a compare-and-set commit, never letting an
+ * availability failure affect serving. Catalog refreshes and learned rejections
+ * run concurrently in independent isolates, so an unconditional `set` would let
+ * the last writer discard the other's rows -- or resurrect a rejection the
+ * fresh catalog had already cleared. Every attempt re-reads the durable store
+ * strongly, merges on the value it just read, and commits only while that exact
+ * version is still current; the in-memory cache follows the committed value.
+ */
+const mergeAndStoreCodexAccountModels = async (
+  merge: (current: CodexAccountModelsStore) => CodexAccountModelsStore,
+  kvOverride?: Deno.Kv | null
+): Promise<void> => {
   try {
     const kv = kvOverride === undefined ? await getKv() : kvOverride;
-    if (!kv) return;
-    await kv.set(CODEX_ACCOUNT_MODELS_KV_KEY, next);
+    if (!kv) {
+      // Without a durable store the hint stays isolate-local, as before.
+      const local = merge(cache.store ?? emptyCodexAccountModelsStore());
+      cache.store = local;
+      cache.loadedAtMs = Date.now();
+      return;
+    }
+    for (let attempt = 0; attempt < CODEX_ACCOUNT_MODELS_COMMIT_ATTEMPTS; attempt += 1) {
+      const entry = await kv.get(CODEX_ACCOUNT_MODELS_KV_KEY, { consistency: "strong" });
+      // An absent or unreadable durable value merges from an empty store: the
+      // base is always the value just read, never a possibly-stale snapshot.
+      const current = parseCodexAccountModelsStore(entry.value) ?? emptyCodexAccountModelsStore();
+      const next = merge(current);
+      const committed = await kv.atomic().check(entry).set(CODEX_ACCOUNT_MODELS_KV_KEY, next).commit();
+      if (!committed.ok) continue;
+      cache.store = next;
+      cache.loadedAtMs = Date.now();
+      return;
+    }
   } catch {
     // Availability evidence is a hint; a KV failure only loses the hint.
   }
@@ -217,12 +246,8 @@ const storeCodexAccountModels = async (next: CodexAccountModelsStore, kvOverride
 /** Record the catalogs every pool account advertised for one client version. */
 export const recordCodexAccountCatalogs = async (entries: readonly CodexAccountCatalogInput[], kvOverride?: Deno.Kv | null): Promise<void> => {
   if (!entries.length) return;
-  try {
-    const durable = (await loadCodexAccountModelsFromKv(kvOverride)) ?? cache.store ?? emptyCodexAccountModelsStore();
-    await storeCodexAccountModels(mergeCodexAccountCatalogs(durable, entries, Date.now()), kvOverride);
-  } catch {
-    // Best effort only.
-  }
+  const nowMs = Date.now();
+  await mergeAndStoreCodexAccountModels((current) => mergeCodexAccountCatalogs(current, entries, nowMs), kvOverride);
 };
 
 /** Record one account+model pair upstream rejected, with the detail text for diagnostics. */
@@ -239,12 +264,7 @@ export const recordCodexModelUnsupported = async (
     details.set(target, options.detail);
     learnedDetails.set(accountId, details);
   }
-  try {
-    const base = cache.store ?? (await loadCodexAccountModelsFromKv(options.kv)) ?? emptyCodexAccountModelsStore();
-    await storeCodexAccountModels(withCodexModelUnsupported(base, accountId, target, nowMs, nowMs), options.kv);
-  } catch {
-    // Best effort only.
-  }
+  await mergeAndStoreCodexAccountModels((current) => withCodexModelUnsupported(current, accountId, target, nowMs, nowMs), options.kv);
 };
 
 /** Whether a sibling's same-version catalog proves the model is servable somewhere. */
@@ -255,23 +275,27 @@ const siblingListsModel = (store: CodexAccountModelsStore, other: string, catalo
 };
 
 /**
- * Accounts that cannot serve a named model, mapped to the upstream detail when
- * one was learned. A stored catalog proves absence only against a sibling's
- * catalog for the same client version: a version-specific answer is never read
- * as an authoritative absence on its own.
+ * Accounts in the current pool that cannot serve a named model, mapped to the
+ * upstream detail when one was learned. Only current pool accounts are
+ * considered: a removed or replaced account's stored catalog or rejection says
+ * nothing about the accounts serving now. A stored catalog proves absence only
+ * against a current sibling's catalog for the same client version, and a
+ * learned rejection ages back to unknown availability after
+ * CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_AGE_MS instead of excluding the account
+ * forever.
  */
-export const codexModelUnavailableAccounts = (model: string | null): ReadonlyMap<string, string | null> => {
+export const codexModelUnavailableAccounts = (model: string | null, currentAccountIds: readonly string[]): ReadonlyMap<string, string | null> => {
   const unavailable = new Map<string, string | null>();
   const target = model?.trim();
   if (!target) return unavailable;
-  const store = currentCodexAccountModelsStore(Date.now());
+  const nowMs = Date.now();
+  const store = currentCodexAccountModelsStore(nowMs);
   if (store === null) return unavailable;
-  // A learned rejection counts even for an account whose catalog was never
-  // recorded, so the account set is the union of both maps.
-  const accountIds = [...new Set([...Object.keys(store.accounts), ...Object.keys(store.unsupported)])];
+  const accountIds = [...new Set(currentAccountIds)];
   for (const accountId of accountIds) {
     const unsupported = recordValue(store.unsupported, accountId);
-    if (unsupported !== undefined && recordValue(unsupported, target) !== undefined) {
+    const observedAtMs = unsupported === undefined ? undefined : recordValue(unsupported, target);
+    if (observedAtMs !== undefined && nowMs - observedAtMs <= CODEX_ACCOUNT_MODELS_UNSUPPORTED_MAX_AGE_MS) {
       unavailable.set(accountId, learnedDetails.get(accountId)?.get(target) ?? null);
       continue;
     }
