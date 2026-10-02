@@ -504,6 +504,7 @@ export const loadPaidResponsesCatalogs = async (
   // discovery is only needed before dispatch when the model is not in the
   // Codex roster; known Codex models can use the historical Metered path and
   // refresh paid catalogs after a fallback-triggering primary response.
+  const codexEnabled = isProviderEnabled("codex", selection);
   let [meteredCatalog, surplusCatalog] = await Promise.all([fetchMeteredModels({ cachedOnly: true }), fetchSurplusModels({ cachedOnly: true })]);
   if (
     !codexModelKnown &&
@@ -511,7 +512,26 @@ export const loadPaidResponsesCatalogs = async (
   ) {
     [meteredCatalog, surplusCatalog] = await refreshPaidCatalogs(meteredCatalog, surplusCatalog, options.signal);
   }
-  const routing = resolvePaidRoutingState({ meteredCatalog, surplusCatalog, codexModelKnown, endpointType, requestUsesTools, model: options.model, selection });
+  const resolveRouting = () =>
+    resolvePaidRoutingState({ meteredCatalog, surplusCatalog, codexModelKnown, endpointType, requestUsesTools, model: options.model, selection });
+  let routing = resolveRouting();
+  // With the Codex tier switched off, the enabled paid catalogs are the only
+  // routing evidence left, so a cold enabled catalog must be discovered before
+  // this request can be rejected as provider_disabled: the cold snapshot cannot
+  // prove that the enabled provider is unable to serve a Codex-known model.
+  // Only enabled providers are discovered, a switched-off tier is never probed,
+  // and an already-routable paid provider keeps the cached-first path.
+  if (codexModelKnown && !codexEnabled && !routing.paidProviders.length) {
+    [meteredCatalog, surplusCatalog] = await Promise.all([
+      paidCatalogNeedsRefresh(meteredCatalog, METERED_MODELS_CACHE_TTL_MS) && isProviderEnabled("openlux", selection)
+        ? fetchMeteredModels({ signal: options.signal })
+        : Promise.resolve(meteredCatalog),
+      paidCatalogNeedsRefresh(surplusCatalog, SURPLUS_MODELS_CACHE_TTL_MS) && isProviderEnabled("surplus", selection)
+        ? fetchSurplusModels({ signal: options.signal })
+        : Promise.resolve(surplusCatalog),
+    ]);
+    routing = resolveRouting();
+  }
   if (routing.paidProviders.length) refreshStalePaidCatalogsInBackground(meteredCatalog, surplusCatalog);
   return { codexModelKnown, endpointType, requestUsesTools, meteredCatalog, surplusCatalog, selection, routing };
 };

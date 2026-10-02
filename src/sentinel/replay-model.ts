@@ -1,7 +1,15 @@
 // Sentinel replay constants, record types and byte primitives, split out of src/sentinel_replay_capture.ts.
 
 import { MAX_ACCEPTED_JSON_BODY_BYTES } from "../request.ts";
-import { SENTINEL_UPSTREAM_MAX_BYTES, SENTINEL_UPSTREAM_MAX_CHUNKS, type SentinelUpstreamRecorder, type SentinelUpstreamTrace } from "./upstream-capture.ts";
+import { type SentinelUpstreamRecorder, type SentinelUpstreamTrace } from "./upstream-capture.ts";
+import {
+  SENTINEL_REPLAY_MAX_CIPHERTEXT_BYTES as MAX_REPLAY_CIPHERTEXT_BYTES,
+  SENTINEL_REPLAY_MAX_DOWNSTREAM_BYTES,
+  SENTINEL_REPLAY_MAX_METADATA_BYTES as MAX_REPLAY_METADATA_BYTES,
+  SENTINEL_REPLAY_MAX_PLAINTEXT_BYTES as MAX_REPLAY_PLAINTEXT_BYTES,
+  SENTINEL_REPLAY_MAX_STORED_CHUNKS as MAX_REPLAY_CHUNKS,
+  SENTINEL_REPLAY_STORAGE_CHUNK_BYTES,
+} from "./replay-limits.ts";
 
 export const SENTINEL_REPLAY_TTL_MS = 48 * 60 * 60 * 1_000;
 /**
@@ -11,11 +19,11 @@ export const SENTINEL_REPLAY_TTL_MS = 48 * 60 * 60 * 1_000;
  * `expired` instead of decaying into `unknown` at exactly the same instant.
  */
 export const SENTINEL_REPLAY_STATUS_TTL_MS = 2 * SENTINEL_REPLAY_TTL_MS;
-export const SENTINEL_REPLAY_CHUNK_BYTES = 48 * 1_024;
+export const SENTINEL_REPLAY_CHUNK_BYTES = SENTINEL_REPLAY_STORAGE_CHUNK_BYTES;
 export const SENTINEL_REPLAY_MAX_BODY_BYTES = MAX_ACCEPTED_JSON_BODY_BYTES;
 export const SENTINEL_REPLAY_MAX_BUFFERED_OBSERVATION_BYTES = 1 * 1_024 * 1_024;
 /** Bounded observed downstream terminal/error body retained with a failure. */
-export const SENTINEL_REPLAY_MAX_DOWNSTREAM_BODY_BYTES = 64 * 1_024;
+export const SENTINEL_REPLAY_MAX_DOWNSTREAM_BODY_BYTES = SENTINEL_REPLAY_MAX_DOWNSTREAM_BYTES;
 export const SENTINEL_REPLAY_EXPORT_PAGE_LIMIT = 1;
 export const SENTINEL_REPLAY_MANIFEST_PREFIX = ["uos_ai", "sentinel_replay", "v1", "manifest"] as const;
 export const SENTINEL_REPLAY_DEDUPE_PREFIX = ["uos_ai", "sentinel_replay", "v1", "dedupe"] as const;
@@ -35,23 +43,7 @@ const REPLAY_PLAINTEXT_VERSION = 3;
 /** v2 fingerprint frame namespace; the outer crypto transport stays v1. */
 const FINGERPRINT_NAMESPACE_V2 = "uos-sentinel-replay-v2:fingerprint";
 const CASE_GROUP_NAMESPACE_V1 = "uos-sentinel-replay-v1:case-group";
-/**
- * The private metadata carries the sealed upstream trace as per-chunk base64,
- * so its bound is derived from the bounded capture rather than fixed: base64
- * expansion of the full accepted upstream capture, per-chunk base64 padding and
- * JSON framing, the retained downstream body (carried in both of its metadata
- * projections), and the remaining bounded metadata. Encode and decode share
- * this one bound, so a capture the recorder accepted stays exportable.
- */
-const MAX_REPLAY_UPSTREAM_METADATA_BYTES = Math.ceil(SENTINEL_UPSTREAM_MAX_BYTES / 3) * 4 + SENTINEL_UPSTREAM_MAX_CHUNKS * 8;
-/** Base64 expansion of the retained downstream body carried in both metadata projections. */
-const MAX_REPLAY_DOWNSTREAM_METADATA_BYTES = 2 * Math.ceil(SENTINEL_REPLAY_MAX_DOWNSTREAM_BODY_BYTES / 3) * 4;
-/** Remaining bounded metadata; the entire metadata envelope previously fit in this allowance. */
-const MAX_REPLAY_AUXILIARY_METADATA_BYTES = 256 * 1_024;
-const MAX_REPLAY_METADATA_BYTES = MAX_REPLAY_UPSTREAM_METADATA_BYTES + MAX_REPLAY_DOWNSTREAM_METADATA_BYTES + MAX_REPLAY_AUXILIARY_METADATA_BYTES;
-const MAX_REPLAY_PLAINTEXT_BYTES = SENTINEL_REPLAY_MAX_BODY_BYTES + MAX_REPLAY_METADATA_BYTES + 4;
-const MAX_REPLAY_CIPHERTEXT_BYTES = MAX_REPLAY_PLAINTEXT_BYTES + 1_024 * 1_024 + 16;
-const MAX_REPLAY_CHUNKS = Math.ceil(MAX_REPLAY_CIPHERTEXT_BYTES / SENTINEL_REPLAY_CHUNK_BYTES);
+/** Limits are shared with export/decode and the offline reader; see replay-limits.ts. */
 const MAX_CAPTURE_ID_CHARS = 128;
 const MAX_SSE_EVENT_CHARS = 16 * 1_024 * 1_024;
 const HEX_DIGEST = /^[0-9a-f]{64}$/;
@@ -240,6 +232,10 @@ export type SentinelReplayManifest = Readonly<{
   iv: string;
   chunk_count: number;
   ciphertext_bytes: number;
+  /** Additive retention accounting: encoded KV charge when this build stored it. */
+  stored_bytes?: number;
+  /** Additive owner lookup: request id, so eviction can publish a truthful status. */
+  request_id?: string;
 }>;
 
 export type ExportedSentinelReplayCapture = Readonly<{
@@ -249,10 +245,10 @@ export type ExportedSentinelReplayCapture = Readonly<{
 
 /**
  * Per-request capture status. It exists so a failure is discoverable by its
- * request id even when nothing was stored: a missing replay key or a failed
- * persist must never look like an empty replay history.
+ * request id even when nothing was stored: a missing replay key, a failed
+ * persist or a retention eviction must never look like an empty history.
  */
-export type SentinelReplayCaptureStatus = "ready" | "incomplete" | "disabled" | "failed" | "expired" | "unknown";
+export type SentinelReplayCaptureStatus = "ready" | "incomplete" | "disabled" | "failed" | "evicted" | "expired" | "unknown" | "status_not_retained";
 
 export type SentinelReplayCaptureStatusRow = Readonly<{
   version: 1;

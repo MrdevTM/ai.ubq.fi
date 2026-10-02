@@ -32,6 +32,25 @@ export const LOCAL_DEVELOPMENT_KEY_ID = "local-development";
 /** The single account the loopback development server provisions for itself. */
 export const LOCAL_DEVELOPMENT_KEY_NAME = "Local development (loopback)";
 
+/**
+ * Fixed internal deadline for the local paid-pricing snapshot.
+ *
+ * Listener startup awaits local provisioning, so a pricing source that stalls
+ * (or that ignores the abort signal it is handed) must not hold the listener
+ * open. The deadline is deliberately internal - no environment variable, CLI
+ * flag, or caller option - and it leaves generous room next to the 10s fetch
+ * budget each upstream metadata call already carries, so a healthy
+ * initialization is never cut short.
+ */
+export const LOCAL_DEVELOPMENT_PRICING_DEADLINE_MS = 30_000;
+
+let localDevelopmentPricingDeadlineMs = LOCAL_DEVELOPMENT_PRICING_DEADLINE_MS;
+
+/** Test-only override; `null` restores the fixed production deadline. */
+export const setLocalDevelopmentPricingDeadlineMsForTest = (deadlineMs: number | null): void => {
+  localDevelopmentPricingDeadlineMs = deadlineMs ?? LOCAL_DEVELOPMENT_PRICING_DEADLINE_MS;
+};
+
 export type LocalDevelopmentKeyStatus = "created" | "present" | "revoked" | "unconfigured" | "unavailable" | "conflict";
 
 type LocalDevelopmentKeyMaterial = Readonly<{
@@ -50,6 +69,32 @@ export type LocalDevelopmentPricingInitializer = (
     "paid_fallback_model_ids" | "paid_fallback_quota_per_credit" | "paid_fallback_pricing_checked_at_ms" | "paid_fallback_max_exposure_microcredits"
   >
 >;
+
+/** The reason carried by a cancelled or expired signal, or a generic AbortError. */
+const abortReason = (signal: AbortSignal): Error =>
+  signal.reason instanceof Error ? signal.reason : new DOMException("The request was aborted.", "AbortError");
+
+/**
+ * Settles as soon as `operation` does or `signal` aborts, whichever happens
+ * first. The operation always stays observed by the race, so a late rejection
+ * cannot surface as an unhandled rejection and a late result can never be
+ * published by a caller that already moved on.
+ */
+const awaitWithAbort = async <T>(operation: Promise<T>, signal: AbortSignal): Promise<T> => {
+  let onAbort = (): void => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    if (signal.aborted) onAbort();
+    return await Promise.race([operation, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+};
 
 const buildLocalDevelopmentKey = async (
   nowMs: number,
@@ -105,7 +150,9 @@ const buildLocalDevelopmentKey = async (
  * best-effort: an existing record is never rewritten, so an operator can revoke
  * it to switch local paid routing off, or adjust it in the console. Deleting it
  * re-provisions a fresh unlimited key (with current pricing) at the next local
- * start.
+ * start. Pricing initialization is bounded by
+ * {@link LOCAL_DEVELOPMENT_PRICING_DEADLINE_MS}, so listener startup resumes
+ * even when the initializer never settles.
  */
 export const ensureLocalDevelopmentApiKey = async (
   kv: Deno.Kv,
@@ -121,15 +168,28 @@ export const ensureLocalDevelopmentApiKey = async (
 
   const nowMs = Date.now();
   let material: LocalDevelopmentKeyMaterial;
+  // The initializer receives a cooperative abort at the deadline, while the
+  // race bounds an initializer that never observes it. Both paths end the same
+  // way: startup resumes and nothing is published from the aborted attempt.
+  const pricingDeadline = new AbortController();
+  const deadlineTimer = setTimeout(() => {
+    pricingDeadline.abort(new DOMException("Local development pricing initialization exceeded its internal deadline.", "TimeoutError"));
+  }, localDevelopmentPricingDeadlineMs);
+  const pricingSignal = options.signal ? AbortSignal.any([options.signal, pricingDeadline.signal]) : pricingDeadline.signal;
   try {
-    material = await buildLocalDevelopmentKey(nowMs, options.initializePolicy ?? initializePaidFallbackPolicy, options.signal);
+    material = await awaitWithAbort(buildLocalDevelopmentKey(nowMs, options.initializePolicy ?? initializePaidFallbackPolicy, pricingSignal), pricingSignal);
   } catch (error) {
     console.warn(
       "[ai.ubq.fi] Local development key was not provisioned; paid providers stay unavailable locally:",
       error instanceof Error ? error.message : String(error)
     );
     return "unavailable";
+  } finally {
+    clearTimeout(deadlineTimer);
   }
+  // A deadline or caller cancellation that landed during the attempt must never
+  // publish, even when the initializer resolved before it was observed.
+  if (pricingSignal.aborted) return "unavailable";
 
   const hashEntry = await kv.get<ApiKeyHashRecord>(material.hashKey);
   const window = makeApiKeyUsageWindowV3(material.policy, nowMs);
