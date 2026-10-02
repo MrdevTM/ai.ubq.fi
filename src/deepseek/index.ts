@@ -311,8 +311,22 @@ export const deepSeekDefaultOutputAllowance = (reasoningEffort: string): number 
   projectDeepSeekReasoningEffort(reasoningEffort) === "none" ? 8_192 : null;
 
 /**
+ * DeepSeek's Chat contract defines no `developer` role, while the gateway's
+ * Chat input accepts the OpenAI one. Forwarding it unchanged would send the
+ * provider a role its contract does not define, so the role is translated
+ * here, exactly as the Responses translator already does
+ * (`src/deepseek/chat-projection.ts`). Message order and content, and every
+ * other role, are forwarded unchanged; messages are copied rather than
+ * mutated so the caller's own request record is never rewritten in place.
+ */
+const projectDeepSeekMessages = (messages: unknown): unknown => {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map((message) => (isRecord(message) && !Array.isArray(message) && message.role === "developer" ? { ...message, role: "system" } : message));
+};
+
+/**
  * Projects the official Chat Completions body onto DeepSeek's documented wire
- * contract. Only two provider necessities are applied — everything else is
+ * contract. Only three provider necessities are applied — everything else is
  * forwarded unchanged:
  *
  * 1. `model` becomes the canonical official id, so the interchangeable legacy
@@ -321,6 +335,8 @@ export const deepSeekDefaultOutputAllowance = (reasoningEffort: string): number 
  *    gateway's Chat contract only accepts the OpenAI field name, and DeepSeek
  *    documents no `max_completion_tokens`, so leaving it in place would both
  *    lose the cap and send an unrecognized parameter.
+ * 3. `developer` messages become `system` messages, because DeepSeek's Chat
+ *    contract defines no developer role.
  */
 export const projectDeepSeekRequest = (body: Record<string, unknown>, requestedModel: string): Record<string, unknown> => {
   const upstreamModel = deepSeekUpstreamModelFor(requestedModel);
@@ -331,6 +347,7 @@ export const projectDeepSeekRequest = (body: Record<string, unknown>, requestedM
   }
   delete projected.max_completion_tokens;
   if (typeof projected.reasoning_effort === "string") projected.reasoning_effort = projectDeepSeekReasoningEffort(projected.reasoning_effort);
+  if (Array.isArray(projected.messages)) projected.messages = projectDeepSeekMessages(projected.messages);
   return projected;
 };
 

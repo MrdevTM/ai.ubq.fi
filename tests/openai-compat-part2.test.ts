@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import {
+  DEEPSEEK_CHAT_COMPLETIONS_URL,
   DEEPSEEK_FLASH_MODEL,
   DEEPSEEK_V4_FLASH_MODEL,
   DEFAULT_MODEL_KEY,
@@ -838,6 +839,70 @@ Deno.test("openai: DeepSeek request projection translates the documented wire co
   // The provider's published pro model is served under its own canonical id.
   assert.equal(projectDeepSeekRequest({ model: DEEPSEEK_FLASH_MODEL }, "deepseek-v4-pro").model, "deepseek-v4-pro");
   assert.throws(() => projectDeepSeekRequest({ model: DEEPSEEK_FLASH_MODEL }, "deepseek-v4-nope"), /not configured/);
+});
+
+Deno.test("openai: DeepSeek Chat projection translates developer messages and preserves the caller's order and content", async () => {
+  const envKey = "DEEPSEEK_API_KEY";
+  const originalApiKey = Deno.env.get(envKey);
+  const callerMessages = [
+    { role: "developer", content: "Answer in one short sentence." },
+    { role: "assistant", content: "Earlier reply." },
+    { role: "user", content: "ping" },
+  ];
+  Deno.env.set(envKey, "deepseek-test-key");
+  // A captured call list rather than mutable locals: the checker does not track
+  // an assignment made inside the fetch-mock closure, so a nullable local would
+  // narrow to `never` at the assertions below.
+  const upstreamCalls: { url: string; body: string | null }[] = [];
+  try {
+    const response = await withFetchMock(
+      (url, bodyText) => {
+        upstreamCalls.push({ url, body: bodyText });
+        return Response.json({
+          id: "deepseek-developer-role-1",
+          object: "chat.completion",
+          created: 1_780_000_000,
+          model: DEEPSEEK_FLASH_MODEL,
+          choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
+        });
+      },
+      () =>
+        handleChatCompletions(
+          new Request("https://ai.ubq.fi/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: DEEPSEEK_FLASH_MODEL, messages: callerMessages, stream: false }),
+          })
+        )
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamCalls.length, 1);
+    assert.equal(upstreamCalls[0].url, DEEPSEEK_CHAT_COMPLETIONS_URL);
+    const upstreamBody = upstreamCalls[0].body;
+    assert.ok(upstreamBody);
+    // DeepSeek's Chat contract defines no `developer` role: the outbound bytes
+    // carry `system`, and no `developer` value reaches the provider.
+    assert.ok(upstreamBody.includes('"role":"system"'));
+    assert.equal(upstreamBody.includes("developer"), false);
+    assert.deepEqual((JSON.parse(upstreamBody) as Record<string, unknown>).messages, [
+      { role: "system", content: "Answer in one short sentence." },
+      { role: "assistant", content: "Earlier reply." },
+      { role: "user", content: "ping" },
+    ]);
+    // The caller's own request record is never rewritten in place.
+    assert.deepEqual(callerMessages, [
+      { role: "developer", content: "Answer in one short sentence." },
+      { role: "assistant", content: "Earlier reply." },
+      { role: "user", content: "ping" },
+    ]);
+    const payload = (await response.json()) as Record<string, unknown>;
+    assert.equal(payload.object, "chat.completion");
+    assert.deepEqual(payload.choices, [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }]);
+  } finally {
+    if (originalApiKey === undefined) Deno.env.delete(envKey);
+    else Deno.env.set(envKey, originalApiKey);
+  }
 });
 
 Deno.test("openai: unsupported snapshot model is rejected before upstream fetch", async () => {
