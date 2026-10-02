@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { CountingKv } from "./helpers/counting-kv.ts";
+import { CODEX_REFRESH_TOKEN_URL } from "../src/codex/auth.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, CodexAuthState } from "../src/types.ts";
 import { LIVE_CALL_MAX_BODY_BYTES } from "../src/live/upstream.ts";
 import { sha256Base64Url } from "../src/utils.ts";
@@ -35,6 +36,33 @@ const codexAccount = (accountId: string, nowMs: number): CodexAuthState => ({
   updated_at_ms: nowMs,
 });
 
+const encodeBase64Url = (value: unknown): string =>
+  btoa(JSON.stringify(value))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/={1,2}$/u, "");
+
+/** A decodable JWT-shaped token; only `exp` matters to the refresh decision. */
+const jwtLike = (payload: unknown): string => `${encodeBase64Url({ alg: "none" })}.${encodeBase64Url(payload)}.signature`;
+
+/** A credential whose JWT expiry is already past, so the coordinated path must refresh it. */
+const expiredCodexAccount = (accountId: string): CodexAuthState => ({
+  account_id: accountId,
+  access_token: jwtLike({ exp: Math.floor((Date.now() - 60_000) / 1_000) }),
+  refresh_token: `${accountId}-refresh-token`,
+  updated_at_ms: Date.now(),
+});
+
+/** The synthetic credential pair the controlled refresh endpoint answers with. */
+const REFRESH_ACCESS_TOKEN = "live-calls-refreshed-access-token";
+const REFRESH_REFRESH_TOKEN = "live-calls-refreshed-refresh-token";
+
+type RefreshCall = Readonly<{ url: string; refreshToken: string | null }>;
+
+type RefreshResponder = (call: RefreshCall) => Response;
+
+type LiveCallsFixtureOptions = Readonly<{ accounts?: readonly CodexAuthState[] }>;
+
 /** The client's exact byte layout: CRLF-delimited parts `sdp` then `session`. */
 const realtimeCallBody = (sdp: string, session: unknown): string =>
   `--${BOUNDARY}\r\nContent-Disposition: form-data; name="sdp"\r\nContent-Type: application/sdp\r\n\r\n${sdp}\r\n` +
@@ -50,7 +78,9 @@ type LiveCallsFixture = {
   readonly token: string;
   readonly gatewayBaseUrl: string;
   readonly upstreamCalls: UpstreamCall[];
+  readonly refreshCalls: RefreshCall[];
   setResponder: (responder: LiveCallsResponder) => void;
+  setRefreshResponder: (responder: RefreshResponder) => void;
   setAuthPool: (accounts: readonly CodexAuthState[]) => Promise<void>;
   stopUpstream: () => Promise<void>;
   close: () => Promise<void>;
@@ -58,7 +88,7 @@ type LiveCallsFixture = {
 
 const acceptedAnswer = (): Response => new Response(SDP_ANSWER, { status: 201, headers: { Location: `/v1/realtime/calls/${CALL_ID}` } });
 
-const startLiveCallsFixture = async (responder: LiveCallsResponder): Promise<LiveCallsFixture> => {
+const startLiveCallsFixture = async (responder: LiveCallsResponder, options: LiveCallsFixtureOptions = {}): Promise<LiveCallsFixture> => {
   const { setKvForTest } = await import("../src/kv.ts");
   const { resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
   const { resetCodexAccountRoutingForTest } = await import("../src/codex/account-routing.ts");
@@ -69,7 +99,9 @@ const startLiveCallsFixture = async (responder: LiveCallsResponder): Promise<Liv
 
   const kv = new CountingKv();
   const upstreamCalls: UpstreamCall[] = [];
+  const refreshCalls: RefreshCall[] = [];
   let activeResponder = responder;
+  let activeRefreshResponder: RefreshResponder = (_call) => Response.json({ access_token: REFRESH_ACCESS_TOKEN, refresh_token: REFRESH_REFRESH_TOKEN });
   const originalDeployFlag = config.isDeploy;
   const originalInfo = console.info;
   const originalWarn = console.warn;
@@ -84,9 +116,29 @@ const startLiveCallsFixture = async (responder: LiveCallsResponder): Promise<Liv
   (config as { isDeploy: boolean }).isDeploy = true;
 
   const now = Date.now();
-  await kv.set(["ubq_ai", "codex_auth"], { accounts: [codexAccount(ACCOUNT_A, now), codexAccount(ACCOUNT_B, now)], updated_at_ms: now });
+  const accounts = options.accounts ?? [codexAccount(ACCOUNT_A, now), codexAccount(ACCOUNT_B, now)];
+  await kv.set(["ubq_ai", "codex_auth"], { accounts, updated_at_ms: now });
   const token = `u_${"c".repeat(64)}`;
   await seedApiKey(kv, token, now);
+
+  // The refresh URL is a module constant, so the fixture redirects that exact
+  // URL to a real loopback endpoint; no production refresh code or upstream
+  // auth server is involved.
+  const refreshServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, async (request) => {
+    const body = JSON.parse(await request.text()) as Record<string, unknown>;
+    const call: RefreshCall = { url: request.url, refreshToken: typeof body.refresh_token === "string" ? body.refresh_token : null };
+    refreshCalls.push(call);
+    return activeRefreshResponder(call);
+  });
+  const refreshEndpointUrl = `http://127.0.0.1:${(refreshServer.addr as Deno.NetAddr).port}/oauth/token`;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    let target: string;
+    if (typeof input === "string") target = input;
+    else if (input instanceof URL) target = input.href;
+    else target = input.url;
+    return originalFetch(target === CODEX_REFRESH_TOKEN_URL ? refreshEndpointUrl : input, init);
+  };
 
   const upstreamServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, async (request) => {
     const bodyText = await request.text();
@@ -104,11 +156,15 @@ const startLiveCallsFixture = async (responder: LiveCallsResponder): Promise<Liv
     token,
     gatewayBaseUrl: `http://127.0.0.1:${(gatewayServer.addr as Deno.NetAddr).port}`,
     upstreamCalls,
+    refreshCalls,
     setResponder: (next) => {
       activeResponder = next;
     },
-    setAuthPool: async (accounts) => {
-      await kv.set(["ubq_ai", "codex_auth"], { accounts, updated_at_ms: Date.now() });
+    setRefreshResponder: (next) => {
+      activeRefreshResponder = next;
+    },
+    setAuthPool: async (nextAccounts) => {
+      await kv.set(["ubq_ai", "codex_auth"], { accounts: nextAccounts, updated_at_ms: Date.now() });
     },
     stopUpstream: async () => {
       if (upstreamStopped) return;
@@ -119,12 +175,14 @@ const startLiveCallsFixture = async (responder: LiveCallsResponder): Promise<Liv
       console.info = originalInfo;
       console.warn = originalWarn;
       (config as { isDeploy: boolean }).isDeploy = originalDeployFlag;
+      globalThis.fetch = originalFetch;
       setLiveUpstreamBasesForTest({ callsBaseUrl: null, sidebandBaseUrl: null });
       setKvForTest(null);
       resetCodexAuthCacheForTest();
       resetCodexAccountRoutingForTest();
       await gatewayServer.shutdown();
       await upstreamServer.shutdown();
+      await refreshServer.shutdown();
     },
   };
 };
@@ -399,6 +457,74 @@ Deno.test({
       assert.equal(response.status, 401, body);
       assert.equal(body, '{"detail":"credential expired"}');
       assert.equal(fixture.upstreamCalls.length, 1, "the reloaded pool still offers only the failed account");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "POST /v1/live refreshes the selected account's expired token before dispatch and leaves other accounts untouched",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const untouchedAccount = codexAccount(ACCOUNT_B, Date.now());
+    const fixture = await startLiveCallsFixture(() => acceptedAnswer(), { accounts: [expiredCodexAccount(ACCOUNT_A), untouchedAccount] });
+    try {
+      const response = await postLiveCall(fixture);
+      const body = await response.text();
+      assert.equal(response.status, 201, body);
+      assert.equal(body, SDP_ANSWER);
+
+      const upstream = fixture.upstreamCalls.at(-1);
+      assert.ok(upstream, "the call reached the upstream");
+      assert.equal(upstream.headers.get("chatgpt-account-id"), ACCOUNT_A);
+      assert.equal(
+        upstream.headers.get("authorization"),
+        `Bearer ${REFRESH_ACCESS_TOKEN}`,
+        "the dispatch carries the refreshed credential instead of the expired bearer the routing read exposed"
+      );
+      assert.equal(fixture.refreshCalls.length, 1, "the expired account is refreshed exactly once");
+      assert.equal(fixture.refreshCalls[0]?.refreshToken, `${ACCOUNT_A}-refresh-token`, "the refresh re-read the selected account by identity");
+
+      const storedPool = fixture.kv.entries.get(JSON.stringify(["ubq_ai", "codex_auth"]))?.value as { accounts?: CodexAuthState[] } | undefined;
+      const refreshed = storedPool?.accounts?.find((account) => account.account_id === ACCOUNT_A);
+      assert.equal(refreshed?.access_token, REFRESH_ACCESS_TOKEN, "the rotated credential is persisted under the same account identity");
+      assert.equal(refreshed.refresh_token, REFRESH_REFRESH_TOKEN);
+      const untouched = storedPool?.accounts?.find((account) => account.account_id === ACCOUNT_B);
+      assert.deepEqual(untouched, untouchedAccount, "an unrelated account's credential is left exactly as seeded");
+
+      const mapping = fixture.kv.entries.get(JSON.stringify(["uos_ai", "codex_live_calls", "v1", CALL_ID]))?.value;
+      assert.equal((mapping as { account_id?: unknown } | undefined)?.account_id, ACCOUNT_A, "the call keeps its creating account identity");
+      assert.equal((mapping as { principal_id?: unknown } | undefined)?.principal_id, PRINCIPAL, "the creator-principal binding is preserved");
+    } finally {
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "POST /v1/live fails closed when the selected account disappears while its token is refreshing",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    let fixture: LiveCallsFixture | null = null;
+    fixture = await startLiveCallsFixture(() => acceptedAnswer(), { accounts: [expiredCodexAccount(ACCOUNT_A), codexAccount(ACCOUNT_B, Date.now())] });
+    fixture.setRefreshResponder(() => {
+      // The account leaves the pool while its refresh is in flight, so its
+      // rotated credential can never be persisted for it.
+      void fixture.setAuthPool([codexAccount(ACCOUNT_B, Date.now())]);
+      return Response.json({ access_token: REFRESH_ACCESS_TOKEN, refresh_token: REFRESH_REFRESH_TOKEN });
+    });
+    try {
+      const response = await postLiveCall(fixture);
+      const error = await errorPayload(response);
+      assert.equal(response.status, 503, JSON.stringify(error));
+      assert.equal(error.code, "codex_auth_missing");
+      assert.equal(fixture.upstreamCalls.length, 0, "a disappeared account dispatches no credential at all");
+      assert.equal(fixture.refreshCalls.length, 1);
     } finally {
       await fixture.close();
     }
