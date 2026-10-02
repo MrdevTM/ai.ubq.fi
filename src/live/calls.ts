@@ -2,6 +2,7 @@
 // into the ChatGPT backend JSON shape and relay the answer verbatim.
 
 import { CODEX_QUOTA_BLOCKED_ERROR_CODE, CodexError, getAuthPoolEntry } from "../codex/auth.ts";
+import { getCurrentAccountEntry, getValidAuth } from "../codex/auth-refresh.ts";
 import { selectCodexRoutingAccountsStrong } from "../codex/account-routing.ts";
 import {
   awaitPendingCodexProbeTransitions,
@@ -12,6 +13,7 @@ import {
   routingErrorResponse,
 } from "../codex/dispatch.ts";
 import type { RouteSelection, RoutingAccount } from "../codex/routing-state.ts";
+import type { CodexAuthState } from "../types.ts";
 import { readBoundedResponseBody } from "../bounded-response-body.ts";
 import { openaiError } from "../http.ts";
 import { getString, isRecord } from "../utils.ts";
@@ -158,6 +160,31 @@ const selectLiveCallAccount = async (attemptedAccountIds: ReadonlySet<string>, m
   return { ok: true, account };
 };
 
+type LiveCallAttempt = Readonly<{ ok: true; accountId: string; auth: CodexAuthState }> | Readonly<{ ok: false; response: Response }>;
+
+/**
+ * Routing selects the account; the credential that is actually dispatched comes
+ * from the same coordinated path ordinary inference uses. The selected account
+ * is re-read by identity and refreshed if stale, so call creation never sends
+ * the expired bearer a cached routing read happened to expose, and an account
+ * that disappeared between the routing read and the dispatch fails closed.
+ */
+const resolveLiveCallAttempt = async (attemptedAccountIds: ReadonlySet<string>, model: string | null): Promise<LiveCallAttempt> => {
+  const selection = await selectLiveCallAccount(attemptedAccountIds, model);
+  if (!selection.ok) return { ok: false, response: selection.response };
+  const accountId = selection.account.auth.account_id;
+  try {
+    const current = await getCurrentAccountEntry(accountId, true);
+    return { ok: true, accountId, auth: await getValidAuth(current) };
+  } catch (error) {
+    if (error instanceof CodexError) {
+      const status = error.status === 401 || error.status === 404 || error.status === 429 ? error.status : 503;
+      return { ok: false, response: routingErrorResponse(status, error.message, error.code) };
+    }
+    return { ok: false, response: routingErrorResponse(503, "Codex auth pool is temporarily unavailable; retry the request.", "codex_auth_missing") };
+  }
+};
+
 const liveCallDispatchFailureResponse = (error: unknown): Response => {
   if (error instanceof CodexError) {
     const status = error.status >= 400 && error.status <= 599 ? error.status : 502;
@@ -215,19 +242,19 @@ export const handleLiveCallCreate = async (req: Request, principal: string): Pro
   let captured: Response | null = null;
 
   for (let attempt = 1; attempt <= LIVE_CALL_MAX_UPSTREAM_ATTEMPTS; attempt += 1) {
-    const selection = await selectLiveCallAccount(attemptedAccountIds, model);
-    if (!selection.ok) return captured ?? selection.response;
-    const accountId = selection.account.auth.account_id;
+    const resolved = await resolveLiveCallAttempt(attemptedAccountIds, model);
+    if (!resolved.ok) return captured ?? resolved.response;
+    const { accountId, auth } = resolved;
     attemptedAccountIds.add(accountId);
 
     let upstream: Response;
     try {
-      upstream = await fetchCodexResponseWithAuth(selection.account.auth, liveCallsUrl(), serializedBody, headers, req.signal);
+      upstream = await fetchCodexResponseWithAuth(auth, liveCallsUrl(), serializedBody, headers, req.signal);
     } catch (error) {
       await recordCodexThrownHealth(accountId, error);
       return captured ?? liveCallDispatchFailureResponse(error);
     }
-    await recordCodexResponseHealth(accountId, upstream, selection.account.auth, "success");
+    await recordCodexResponseHealth(accountId, upstream, auth, "success");
 
     const credentialFailure = upstream.status === 401 || upstream.status === 403;
     if (!credentialFailure || attempt === LIVE_CALL_MAX_UPSTREAM_ATTEMPTS) return await relayLiveCallResponse(upstream, accountId, principal);
