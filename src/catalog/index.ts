@@ -1,5 +1,5 @@
 import { fetchCodexModels, loadFullCodexModelsSnapshot } from "../codex/index.ts";
-import { loadCodexModelsWhitelist, filterWhitelistedCatalogModels } from "../models/codex-models-whitelist.ts";
+import { type CodexModelsWhitelist, filterWhitelistedCatalogModels, loadCodexModelsWhitelist } from "../models/codex-models-whitelist.ts";
 import { parseCodexClientVersion } from "../models/codex-models.ts";
 import { openaiError } from "../http.ts";
 import { getKv } from "../kv.ts";
@@ -83,17 +83,22 @@ const enabledPaidCatalogSources = async (selection: ProviderSelection | null, op
 };
 
 /**
- * Apply the operator's curated whitelist to the gateway-hosted rows, then
- * append OpenRouter's own dynamic catalogue: those rows come from the upstream
- * snapshot and refresh on its TTL, so they stay listed without an operator
- * re-save while every curated id above stays gated.
+ * Apply the operator's curated whitelist to every row this response advertises.
+ * OpenRouter's dynamic catalogue contributes its rows before the filter rather
+ * than after it: the enabled-model policy is the authority a Codex client
+ * selects from, so a row the operator did not enable must not reach it.
+ *
+ * An empty or absent whitelist is no filter at all, so OpenRouter's rows then
+ * list on their own snapshot TTL without an operator re-save.
  */
-const applyCatalogWhitelist = async (models: readonly Record<string, unknown>[], openRouterEnabled: boolean): Promise<Record<string, unknown>[]> => {
-  const kv = await getKv();
-  const whitelist = kv ? await loadCodexModelsWhitelist(kv) : null;
-  const filtered = filterWhitelistedCatalogModels(models, whitelist);
-  return openRouterEnabled ? withOpenRouterModels(filtered) : filtered;
-};
+const applyCatalogWhitelist = (
+  models: readonly Record<string, unknown>[],
+  openRouterEnabled: boolean,
+  whitelist: CodexModelsWhitelist | null
+): Record<string, unknown>[] => filterWhitelistedCatalogModels(openRouterEnabled ? withOpenRouterModels(models) : models, whitelist);
+
+/** Whether the operator's curated whitelist currently narrows the catalog. */
+const catalogWhitelistIsActive = (whitelist: CodexModelsWhitelist | null): boolean => whitelist !== null && whitelist.model_ids.length > 0;
 
 const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheState: string): Promise<Response> => {
   // Rows this response appends are resolved dynamically, so start an enrichment
@@ -112,8 +117,10 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   const lithosEnabled = isProviderEnabled("lithos", selection);
   const cerebrasEnabled = isProviderEnabled("cerebras", selection);
   // OpenRouter serves its own dynamic catalogue on both OpenAI wires; its rows
-  // are appended after the operator whitelist below.
+  // are appended before the operator whitelist below, which is the final say.
   const openRouterEnabled = isProviderEnabled("openrouter", selection) && readOpenRouterApiKey() !== null;
+  const catalogKv = await getKv();
+  const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
   const [metered, surplus] = await enabledPaidCatalogSources(selection);
   const nowMs = Date.now();
   if (metered) refreshExpiredModelList(nowMs, metered.updated_at_ms, METERED_MODELS_CACHE_TTL_MS, fetchMeteredModels);
@@ -123,8 +130,17 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   // provider that is still switched on.
   // A provider that can append rows keeps the response off the stored-body
   // short circuit, so an appended row is never dropped by answering with the
-  // catalog body alone.
-  if (!paidModels.length && !deepSeekEnabled && !lithosEnabled && !cerebrasEnabled && !openRouterEnabled && codexEnabled)
+  // catalog body alone. An active whitelist does the same: the stored body is
+  // the unfiltered upstream catalog, so it must not short-circuit the filter.
+  if (
+    !catalogWhitelistIsActive(catalogWhitelist) &&
+    !paidModels.length &&
+    !deepSeekEnabled &&
+    !lithosEnabled &&
+    !cerebrasEnabled &&
+    !openRouterEnabled &&
+    codexEnabled
+  )
     return catalogOnlyResponse(catalog, req, headers);
   const parsed = {
     ...catalog.parsed,
@@ -138,11 +154,11 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
     seen.add(model.id);
   }
   // The official ids are appended first so an operator whitelist still has the
-  // final say over every gateway-hosted model.
+  // final say over every advertised model, this route included.
   parsed.models = deepSeekEnabled ? withDeepSeekOfficialModels(parsed.models) : parsed.models;
   parsed.models = lithosEnabled ? withLithosModels(parsed.models) : parsed.models;
   parsed.models = cerebrasEnabled ? withCerebrasModels(parsed.models) : parsed.models;
-  parsed.models = await applyCatalogWhitelist(parsed.models, openRouterEnabled);
+  parsed.models = applyCatalogWhitelist(parsed.models, openRouterEnabled, catalogWhitelist);
   const body = JSON.stringify(parsed);
   const etag = await catalogBodyEtag(body, catalog);
   if (etag) headers.set("ETag", etag);
@@ -166,13 +182,18 @@ const meteredCatalogResponse = async (selection: ProviderSelection | null): Prom
   // This path answers without a stored catalog, so the Codex snapshot is the only
   // place a Codex-served id's real window can come from.
   const codexRecords = codexSnapshotRecords(await loadFullCodexModelsSnapshot());
+  const rows = withOpenRouterModels(
+    withCerebrasModels(
+      withLithosModels(withDeepSeekOfficialModels(paidModels.map((model) => meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null))))
+    )
+  );
+  // Without a stored body this route still answers the versioned catalog a
+  // Codex client selects from, so the operator whitelist narrows it here too.
+  const kv = await getKv();
+  const whitelist = kv ? await loadCodexModelsWhitelist(kv) : null;
   return new Response(
     JSON.stringify({
-      models: withOpenRouterModels(
-        withCerebrasModels(
-          withLithosModels(withDeepSeekOfficialModels(paidModels.map((model) => meteredCodexModelRecord(model, codexRecords.get(model.id) ?? null))))
-        )
-      ),
+      models: filterWhitelistedCatalogModels(rows, whitelist),
     }),
     {
       status: 200,
