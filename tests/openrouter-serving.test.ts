@@ -140,7 +140,7 @@ class CatalogKv {
   }
 }
 
-Deno.test("openrouter catalogue rows stay listed while the operator whitelist hides gateway ids", async () => {
+Deno.test("the public catalogue lists only operator-enabled ids while an empty whitelist filters none", async () => {
   const meteredKey = Deno.env.get("METERED_API_KEY");
   const surplusKey = Deno.env.get("SURPLUS_API_KEY");
   Deno.env.delete("METERED_API_KEY");
@@ -160,7 +160,7 @@ Deno.test("openrouter catalogue rows stay listed while the operator whitelist hi
     codex_models: codexSnapshot,
     updated_at_ms: Date.now(),
   });
-  kv.values.set(keyOf([...CODEX_MODELS_WHITELIST_KV_KEY]), { model_ids: ["listed-codex-id"], updated_at_ms: 1 });
+  kv.values.set(keyOf([...CODEX_MODELS_WHITELIST_KV_KEY]), { model_ids: ["listed-codex-id", "vendor/alpha"], updated_at_ms: 1 });
   resetProviderSelectionCacheForTest();
   resetRuntimeConfigCacheForTest();
   setKvForTest(kv as unknown as Deno.Kv);
@@ -187,13 +187,32 @@ Deno.test("openrouter catalogue rows stay listed while the operator whitelist hi
       const entries = ((await catalog.json()) as { data: { id: string; providers: { id: string }[] }[] }).data;
       assert.deepEqual(
         entries.find((entry) => entry.id === "vendor/alpha")?.providers.map((provider) => provider.id),
-        ["openrouter"]
+        ["openrouter"],
+        "an enabled OpenRouter row stays on the public page"
+      );
+      assert.equal(
+        entries.some((entry) => entry.id === "listed-codex-id"),
+        true,
+        "an enabled gateway id stays on the public page"
       );
       assert.equal(
         entries.some((entry) => entry.id === "hidden-codex-id"),
         false,
         "the public catalogue still honors the whitelist"
       );
+      assert.equal(
+        entries.some((entry) => entry.id === "vendor/beta"),
+        false,
+        "a disabled OpenRouter row leaves the public page"
+      );
+
+      // An empty whitelist is the documented no-filter contract, so the dynamic
+      // OpenRouter rows return without an operator re-save.
+      kv.values.set(keyOf([...CODEX_MODELS_WHITELIST_KV_KEY]), { model_ids: [], updated_at_ms: 2 });
+      const unfiltered = await handlePublicModelCatalog();
+      const unfilteredIds = ((await unfiltered.json()) as { data: { id: string }[] }).data.map((entry) => entry.id);
+      assert.equal(unfilteredIds.includes("vendor/beta"), true, "an empty whitelist filters no OpenRouter row");
+      assert.equal(unfilteredIds.includes("hidden-codex-id"), true, "an empty whitelist restores every gateway id");
     });
   } finally {
     setKvForTest(null);
