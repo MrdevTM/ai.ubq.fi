@@ -10,12 +10,15 @@
 // constrained to the typesafe namespace so a shared credential cannot be used
 // to reach unrelated OpenRouter models.
 
+import { ApiKeyQuotaDispatchError } from "../api-key-policy.ts";
 import { openaiError } from "../http.ts";
 import {
   attachResponseTelemetry,
   createResponseTelemetryState,
   extractUsageTokens,
   recordCompletionUsage,
+  recordFirstProviderDispatch,
+  recordFirstProviderHeaders,
   recordRequestUsage,
   type UsageContext,
 } from "../openai-telemetry.ts";
@@ -23,6 +26,7 @@ import { fetchOpenRouterSystemOne, OpenRouterError, type OpenRouterFetch } from 
 import { recordOpenRouterProviderHealth } from "../provider/health.ts";
 import { isProviderEnabled, loadProviderSelectionCached } from "../provider/selection.ts";
 import { readJsonBody } from "../request.ts";
+import { apiKeyQuotaDispatchErrorResponse } from "../upstream-wire.ts";
 import { getString, isRecord } from "../utils.ts";
 
 export const SYSTEMONE_DEFAULT_MODEL = "~typesafe/jev-latest";
@@ -134,6 +138,27 @@ const SYSTEMONE_ERROR_MESSAGES: Readonly<Record<OpenRouterError["code"], string>
   openrouter_upstream_invalid_response: "System One upstream invalid response",
 });
 
+/**
+ * Maps one System One dispatch failure. The API-key reservation refusal is a
+ * quota answer with its own status and quota headers and must not fall through
+ * to the generic upstream mapping; an upstream OpenRouter failure keeps its
+ * existing health classification. Anything else is rethrown unchanged.
+ */
+const systemOneDispatchFailure = (error: unknown): Response => {
+  if (error instanceof ApiKeyQuotaDispatchError) return apiKeyQuotaDispatchErrorResponse(error);
+  if (error instanceof OpenRouterError) {
+    if (error.code === "openrouter_upstream_error" && error.upstreamStatus !== null) {
+      recordSystemOneResponseHealth(error.upstreamStatus);
+    } else if (error.code !== "openrouter_api_key_missing") {
+      // Unreachable transport or an unusable body: not healthy, and there is
+      // no upstream status to classify.
+      void recordOpenRouterProviderHealth("upstream_error", null, Date.now);
+    }
+    return openaiError(error.status, SYSTEMONE_ERROR_MESSAGES[error.code], error.code);
+  }
+  throw error;
+};
+
 /** Validates the bounded request envelope; a `Response` is the client-facing refusal. */
 const parseSystemOneRequest = (raw: Record<string, unknown>): SystemOneRequest | Response => {
   const unsupported = unsupportedKeyError(raw);
@@ -182,19 +207,18 @@ export const handleSystemOne = async (req: Request, usageContext?: UsageContext,
       body: { model: upstreamModelFor(model), state: request.state, questions: request.questions },
       ...(deps.apiKey ? { apiKey: deps.apiKey() } : {}),
       ...(deps.fetcher ? { fetcher: deps.fetcher } : {}),
+      hooks: {
+        beforeDispatch: () => context.beforeProviderDispatch?.("openrouter") ?? Promise.resolve(undefined),
+        onDispatch: () => {
+          recordFirstProviderDispatch(context);
+        },
+        onHeaders: () => {
+          recordFirstProviderHeaders(context);
+        },
+      },
     });
   } catch (error) {
-    if (error instanceof OpenRouterError) {
-      if (error.code === "openrouter_upstream_error" && error.upstreamStatus !== null) {
-        recordSystemOneResponseHealth(error.upstreamStatus);
-      } else if (error.code !== "openrouter_api_key_missing") {
-        // Unreachable transport or an unusable body: not healthy, and there
-        // is no upstream status to classify.
-        void recordOpenRouterProviderHealth("upstream_error", null, Date.now);
-      }
-      return openaiError(error.status, SYSTEMONE_ERROR_MESSAGES[error.code], error.code);
-    }
-    throw error;
+    return systemOneDispatchFailure(error);
   }
 
   if (!isRecord(payload.answers)) {
