@@ -186,14 +186,22 @@ const getRequestPath = (req: Request): string => {
   }
 };
 
-const isLocalClientAuthDisabledRequest = (req: Request): boolean => {
-  if (isAdminAuthDisabledForRequest(req)) return true;
-  if (config.isDeploy || runtimeGitSha() !== "unknown") return false;
+/**
+ * How a local development request is admitted. `"admin"` is the fully checked
+ * listener bypass (a bound loopback peer plus origin checks); `"legacy"` is the
+ * hostname-only fallback for a checkout whose Git revision is unknown, which
+ * stays policy-free. `null` means neither applies.
+ */
+type LocalClientAuthMode = "admin" | "legacy" | null;
+
+const resolveLocalClientAuthMode = (req: Request): LocalClientAuthMode => {
+  if (isAdminAuthDisabledForRequest(req)) return "admin";
+  if (config.isDeploy || runtimeGitSha() !== "unknown") return null;
   try {
     const hostname = new URL(req.url).hostname.toLowerCase();
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]" ? "legacy" : null;
   } catch {
-    return false;
+    return null;
   }
 };
 
@@ -342,9 +350,32 @@ const logUnknownClientAuth = (logClientAuth: ClientAuthLogger, githubCandidate: 
   });
 };
 
+const authenticateLocalClient = async (
+  mode: Exclude<LocalClientAuthMode, null>,
+  kv: Awaited<ReturnType<typeof getKv>>,
+  token: string | null,
+  logClientAuth: ClientAuthLogger
+): Promise<AuthenticateClientResult> => {
+  // A loopback development server provisions one unlimited local key so the
+  // fully checked listener bypass is a super admin with a real paid-provider
+  // policy. The key is optional: without it (or once it is revoked) the
+  // principal stays policy-free, exactly as before.
+  //
+  // The hostname-only legacy fallback never resolves that key: it applies only
+  // after the peer/origin checks failed, so a mismatching-Origin request stays
+  // policy-free instead of receiving the paid super-admin principal.
+  const localDevelopmentPolicy = mode === "admin" ? await resolveLocalDevelopmentApiKeyPolicy(kv) : null;
+  if (localDevelopmentPolicy) {
+    logClientAuth({ ok: true, method: "local_development_key" });
+    return { ok: true, token, method: { kind: "kv_api_key", key_id: localDevelopmentPolicy.key_id, policy: localDevelopmentPolicy } };
+  }
+  logClientAuth({ ok: true, method: "disabled" });
+  return { ok: true, token, method: { kind: "disabled" } };
+};
+
 export const authenticateClient = async (req: Request): Promise<AuthenticateClientResult> => {
   const kv = await getKv();
-  const localAuthDisabled = isLocalClientAuthDisabledRequest(req);
+  const localAuthMode = resolveLocalClientAuthMode(req);
   const token = getBearerToken(req);
   const tokenPresent = Boolean(token);
   const tokenShape = token ? classifyToken(token) : null;
@@ -358,23 +389,7 @@ export const authenticateClient = async (req: Request): Promise<AuthenticateClie
       ...entry,
     });
   };
-  if (localAuthDisabled) {
-    // A loopback development server provisions one unlimited local key so the
-    // bypass principal is a super admin with a real paid-provider policy. The
-    // key is optional: without it (or once it is revoked) the principal stays
-    // policy-free, exactly as before.
-    const localDevelopmentPolicy = await resolveLocalDevelopmentApiKeyPolicy(kv);
-    if (localDevelopmentPolicy) {
-      logClientAuth({ ok: true, method: "local_development_key" });
-      return {
-        ok: true,
-        token,
-        method: { kind: "kv_api_key", key_id: localDevelopmentPolicy.key_id, policy: localDevelopmentPolicy },
-      };
-    }
-    logClientAuth({ ok: true, method: "disabled" });
-    return { ok: true, token, method: { kind: "disabled" } };
-  }
+  if (localAuthMode !== null) return await authenticateLocalClient(localAuthMode, kv, token, logClientAuth);
 
   if (!token) return await authenticateClientWithoutToken(req, logClientAuth);
 
@@ -723,7 +738,7 @@ export const handleV1Auth = async (req: Request): Promise<Response> => {
   if (!authResult.ok) return authResult.response;
 
   const kv = await getKv();
-  const localClientAuthDisabled = isLocalClientAuthDisabledRequest(req);
+  const localClientAuthDisabled = resolveLocalClientAuthMode(req) !== null;
   const mode = resolveV1AuthMode(localClientAuthDisabled, kv);
 
   const token = authResult.token;
