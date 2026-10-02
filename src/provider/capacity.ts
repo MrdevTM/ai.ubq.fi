@@ -67,6 +67,14 @@ import {
 
 export const PROVIDER_CAPACITY_SNAPSHOT_RETENTION_MS = PROVIDER_CAPACITY_HISTORY_RETENTION_MS;
 
+/**
+ * How long a persisted capacity snapshot satisfies a normal admin read before
+ * the read revalidates it. This matches the Analytics client's visible poll, and
+ * is deliberately shorter than the fifteen-minute history bucket: refreshing a
+ * value overwrites that bucket's point instead of adding one.
+ */
+export const PROVIDER_CAPACITY_READ_FRESH_MS = 30_000;
+
 export {
   PROVIDER_CAPACITY_CODEX_TIMEOUT_MS,
   PROVIDER_CAPACITY_COLD_WAIT_MS,
@@ -431,12 +439,15 @@ const waitForCapacitySnapshot = async (kv: Deno.Kv, previousSnapshotAtMs: number
   const deadline = Date.now() + PROVIDER_CAPACITY_COLD_WAIT_MS;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
-    const [snapshot, lease] = await Promise.all([readCapacitySnapshot(kv), kv.get<CapacityLease>(PROVIDER_CAPACITY_LEASE_KEY).catch(() => null)]);
-    const leaseFinished = !lease?.value || lease.value.lease_until_ms <= Date.now();
-    if (snapshot && (previousSnapshotAtMs === null || snapshot.snapshot_at_ms !== previousSnapshotAtMs || leaseFinished)) {
-      return snapshot;
-    }
-    if (!snapshot && leaseFinished) return null;
+    // Read the lease before the snapshot. The durable commit that writes a new
+    // snapshot deletes the lease in the same atomic operation, so once a
+    // released lease is observed the following snapshot read already includes
+    // that commit. Reading both concurrently could pair the old snapshot with
+    // the released lease and return stale data while fresh data is durable.
+    const lease = await kv.get<CapacityLease>(PROVIDER_CAPACITY_LEASE_KEY).catch(() => null);
+    const snapshot = await readCapacitySnapshot(kv);
+    if (snapshot && (previousSnapshotAtMs === null || snapshot.snapshot_at_ms !== previousSnapshotAtMs)) return snapshot;
+    if (!lease?.value) return snapshot;
   }
   return null;
 };
@@ -564,6 +575,9 @@ export const sampleProviderCapacityOnEvent = async (options: ProviderCapacitySna
   }
 };
 
+const capacityViewIsFresh = (view: ProviderCapacityView, nowMs: number): boolean =>
+  view.cache_state !== "unavailable" && nowMs - view.snapshot_at_ms < PROVIDER_CAPACITY_READ_FRESH_MS;
+
 export const handleProviderCapacity = async (
   request: Request = new Request("https://ai.ubq.fi/admin/providers/capacity"),
   options: ProviderCapacitySnapshotOptions = {}
@@ -571,7 +585,20 @@ export const handleProviderCapacity = async (
   const promptCache = readPromptCacheAnalytics({ kv: options.kv, now: options.now });
   try {
     const live = new URL(request.url).searchParams.get("refresh") === "live";
-    const view = live ? await refreshProviderCapacity(options) : await getPersistedProviderCapacityView(options);
+    // `?refresh=live` keeps forcing an operator probe. A normal read serves the
+    // persisted snapshot while it is inside the read freshness window and
+    // otherwise revalidates through the same lease-guarded refresh, so the
+    // thirty-second admin poll sees current quota without stacking duplicate
+    // upstream calls: concurrent stale reads coalesce on the shared lease and
+    // its bounded cold wait. A refresh that throws keeps the last known
+    // snapshot; a refresh that reaches upstream but fails leaves the affected
+    // source unavailable rather than fabricating a percentage.
+    const cached = await getPersistedProviderCapacityView(options).catch(() => null);
+    if (!live && cached && capacityViewIsFresh(cached, safeNow(options.now ?? Date.now))) {
+      return json(200, { ...cached, prompt_cache: await promptCache }, { "Cache-Control": "no-store" });
+    }
+    const refreshed = await refreshProviderCapacity(options).catch(() => null);
+    const view = refreshed ?? cached ?? unavailableView(Date.now(), [], [], [], []);
     return json(200, { ...view, prompt_cache: await promptCache }, { "Cache-Control": "no-store" });
   } catch {
     return json(200, { ...unavailableView(Date.now(), [], [], [], []), prompt_cache: await promptCache }, { "Cache-Control": "no-store" });
