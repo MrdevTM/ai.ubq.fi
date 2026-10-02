@@ -543,6 +543,24 @@ const finalizedLedger = (
   };
 };
 
+/** Ownerless legacy victims retain a tombstone without inventing a request-status row. */
+const applyClaimedVictimMetadata = (
+  operation: Deno.AtomicOperation,
+  existingStatus: Deno.KvEntryMaybe<unknown> | null,
+  statusRow: SentinelReplayCaptureStatusRow,
+  tombstoneKey: Deno.KvKey,
+  tombstone: Readonly<Record<string, unknown>>,
+  statusFits: boolean
+): Deno.AtomicOperation => {
+  let applied = operation;
+  if (existingStatus !== null) {
+    applied = applied.check({ key: existingStatus.key, versionstamp: existingStatus.versionstamp }).delete(existingStatus.key);
+  }
+  if (!statusFits) return applied;
+  applied = applied.set(tombstoneKey, tombstone, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS });
+  return existingStatus === null ? applied : applied.set(existingStatus.key, statusRow, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS });
+};
+
 /**
  * Delete one already-claimed victim's payload and release its charge in a single
  * atomic commit. The charge is released only after a fresh listing proves the
@@ -591,19 +609,25 @@ const finalizeClaimedVictim = async (
     reason: kind === "evicted" ? SENTINEL_REPLAY_EVICTION_REASON : SENTINEL_REPLAY_EXPIRED_REASON,
   };
   const statusKey = sentinelReplayRequestStatusKey(row.request_id);
+  const hasOwner = row.request_id !== "";
+  const statusRows = hasOwner ? 2 : 1;
   const tombstoneKey = sentinelReplayEvictionKey(row.fingerprint);
-  const statusBytes = sentinelReplayStatusMetadataBytes(statusRow) + sentinelReplayStatusMetadataBytes(tombstone);
-  await pruneCaptureOwnedStatusMetadata(kv, nowMs, 2, statusBytes, STATUS_PRUNE_BATCH, budgetBytes);
+  const statusBytes = (hasOwner ? sentinelReplayStatusMetadataBytes(statusRow) : 0) + sentinelReplayStatusMetadataBytes(tombstone);
+  await pruneCaptureOwnedStatusMetadata(kv, nowMs, statusRows, statusBytes, STATUS_PRUNE_BATCH, budgetBytes);
   // Read the rows this commit really replaces or deletes. The bound tracks the
   // live row set, so re-creating the victim status row and adding its tombstone
   // may move it only by the difference; the versionstamps checked below keep that
   // delta true while another writer touches those keys.
-  const [ledgerState, existingStatus, existingTombstone] = await Promise.all([readLedger(kv, budgetBytes), kv.get(statusKey), kv.get(tombstoneKey)]);
+  const [ledgerState, existingStatus, existingTombstone] = await Promise.all([
+    readLedger(kv, budgetBytes),
+    hasOwner ? kv.get(statusKey) : Promise.resolve(null),
+    kv.get(tombstoneKey),
+  ]);
   if (ledgerState.kind === "corrupt") return { finalized: false, chunks: cleanup.deleted };
   const ledger = withBudget(ledgerState.ledger, budgetBytes);
-  const existingStatusBytes = storedStatusMetadataBytes(existingStatus.value);
+  const existingStatusBytes = storedStatusMetadataBytes(existingStatus?.value);
   const existingTombstoneBytes = storedStatusMetadataBytes(existingTombstone.value);
-  const statusPresent = existingStatus.value === null ? 0 : 1;
+  const statusPresent = existingStatus === null || existingStatus.value === null ? 0 : 1;
   const tombstonePresent = existingTombstone.value === null ? 0 : 1;
   // The metadata bound is hard even during cleanup: when the reserve cannot take
   // the tombstone, the victim's bytes are still released below, but the bounded
@@ -612,9 +636,9 @@ const finalizeClaimedVictim = async (
   // Room for both rows means both are written; otherwise the status row is
   // deleted and any existing tombstone survives exactly as it was.
   const statusFits =
-    ledger.status_records + 2 - statusPresent - tombstonePresent <= SENTINEL_REPLAY_MAX_STATUS_RECORDS &&
+    ledger.status_records + statusRows - statusPresent - tombstonePresent <= SENTINEL_REPLAY_MAX_STATUS_RECORDS &&
     ledger.metadata_bytes + statusBytes - existingStatusBytes - existingTombstoneBytes <= metadataReserve;
-  const afterRecords = statusFits ? 2 : tombstonePresent;
+  const afterRecords = statusFits ? statusRows : tombstonePresent;
   const afterBytes = statusFits ? statusBytes : existingTombstoneBytes;
   const statusRecordsDelta = afterRecords - statusPresent - tombstonePresent;
   const metadataBytesDelta = afterBytes - existingStatusBytes - existingTombstoneBytes;
@@ -622,21 +646,14 @@ const finalizeClaimedVictim = async (
   const entry = await kv.get<SentinelReplayAccountingRow>(key);
   if (!isAccountingRow(entry.value) || entry.value.state !== "evicting") return { finalized: false, chunks: cleanup.deleted };
   fault("commit");
-  let operation = kv
+  const operation = kv
     .atomic()
     .check({ key: SENTINEL_REPLAY_BUDGET_LEDGER_KEY, versionstamp: ledgerState.versionstamp })
     .check({ key, versionstamp: entry.versionstamp })
-    .check({ key: statusKey, versionstamp: existingStatus.versionstamp })
     .check({ key: tombstoneKey, versionstamp: existingTombstone.versionstamp })
     .set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, nextLedger)
-    .delete(key)
-    .delete(statusKey);
-  if (statusFits) {
-    operation = operation
-      .set(statusKey, statusRow, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS })
-      .set(tombstoneKey, tombstone, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS });
-  }
-  const committed = await operation.commit();
+    .delete(key);
+  const committed = await applyClaimedVictimMetadata(operation, existingStatus, statusRow, tombstoneKey, tombstone, statusFits).commit();
   // A commit failure leaves the victim in `evicting` with its charge held for a
   // later pass; its bytes were fully removed, so nothing is double-charged.
   return { finalized: committed.ok, chunks: cleanup.deleted };
