@@ -467,7 +467,7 @@ Deno.test("deepseek responses: freeform tools round-trip through the function-on
     body.value.customToolNames
   );
   assert.deepEqual((payload.output as Record<string, unknown>[])[0], {
-    id: "resp_1_ctc_0_0",
+    id: "ctc_resp_1_0_0",
     type: "custom_tool_call",
     status: "completed",
     call_id: "call_1",
@@ -516,7 +516,7 @@ Deno.test("deepseek responses: a streamed freeform call emits custom tool events
   const completed = events.filter((event) => event.type === "response.completed");
   assert.equal(completed.length, 1);
   assert.deepEqual((completed[0].response as { output: Record<string, unknown>[] }).output, [
-    { id: "resp_1_fc_0", type: "custom_tool_call", status: "completed", call_id: "call_1", name: "exec", input: "text(hi);" },
+    { id: "ctc_resp_1_0", type: "custom_tool_call", status: "completed", call_id: "call_1", name: "exec", input: "text(hi);" },
   ]);
 });
 
@@ -691,7 +691,7 @@ Deno.test("deepseek responses: the reasoning item announces the index it answers
   // The item lifecycle must therefore exist before any later item advances the
   // index, and every reasoning event must name that item's own index and id.
   const responseId = "resp_reason_life";
-  const reasoningId = `${responseId}_rs_0`;
+  const reasoningId = `rs_${responseId}_0`;
   const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", responseId, echo, 1_780_000_000);
   const events: Record<string, unknown>[] = [];
   events.push(...translator.push(chatChunk({ role: "assistant", reasoning_content: "first " })));
@@ -773,7 +773,7 @@ Deno.test("deepseek responses: stream translator accumulates fragmented tool cal
   ]);
   const done = events.find((event) => event.type === "response.output_item.done") as { item: Record<string, unknown> };
   assert.deepEqual(done.item, {
-    id: "resp_tools_fc_0",
+    id: "fc_resp_tools_0",
     type: "function_call",
     status: "completed",
     call_id: "call_1",

@@ -36,6 +36,31 @@ Reversal risk: reverting to a single account's catalog hides per-account entitle
 account as quota-exhausted or credential-invalid writes fences, unlocks paid fallback, or wedges routing; learning from
 any 400 other than the exact upstream shape misattributes ordinary request errors and can skip a capable account.
 
+## Model-switch replay repairs gateway item ids and drops gateway-local reasoning - 2026-10-02
+
+The Chat-only Responses routes (DeepSeek, LithosAI, Cerebras) minted synthetic item ids as `${responseId}_<kind>_<n>`,
+but OpenAI validates replayed item ids by their type prefix (`rs`, `msg`, `fc`, `ctc`), so a Codex thread that had
+completed a DeepSeek turn failed every later `gpt-6.1-sol` turn with
+`Invalid 'input[n].id' ... Expected an ID that begins with 'fc'`; a replayed synthetic reasoning item also cannot be
+resolved under `store: false` (`Item with id ... not found`). The shared output builders now emit
+`<kind>_${responseId}_<n>` (the streamed custom tool call included, so it carries the same `ctc_` prefix the buffered
+builder uses), and `buildCodexRequest` is the Codex seam that repairs an already-stored history: a replayed reasoning
+item whose id matches either producer shape and carries no non-empty `encrypted_content` is dropped, every other
+recognized synthetic id (message, function call, custom tool call) loses only its `id` while keeping content, order and
+`call_id`, and genuine OpenAI ids, encrypted reasoning bytes, and the DeepSeek/LithosAI/Cerebras request bodies are
+untouched. The Responses assembler now forwards the builder's repaired `input` to the Codex upstream and hands the
+original input back to the removed-provider fallback, so only the Codex replay is repaired. Live probes: omitting one
+synthetic function-call id alone returned `response.completed` with `pong`, while an unencrypted reasoning item
+re-prefixed to `rs_` still answered 404.
+
+Reason: the upstream validator sees another provider's replayed history on a model switch, and a stateless
+(`store: false`) upstream can only resolve reasoning it can decrypt; both must be repaired at the one place that builds
+the Codex request.
+
+Reversal risk: widening the drop to every reasoning item without `encrypted_content` would discard items a `store: true`
+client can legitimately replay; matching ids by a loose `resp_` substring would rewrite genuine ids, so only the
+producer's exact `<kind>_...` shapes are recognized.
+
 ## The Codex-native catalog honors the operator whitelist for every assembled provider - 2026-10-02
 
 On 2026-10-02 the user's intent is that the enabled-model policy, the operator's model whitelist, controls what a Codex

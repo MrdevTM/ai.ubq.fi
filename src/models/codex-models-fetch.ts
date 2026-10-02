@@ -421,6 +421,45 @@ export const storeCodexModelsSnapshot = async (snapshot: CodexModelsSnapshot): P
   return false;
 };
 
+/**
+ * The item ids the gateway's own Chat-only Responses translators synthesize.
+ *
+ * The producer mints `responseId` as `resp_` plus up to 40 alphanumerics, so a
+ * gateway item id is `<responseId>_<kind>_<indexes>` in the legacy shape or
+ * `<kind>_<responseId>_<indexes>` once the kind carries its official prefix.
+ * Only those exact producer shapes are recognized, so a genuine OpenAI id is
+ * never rewritten. A replayed legacy id fails the upstream's prefix validation,
+ * and a replayed synthetic reasoning item cannot be looked up under
+ * `store: false`.
+ */
+const GATEWAY_RESPONSE_ID = "resp_[A-Za-z0-9]{1,40}";
+const GATEWAY_ITEM_IDS = [
+  new RegExp(`^${GATEWAY_RESPONSE_ID}_(?:rs|msg|fc|ctc)(?:_\\d+){1,2}$`),
+  new RegExp(`^(?:rs|msg|fc|ctc)_${GATEWAY_RESPONSE_ID}(?:_\\d+){1,2}$`),
+];
+
+const isGatewaySyntheticItemId = (id: string): boolean => GATEWAY_ITEM_IDS.some((pattern) => pattern.test(id));
+
+/** Only an encrypted payload lets a stateless upstream resolve a replayed reasoning item. */
+const hasEncryptedReasoningReplay = (item: Record<string, unknown>): boolean => typeof item.encrypted_content === "string" && item.encrypted_content.length > 0;
+
+/**
+ * One replayed input item for the Codex seam, with gateway-local provenance
+ * removed. A gateway-synthesized reasoning item carries no encrypted payload,
+ * so a `store: false` upstream cannot resolve it and it is dropped. Every other
+ * gateway-synthesized item keeps its content, order and `call_id` and loses
+ * only the nonportable synthetic `id`; unrelated items pass through untouched.
+ */
+const replayItemForCodex = (value: unknown): ResponseInputItem | null => {
+  if (!isRecord(value)) return value as ResponseInputItem;
+  const id = getString(value.id);
+  if (!id || !isGatewaySyntheticItemId(id)) return value as ResponseInputItem;
+  if (value.type === "reasoning" && !hasEncryptedReasoningReplay(value)) return null;
+  const copy: Record<string, unknown> = { ...value };
+  delete copy.id;
+  return copy as ResponseInputItem;
+};
+
 export const buildCodexRequest = (
   model: string,
   input: ResponseInputItem[],
@@ -428,7 +467,7 @@ export const buildCodexRequest = (
 ): Record<string, unknown> => {
   const body: Record<string, unknown> = {
     model,
-    input,
+    input: input.map(replayItemForCodex).filter((item): item is ResponseInputItem => item !== null),
     store: false,
     stream: true,
   };

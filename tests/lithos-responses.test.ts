@@ -80,13 +80,13 @@ Deno.test("lithos responses: a buffered completion maps reasoning_content and th
   assert.equal(payload.incomplete_details, null);
   assert.deepEqual(payload.output, [
     {
-      id: "resp_lithos_buffered_rs_0",
+      id: "rs_resp_lithos_buffered_0",
       type: "reasoning",
       status: "completed",
       summary: [{ type: "summary_text", text: "The request asked for one word." }],
     },
     {
-      id: "resp_lithos_buffered_msg_0",
+      id: "msg_resp_lithos_buffered_0",
       type: "message",
       status: "completed",
       role: "assistant",
@@ -149,13 +149,13 @@ Deno.test("lithos responses: streaming accepts the empty-choices totals frame an
   });
   assert.deepEqual(terminal.response.output, [
     {
-      id: "resp_lithos_stream_rs_0",
+      id: "rs_resp_lithos_stream_0",
       type: "reasoning",
       status: "completed",
       summary: [{ type: "summary_text", text: "Thinking first." }],
     },
     {
-      id: "resp_lithos_stream_msg_0",
+      id: "msg_resp_lithos_stream_0",
       type: "message",
       status: "completed",
       role: "assistant",
@@ -201,13 +201,13 @@ Deno.test("lithos responses: tool calls map to function_call items on both trans
   assert.equal(payload.status, "completed");
   assert.deepEqual(payload.output, [
     {
-      id: "resp_lithos_tools_rs_0",
+      id: "rs_resp_lithos_tools_0",
       type: "reasoning",
       status: "completed",
       summary: [{ type: "summary_text", text: "Calling the tool." }],
     },
     {
-      id: "resp_lithos_tools_fc_0_0",
+      id: "fc_resp_lithos_tools_0_0",
       type: "function_call",
       status: "completed",
       call_id: "get_weather:0",
@@ -245,7 +245,7 @@ Deno.test("lithos responses: tool calls map to function_call items on both trans
   assert.equal(terminal.type, "response.completed");
   assert.deepEqual(terminal.response.output, [
     {
-      id: "resp_lithos_stream_tools_fc_0",
+      id: "fc_resp_lithos_stream_tools_0",
       type: "function_call",
       status: "completed",
       call_id: "get_weather:0",
