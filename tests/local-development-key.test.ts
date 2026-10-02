@@ -81,7 +81,8 @@ denoWithKv.openKv = () => Promise.resolve(memoryKv as unknown as Deno.Kv);
 const { API_KEY_NO_EXPIRATION_MS, API_KEY_NO_USAGE_LIMIT, PAID_FALLBACK_NO_LIMIT, apiKeyHashKey, apiKeyIdKey } = await import("../src/api-keys.ts");
 const { apiKeyUsageV3WindowKey } = await import("../src/api-key-policy.ts");
 const { hasStrictPaidFallbackKeyPolicy } = await import("../src/paid-fallback/index.ts");
-const { LOCAL_DEVELOPMENT_KEY_ID, ensureLocalDevelopmentApiKey, resolveLocalDevelopmentApiKeyPolicy } = await import("../src/auth/local-development-key.ts");
+const { LOCAL_DEVELOPMENT_KEY_ID, ensureLocalDevelopmentApiKey, resolveLocalDevelopmentApiKeyPolicy, setLocalDevelopmentPricingDeadlineMsForTest } =
+  await import("../src/auth/local-development-key.ts");
 const { configureAdminAuthForListener, configureAdminAuthPeerForRequest, configureMacLocalAdminAuthBypassForListener } =
   await import("../src/auth/local-admin.ts");
 const { authenticateClient, handleV1Auth } = await import("../src/auth/index.ts");
@@ -162,6 +163,89 @@ Deno.test("local development key provisioning reports an unavailable pricing sna
     assert.equal(status, "unavailable");
     const idEntry = await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID));
     assert.equal(idEntry.value, null);
+  });
+});
+
+Deno.test("local development key provisioning bounds a pricing initializer that never settles", async () => {
+  await withPaidProviderKey(async () => {
+    const isolated = new MemoryKv();
+    let entered = 0;
+    const enteredSignals: AbortSignal[] = [];
+    let resolvePricing: (value: Awaited<ReturnType<LocalDevelopmentPricingInitializer>>) => void = () => {};
+    const pendingPricing = new Promise<Awaited<ReturnType<LocalDevelopmentPricingInitializer>>>((resolve) => {
+      resolvePricing = resolve;
+    });
+    setLocalDevelopmentPricingDeadlineMsForTest(1_000);
+    try {
+      const startedAt = performance.now();
+      const status = await ensureLocalDevelopmentApiKey(isolated as unknown as Deno.Kv, {
+        initializePolicy: (signal) => {
+          entered += 1;
+          if (signal) enteredSignals.push(signal);
+          return pendingPricing;
+        },
+      });
+      const elapsedMs = performance.now() - startedAt;
+      // Entry proves the fixed deadline ended the wait rather than a skipped initializer.
+      assert.equal(entered, 1);
+      assert.equal(status, "unavailable");
+      assert.ok(elapsedMs >= 750, `provisioning must wait for the deadline (${Math.round(elapsedMs)}ms)`);
+      assert.ok(elapsedMs < 10_000, `provisioning must stay bounded (${Math.round(elapsedMs)}ms)`);
+      // The abandoned attempt is still handed a cooperative abort at the deadline.
+      // Read through the array: a `let` assigned only inside the initializer stays
+      // narrowed to its null initializer under control-flow analysis.
+      const enteredSignal = enteredSignals.at(0);
+      assert.equal(enteredSignal?.aborted, true);
+      assert.equal(enteredSignal.reason.name, "TimeoutError");
+      assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+      // A late result from the abandoned attempt must never publish a key.
+      resolvePricing(pricing);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+    } finally {
+      setLocalDevelopmentPricingDeadlineMsForTest(null);
+    }
+  });
+});
+
+Deno.test("local development key provisioning keeps a normal pricing initialization inside the deadline", async () => {
+  await withPaidProviderKey(async () => {
+    const isolated = new MemoryKv();
+    setLocalDevelopmentPricingDeadlineMsForTest(1_000);
+    try {
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated as unknown as Deno.Kv, { initializePolicy }), "created");
+      const record = (await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value as Record<string, unknown> | null;
+      assert.ok(record);
+      assert.deepEqual(record.paid_fallback_model_ids, pricing.paid_fallback_model_ids);
+      assert.equal(record.paid_fallback_pricing_checked_at_ms, pricing.paid_fallback_pricing_checked_at_ms);
+    } finally {
+      setLocalDevelopmentPricingDeadlineMsForTest(null);
+    }
+  });
+});
+
+Deno.test("local development key provisioning discards a cancelled pricing snapshot", async () => {
+  await withPaidProviderKey(async () => {
+    const isolated = new MemoryKv();
+    const controller = new AbortController();
+    let entered = 0;
+    let resolvePricing: (value: Awaited<ReturnType<LocalDevelopmentPricingInitializer>>) => void = () => {};
+    const pendingPricing = new Promise<Awaited<ReturnType<LocalDevelopmentPricingInitializer>>>((resolve) => {
+      resolvePricing = resolve;
+    });
+    const attempt = ensureLocalDevelopmentApiKey(isolated as unknown as Deno.Kv, {
+      signal: controller.signal,
+      initializePolicy: () => {
+        entered += 1;
+        return pendingPricing;
+      },
+    });
+    controller.abort(new DOMException("cancelled", "AbortError"));
+    assert.equal(await attempt, "unavailable");
+    assert.equal(entered, 1);
+    resolvePricing(pricing);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
   });
 });
 
