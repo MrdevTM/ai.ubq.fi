@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 
+import { ApiKeyQuotaDispatchError, apiKeyPolicyFromHashRecord, reserveApiKeyUsageV3 } from "../src/api-key-policy.ts";
+import { apiKeyHashKey } from "../src/api-keys.ts";
 import { withOpenRouterModels } from "../src/catalog/models.ts";
 import { CODEX_MODELS_KV_KEY } from "../src/codex/index.ts";
 import { setKvForTest } from "../src/kv.ts";
@@ -7,10 +9,15 @@ import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/models/codex-models-whitel
 import { handleModelCapabilities, handleModels, handlePublicModelCatalog } from "../src/models/catalog.ts";
 import { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest, setOpenRouterModelsFetchForTest } from "../src/models/openrouter-models.ts";
 import { createResponseTelemetryState, type ResponseTelemetryState } from "../src/openai-telemetry.ts";
+import { handleTerminalRoute } from "../src/handler/terminal-route.ts";
+import { getOpenRouterProviderHealth, resetProviderHealthThrottleForTest } from "../src/provider/health.ts";
 import { openRouterUpstreamModelFor, resolveOpenRouterUpstreamModel } from "../src/provider/openrouter.ts";
 import { handleOpenRouterChatCompletions, handleOpenRouterResponses } from "../src/provider/openrouter-handlers.ts";
 import { resetProviderSelectionCacheForTest } from "../src/provider/selection.ts";
 import { resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
+import type { ApiKeyHashRecord } from "../src/types.ts";
+import { sha256Base64Url } from "../src/utils.ts";
+import { CountingKv } from "./helpers/counting-kv.ts";
 
 const catalogue = {
   data: [
@@ -116,6 +123,165 @@ Deno.test("openrouter responses forwards the client body and reports the upstrea
     assert.equal(response.status, 200);
     assert.equal(captured.body?.model, "vendor/beta");
     assert.equal(response.headers.get("x-uos-upstream"), "openrouter");
+  });
+});
+
+const dispatchCases = [
+  { path: "/v1/chat/completions", body: { messages: [{ role: "user", content: "hi" }] }, handle: handleOpenRouterChatCompletions },
+  { path: "/v1/responses", body: { input: "hi" }, handle: handleOpenRouterResponses },
+] as const;
+
+Deno.test("openrouter rethrows local quota-hook refusals before either transport starts", async () => {
+  await withServedCatalogue(async () => {
+    const kv = new CountingKv();
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = () => {
+      fetchCalls += 1;
+      return Promise.reject(new Error("a local quota refusal must never fetch"));
+    };
+    setKvForTest(kv as unknown as Deno.Kv);
+    resetProviderHealthThrottleForTest();
+    try {
+      for (const scenario of dispatchCases) {
+        for (const stream of [false, true]) {
+          const telemetry = createResponseTelemetryState();
+          const quotaError = new ApiKeyQuotaDispatchError("fixture quota exhausted", {
+            status: 429,
+            code: "rate_limit_exceeded",
+            errorType: "rate_limit_error",
+            headers: { "Retry-After": "17", "ratelimit-limit": "1", "ratelimit-remaining": "0" },
+          });
+          let hookCalls = 0;
+          await assert.rejects(
+            () =>
+              scenario.handle(
+                new Request(`https://ai.ubq.fi${scenario.path}`, { method: "POST" }),
+                { model: "vendor/alpha", ...scenario.body, stream },
+                "vendor/alpha",
+                {
+                  ...streamUsageContext(telemetry),
+                  beforeProviderDispatch: (provider) => {
+                    assert.equal(provider, "openrouter");
+                    hookCalls += 1;
+                    return Promise.reject(quotaError);
+                  },
+                }
+              ),
+            (error: unknown) => error === quotaError
+          );
+          assert.equal(hookCalls, 1);
+          assert.equal(fetchCalls, 0);
+          assert.deepEqual(telemetry.attemptedProviders, []);
+          assert.equal(telemetry.firstProviderDispatchMs, null);
+          assert.equal(telemetry.firstProviderHeadersMs, null);
+          assert.equal((await getOpenRouterProviderHealth()).state, "unknown");
+        }
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      setKvForTest(null);
+      resetProviderHealthThrottleForTest();
+    }
+  });
+});
+
+Deno.test("openrouter terminal routes retain real deferred-quota 429 bodies and headers with zero dispatch", async () => {
+  await withServedCatalogue(async () => {
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = () => {
+      fetchCalls += 1;
+      return Promise.reject(new Error("an exhausted key must never fetch"));
+    };
+    try {
+      for (const scenario of dispatchCases) {
+        const kv = new CountingKv();
+        const token = `u_${crypto.randomUUID().replaceAll("-", "").repeat(2)}`;
+        const tokenHash = await sha256Base64Url(token);
+        const now = Date.now();
+        const record: ApiKeyHashRecord = {
+          id: `openrouter-quota-${crypto.randomUUID()}`,
+          expires_at_ms: -1,
+          revoked_at_ms: null,
+          usage_limit_requests: 1,
+          usage_requests: 0,
+          usage_reset_at_ms: now + 60_000,
+          window_ms: 60_000,
+          usage_quota_version: 3,
+          paid_fallback_enabled: false,
+          paid_fallback_limit_microcredits: 0,
+          paid_fallback_spent_microcredits: 0,
+          paid_fallback_reserved_microcredits: 0,
+          paid_fallback_reservation_request_id: null,
+        };
+        kv.seed(apiKeyHashKey(tokenHash), record);
+        setKvForTest(kv as unknown as Deno.Kv);
+        resetProviderSelectionCacheForTest();
+        resetProviderHealthThrottleForTest();
+        const policy = apiKeyPolicyFromHashRecord(tokenHash, record, now);
+        assert.ok(policy);
+        const charged = await reserveApiKeyUsageV3(policy, "already-dispatched", scenario.path, { kv: kv as unknown as Deno.Kv });
+        assert.equal(charged.ok, true);
+        (await charged.reservation.beforeProviderDispatch("openrouter"))?.markTransportStarted();
+        const request = new Request(`https://ai.ubq.fi${scenario.path}`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "vendor/alpha", ...scenario.body }),
+        });
+        const response = await handleTerminalRoute(request, scenario.path, undefined, `quota-${crypto.randomUUID()}`, now, performance.now());
+        assert.equal(response.status, 429);
+        const payload = await response.json();
+        assert.equal(payload.error.code, "rate_limit_exceeded");
+        assert.equal(payload.error.type, "rate_limit_error");
+        assert.ok(Number(response.headers.get("retry-after")) > 0);
+        assert.equal(response.headers.get("ratelimit-limit"), "1");
+        assert.equal(response.headers.get("ratelimit-remaining"), "0");
+        assert.equal(fetchCalls, 0);
+        assert.equal((await getOpenRouterProviderHealth()).state, "unknown");
+        await charged.reservation.release();
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      setKvForTest(null);
+      resetProviderSelectionCacheForTest();
+      resetProviderHealthThrottleForTest();
+    }
+  });
+});
+
+Deno.test("openrouter keeps ordinary transport failures as upstream 502s on both wires", async () => {
+  await withServedCatalogue(async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      for (const scenario of dispatchCases) {
+        const kv = new CountingKv();
+        setKvForTest(kv as unknown as Deno.Kv);
+        resetProviderHealthThrottleForTest();
+        let fetchCalls = 0;
+        globalThis.fetch = () => {
+          fetchCalls += 1;
+          return Promise.reject(new TypeError("fixture network refusal"));
+        };
+        const telemetry = createResponseTelemetryState();
+        const response = await scenario.handle(
+          new Request(`https://ai.ubq.fi${scenario.path}`, { method: "POST" }),
+          { model: "vendor/alpha", ...scenario.body },
+          "vendor/alpha",
+          streamUsageContext(telemetry)
+        );
+        assert.equal(response.status, 502);
+        assert.equal((await response.json()).error.code, "openrouter_upstream_unreachable");
+        assert.equal(fetchCalls, 1);
+        assert.deepEqual(telemetry.attemptedProviders, ["openrouter"]);
+        assert.notEqual(telemetry.firstProviderDispatchMs, null);
+        assert.equal((await getOpenRouterProviderHealth()).last_event, "upstream_error");
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      setKvForTest(null);
+      resetProviderHealthThrottleForTest();
+    }
   });
 });
 
