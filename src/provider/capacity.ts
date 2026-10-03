@@ -39,7 +39,6 @@ import {
   additionalRateLimitsForRouting,
   codexAccountLabel,
   codexUsageUrl,
-  fillMissingCodexAdditionalLimitsForAdmin,
   parseCodexUsage,
   providerCapacityLastAvailableKey,
   readCapacitySnapshot,
@@ -323,16 +322,9 @@ const toCapacityView = (
   nowMs: number
 ): ProviderCapacityView => {
   const current = staleProviderSnapshot(snapshot, nowMs);
-  const codexSources = fillMissingCodexAdditionalLimitsForAdmin(
-    current.sources.filter((source): source is ProviderCapacityCodexSource => source.source === "codex")
-  );
-  const projected = {
-    ...current,
-    sources: [codexSources[0] ?? current.sources[0], codexSources[1] ?? current.sources[1], current.sources[2]],
-  } as ProviderCapacitySnapshot;
-  const stale = projected.sources.some((source) => source.state === "stale");
+  const stale = current.sources.some((source) => source.state === "stale");
   return {
-    ...projected,
+    ...current,
     cache_state: stale ? "stale" : requestedState,
     history,
     reset_events: resetEvents,
