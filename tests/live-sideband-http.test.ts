@@ -4,6 +4,7 @@ import { CountingKv } from "./helpers/counting-kv.ts";
 import { CODEX_REFRESH_TOKEN_URL } from "../src/codex/auth.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, CodexAuthState } from "../src/types.ts";
 import { sha256Base64Url } from "../src/utils.ts";
+import { LIVE_SIDEBAND_MAX_BUFFERED_BYTES, LIVE_SIDEBAND_MAX_PAYLOAD_BYTES } from "../src/live/upstream.ts";
 
 // Hermetic loopback proof for the `GET /v1/live/<call_id>` sideband: the real
 // production handler, a disposable in-memory KV, a seeded Codex auth pool, and
@@ -68,7 +69,11 @@ type RefreshCall = Readonly<{ url: string; refreshToken: string | null; index: n
 
 type RefreshResponder = (call: RefreshCall) => Response;
 
-type SidebandFixtureOptions = Readonly<{ accounts?: readonly CodexAuthState[] }>;
+type SidebandFixtureOptions = Readonly<{
+  accounts?: readonly CodexAuthState[];
+  delayUpstreamOpen?: boolean;
+  upstreamBufferedBytes?: number;
+}>;
 
 const seedApiKey = async (kv: CountingKv, keyId: string, name: string, token: string, nowMs: number): Promise<void> => {
   const tokenHash = await sha256Base64Url(token);
@@ -117,6 +122,9 @@ type SidebandFixture = {
   readonly gatewayWsBaseUrl: string;
   readonly upstreamSidebands: UpstreamSideband[];
   readonly refreshCalls: RefreshCall[];
+  waitForUpstreamHandshake: () => Promise<void>;
+  waitForClientFrames: (expected: number) => Promise<void>;
+  releaseUpstreamHandshake: () => void;
   waitForUpstreamSideband: (index?: number) => Promise<UpstreamSideband>;
   setRefreshResponder: (responder: RefreshResponder) => void;
   setAuthPool: (accounts: readonly CodexAuthState[]) => Promise<void>;
@@ -136,6 +144,12 @@ const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promi
   const upstreamSidebands: UpstreamSideband[] = [];
   const openSidebands: WebSocket[] = [];
   const refreshCalls: RefreshCall[] = [];
+  const serverAbort = new AbortController();
+  const upstreamHandshake = Promise.withResolvers<undefined>();
+  let upstreamHandshakeStarted = false;
+  let clientFrameCount = 0;
+  let closing = false;
+  if (!options.delayUpstreamOpen) upstreamHandshake.resolve(undefined);
   let activeRefreshResponder: RefreshResponder = (call) =>
     Response.json({ access_token: `${REFRESH_ACCESS_TOKEN}-${call.index}`, refresh_token: `${REFRESH_REFRESH_TOKEN}-${call.index}` });
   const originalDeployFlag = config.isDeploy;
@@ -176,7 +190,7 @@ const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promi
   // The refresh URL is a module constant, so the fixture redirects that exact
   // URL to a real loopback endpoint; no production refresh code or upstream
   // auth server is involved.
-  const refreshServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, async (request) => {
+  const refreshServer = Deno.serve({ hostname: "127.0.0.1", port: 0, signal: serverAbort.signal, onListen: () => {} }, async (request) => {
     const body = JSON.parse(await request.text()) as Record<string, unknown>;
     const call: RefreshCall = {
       url: request.url,
@@ -196,9 +210,12 @@ const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promi
     return originalFetch(target === CODEX_REFRESH_TOKEN_URL ? refreshEndpointUrl : input, init);
   };
 
-  const upstreamServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, (request) => {
+  const upstreamServer = Deno.serve({ hostname: "127.0.0.1", port: 0, signal: serverAbort.signal, onListen: () => {} }, async (request) => {
     const url = new URL(request.url);
     if (url.pathname !== `/v1/live/${CALL_ID}`) return new Response("not found", { status: 404 });
+    upstreamHandshakeStarted = true;
+    await upstreamHandshake.promise;
+    if (closing || request.signal.aborted) return new Response(null, { status: 503 });
     // The upgraded request is closed once its response is returned, so its
     // headers must be copied while the handshake is still in scope.
     const record: UpstreamSideband = {
@@ -220,12 +237,38 @@ const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promi
     upstreamSidebands.push(record);
     return upgrade.response;
   });
+  const upstreamWsBaseUrl = `ws://127.0.0.1:${(upstreamServer.addr as Deno.NetAddr).port}/v1/live`;
   setLiveUpstreamBasesForTest({
     callsBaseUrl: null,
-    sidebandBaseUrl: `ws://127.0.0.1:${(upstreamServer.addr as Deno.NetAddr).port}/v1/live`,
+    sidebandBaseUrl: upstreamWsBaseUrl,
   });
 
-  const gatewayServer = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, createServeHandler(handler));
+  // Keep real loopback sockets and sends while supplying a deterministic
+  // pending-byte observation for the gateway's upstream socket only.
+  const CLIENT_CONSTRUCTOR = options.upstreamBufferedBytes === undefined ? null : await loadClientConstructor();
+  const originalBufferedAmount = CLIENT_CONSTRUCTOR ? Object.getOwnPropertyDescriptor(CLIENT_CONSTRUCTOR.prototype, "bufferedAmount") : undefined;
+  if (CLIENT_CONSTRUCTOR && options.upstreamBufferedBytes !== undefined) {
+    Object.defineProperty(CLIENT_CONSTRUCTOR.prototype, "bufferedAmount", {
+      configurable: true,
+      get(this: UpstreamClient): number {
+        if (this.url === `${upstreamWsBaseUrl}/${CALL_ID}`) return options.upstreamBufferedBytes ?? 0;
+        return originalBufferedAmount?.get?.call(this) as number;
+      },
+    });
+  }
+
+  const gatewayServer = Deno.serve({ hostname: "127.0.0.1", port: 0, signal: serverAbort.signal, onListen: () => {} }, createServeHandler(handler));
+  const gatewayPort = String((gatewayServer.addr as Deno.NetAddr).port);
+  const originalUpgrade = Deno.upgradeWebSocket;
+  Deno.upgradeWebSocket = (request, upgradeOptions) => {
+    const upgrade = originalUpgrade(request, upgradeOptions);
+    if (new URL(request.url).port === gatewayPort) {
+      upgrade.socket.addEventListener("message", () => {
+        clientFrameCount += 1;
+      });
+    }
+    return upgrade;
+  };
 
   return {
     kv,
@@ -234,10 +277,27 @@ const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promi
     gatewayWsBaseUrl: `ws://127.0.0.1:${(gatewayServer.addr as Deno.NetAddr).port}/v1/live`,
     upstreamSidebands,
     refreshCalls,
+    waitForUpstreamHandshake: async () => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (upstreamHandshakeStarted) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error("the gateway never started the upstream handshake");
+    },
+    releaseUpstreamHandshake: () => {
+      upstreamHandshake.resolve(undefined);
+    },
+    waitForClientFrames: async (expected) => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (clientFrameCount >= expected) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error("the gateway never received the expected client frames");
+    },
     waitForUpstreamSideband: async (index = 0) => {
       for (let attempt = 0; attempt < 200; attempt += 1) {
         const sideband = upstreamSidebands.at(index);
-        if (sideband !== undefined) return sideband;
+        if (sideband !== undefined && sideband.socket.readyState !== WebSocket.CONNECTING) return sideband;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       throw new Error("the gateway never dialed the upstream sideband");
@@ -249,6 +309,8 @@ const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promi
       await kv.set(["ubq_ai", "codex_auth"], { accounts: nextAccounts, updated_at_ms: Date.now() });
     },
     close: async () => {
+      closing = true;
+      upstreamHandshake.resolve(undefined);
       for (const socket of openSidebands) {
         try {
           socket.close();
@@ -264,9 +326,12 @@ const startSidebandFixture = async (options: SidebandFixtureOptions = {}): Promi
       setKvForTest(null);
       resetCodexAuthCacheForTest();
       resetCodexAccountRoutingForTest();
-      await gatewayServer.shutdown();
-      await upstreamServer.shutdown();
-      await refreshServer.shutdown();
+      // Abort closes pending HTTP connections too; graceful shutdown would wait
+      // forever for a held handshake whose client has already disconnected.
+      serverAbort.abort();
+      await Promise.all([gatewayServer.finished, upstreamServer.finished, refreshServer.finished]);
+      Deno.upgradeWebSocket = originalUpgrade;
+      if (CLIENT_CONSTRUCTOR && originalBufferedAmount) Object.defineProperty(CLIENT_CONSTRUCTOR.prototype, "bufferedAmount", originalBufferedAmount);
     },
   };
 };
@@ -440,6 +505,121 @@ Deno.test({
       client.worker.postMessage("close");
       client.worker.terminate();
       await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> flushes a delayed-open queue at the UTF-8 payload byte boundary and keeps relaying",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture({ delayUpstreamOpen: true });
+    const client = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+    try {
+      await fixture.waitForUpstreamHandshake();
+      const frame = "é".repeat(LIVE_SIDEBAND_MAX_PAYLOAD_BYTES / 2);
+      client.send(frame);
+      client.send(CLIENT_FRAME);
+      await fixture.waitForClientFrames(2);
+      assert.equal(fixture.upstreamSidebands.length, 0, "the upstream is still waiting to upgrade");
+      fixture.releaseUpstreamHandshake();
+      const upstream = await fixture.waitForUpstreamSideband();
+      assert.deepEqual(await waitForUpstreamFrames(upstream, 2), [frame, CLIENT_FRAME]);
+      client.send(CLIENT_FRAME);
+      assert.deepEqual(await waitForUpstreamFrames(upstream, 3), [frame, CLIENT_FRAME, CLIENT_FRAME]);
+      const reply = nextFrame(client);
+      upstream.socket.send(UPSTREAM_FRAME);
+      assert.equal(await reply, UPSTREAM_FRAME);
+    } finally {
+      client.terminate();
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> rejects oversized UTF-8 and binary client frames before the delayed upstream opens",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn(t) {
+    for (const [name, frame] of [
+      ["UTF-8", "é".repeat(LIVE_SIDEBAND_MAX_PAYLOAD_BYTES / 2 + 1)],
+      ["binary", new Uint8Array(LIVE_SIDEBAND_MAX_PAYLOAD_BYTES + 1)],
+    ] as const) {
+      await t.step(name, async () => {
+        const fixture = await startSidebandFixture({ delayUpstreamOpen: true });
+        const client = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+        try {
+          await fixture.waitForUpstreamHandshake();
+          const closed = nextClose(client);
+          client.send(frame);
+          assert.deepEqual(await closed, { code: 1011, reason: "realtime sideband frame exceeds payload limit" });
+          assert.equal(fixture.upstreamSidebands.length, 0, "the oversized frame never reaches an upgraded upstream");
+        } finally {
+          client.terminate();
+          await fixture.close();
+        }
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> caps a delayed-open queue by bytes below the frame-count limit",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const fixture = await startSidebandFixture({ delayUpstreamOpen: true });
+    const client = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+    try {
+      await fixture.waitForUpstreamHandshake();
+      const closed = nextClose(client);
+      const frame = "€".repeat(1_048_576);
+      for (let index = 0; index < 3; index += 1) client.send(frame);
+      assert.deepEqual(await closed, { code: 1011, reason: "realtime sideband frame queue overflow" });
+      assert.equal(fixture.upstreamSidebands.length, 0, "the 9 MiB queue is refused while the upstream handshake is pending");
+    } finally {
+      client.terminate();
+      await fixture.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "GET /v1/live/<call_id> checks pending bytes plus the next frame during queued flush and direct send",
+  ignore: loopbackPermission.state !== "granted",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn(t) {
+    const pendingBytes = LIVE_SIDEBAND_MAX_BUFFERED_BYTES - new TextEncoder().encode(CLIENT_FRAME).byteLength + 1;
+    for (const delayUpstreamOpen of [true, false]) {
+      await t.step(delayUpstreamOpen ? "queued flush" : "direct send", async () => {
+        const fixture = await startSidebandFixture({ delayUpstreamOpen, upstreamBufferedBytes: pendingBytes });
+        const client = await connectSideband(`${fixture.gatewayWsBaseUrl}/${CALL_ID}`, { authorization: `Bearer ${fixture.token}` });
+        try {
+          await fixture.waitForUpstreamHandshake();
+          if (!delayUpstreamOpen) {
+            const upstream = await fixture.waitForUpstreamSideband();
+            const ready = nextFrame(client);
+            upstream.socket.send(UPSTREAM_FRAME);
+            assert.equal(await ready, UPSTREAM_FRAME, "the upstream relay is open before the direct client send");
+          }
+          const closed = nextClose(client);
+          client.send(CLIENT_FRAME);
+          await fixture.waitForClientFrames(1);
+          fixture.releaseUpstreamHandshake();
+          assert.deepEqual(await closed, { code: 1011, reason: "realtime upstream is not draining frames" });
+          const upstream = await fixture.waitForUpstreamSideband();
+          assert.deepEqual(upstream.messages, [], "the frame that would exceed the pending-byte bound was never sent");
+        } finally {
+          client.terminate();
+          await fixture.close();
+        }
+      });
     }
   },
 });

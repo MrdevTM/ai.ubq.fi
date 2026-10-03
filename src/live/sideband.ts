@@ -69,6 +69,13 @@ const frameText = (raw: unknown): string | null => {
   return null;
 };
 
+const frameBytes = (raw: unknown): number => {
+  if (typeof raw === "string") return new TextEncoder().encode(raw).byteLength;
+  if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) return raw.byteLength;
+  if (raw instanceof Blob) return raw.size;
+  return 0;
+};
+
 const closeDownstream = (socket: DownstreamSocket, code: number, reason: string): void => {
   if (socket.readyState !== 0 && socket.readyState !== SOCKET_OPEN) return;
   const sendable = downstreamCloseCode(code);
@@ -118,6 +125,7 @@ const bridgeLiveSideband = async (input: LiveSidebandBridge): Promise<void> => {
   const { downstream, callId, accountId, accessToken } = input;
 
   const preopenFrames: string[] = [];
+  let preopenBytes = 0;
   // The state the downstream handlers share with the dial behind the first
   // await: whether the bridge settled, whether the upstream handshake finished,
   // and whether that dial produced the socket below.
@@ -128,9 +136,25 @@ const bridgeLiveSideband = async (input: LiveSidebandBridge): Promise<void> => {
     if (relay.settled) return;
     relay.settled = true;
     preopenFrames.length = 0;
+    preopenBytes = 0;
     if (relay.dialed) closeUpstream(upstream, code, reason);
     closeDownstream(downstream, code, reason);
     logLiveSideband("closed", { call_id: callId, account_id: accountId, code });
+  };
+
+  const sendUpstreamFrame = (text: string): boolean => {
+    const bufferedBytes: unknown = upstream.bufferedAmount;
+    if (typeof bufferedBytes !== "number" || bufferedBytes + frameBytes(text) > LIVE_SIDEBAND_MAX_BUFFERED_BYTES) {
+      finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime upstream is not draining frames");
+      return false;
+    }
+    try {
+      upstream.send(text);
+      return true;
+    } catch {
+      finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime upstream send failed");
+      return false;
+    }
   };
 
   // Deno delivers the downstream events to the handler attached when they
@@ -138,26 +162,29 @@ const bridgeLiveSideband = async (input: LiveSidebandBridge): Promise<void> => {
   // the client sends right after the 101, or its disconnect, has to be queued
   // (or acted on) instead of lost while the upstream constructor loads.
   downstream.onmessage = (event: MessageEvent) => {
+    if (relay.settled) return;
+    if (frameBytes(event.data) > LIVE_SIDEBAND_MAX_PAYLOAD_BYTES) {
+      finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime sideband frame exceeds payload limit");
+      return;
+    }
     // The frameless sideband is JSON text; a binary frame is a protocol error.
     const text = frameText(event.data);
-    if (text === null || relay.settled) return;
+    if (text === null) return;
+    const bytes = frameBytes(text);
+    if (bytes > LIVE_SIDEBAND_MAX_PAYLOAD_BYTES) {
+      finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime sideband frame exceeds payload limit");
+      return;
+    }
     if (!relay.upstreamOpen) {
-      if (preopenFrames.length >= LIVE_SIDEBAND_PREOPEN_MAX_FRAMES) {
+      if (preopenFrames.length >= LIVE_SIDEBAND_PREOPEN_MAX_FRAMES || preopenBytes + bytes > LIVE_SIDEBAND_MAX_BUFFERED_BYTES) {
         finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime sideband frame queue overflow");
         return;
       }
       preopenFrames.push(text);
+      preopenBytes += bytes;
       return;
     }
-    if (upstream.bufferedAmount > LIVE_SIDEBAND_MAX_BUFFERED_BYTES) {
-      finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime upstream is not draining frames");
-      return;
-    }
-    try {
-      upstream.send(text);
-    } catch {
-      finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime upstream send failed");
-    }
+    sendUpstreamFrame(text);
   };
   downstream.onclose = (event: CloseEvent) => {
     finish(event.code, event.reason);
@@ -187,19 +214,15 @@ const bridgeLiveSideband = async (input: LiveSidebandBridge): Promise<void> => {
   upstream.on("open", () => {
     relay.upstreamOpen = true;
     logLiveSideband("joined", { call_id: callId, account_id: accountId });
+    preopenBytes = 0;
     for (const frame of preopenFrames.splice(0)) {
-      try {
-        upstream.send(frame);
-      } catch {
-        finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime upstream send failed");
-        return;
-      }
+      if (!sendUpstreamFrame(frame)) return;
     }
   });
   upstream.on("message", (data: unknown, isBinary: boolean) => {
     if (isBinary) return;
     const text = frameText(data);
-    if (text === null || downstream.readyState !== SOCKET_OPEN || downstream.bufferedAmount > LIVE_SIDEBAND_MAX_BUFFERED_BYTES) {
+    if (text === null || downstream.readyState !== SOCKET_OPEN || downstream.bufferedAmount + frameBytes(text) > LIVE_SIDEBAND_MAX_BUFFERED_BYTES) {
       finish(SIDEBAND_FAILURE_CLOSE_CODE, "realtime sideband is not writable");
       return;
     }
