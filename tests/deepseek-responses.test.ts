@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload, toResponsesUsage } from "../src/deepseek/responses-payload.ts";
 import { createDeepSeekResponsesStreamTranslator, deepSeekResponsesTerminalKind, encodeResponsesEvent } from "../src/deepseek/responses-stream.ts";
 import { toDeepSeekChatMessages, toDeepSeekResponsesChatBody } from "../src/deepseek/chat-projection.ts";
-import { FORWARDED_PAYLOAD_POLICY } from "../src/deepseek/forwarded-payload-policy.ts";
+import { type ForwardedPayloadElision, FORWARDED_PAYLOAD_POLICY } from "../src/deepseek/forwarded-payload-policy.ts";
 import { deepSeekFinishDisposition, deepSeekThinkingToolChoiceConflict } from "../src/deepseek/index.ts";
 
 const echo: DeepSeekResponsesEcho = { tools: undefined, tool_choice: undefined, parallel_tool_calls: true, instructions: null };
@@ -630,6 +630,31 @@ Deno.test("deepseek responses: projects a sub-agent message envelope onto a user
       content: "[agent message] /root -> /root/worker:\nMessage Type: NEW_TASK\n[gateway: 1 sealed agent-message part(s) were not readable and omitted]",
     },
   ]);
+});
+
+Deno.test("deepseek responses: bounds oversized sub-agent payloads under the declared policy", () => {
+  const oversized = "x".repeat(FORWARDED_PAYLOAD_POLICY.perMessageLimit + 1_000);
+  const message = {
+    type: "agent_message",
+    author: "/root/worker",
+    recipient: "/root",
+    content: [{ type: "encrypted_content", encrypted_content: oversized }],
+  };
+  const elisions: ForwardedPayloadElision[] = [];
+  const reduced = toDeepSeekChatMessages([message], null, "reduce", elisions);
+  assert.equal(reduced.ok, true);
+  const content = (reduced.value[0] as { content: string }).content;
+  assert.ok(content.length < oversized.length, "the payload must be reduced below its original size");
+  assert.ok(content.includes(FORWARDED_PAYLOAD_POLICY.version), "the elision marker must name the policy version");
+  assert.equal(elisions.length, 1);
+  assert.equal(elisions[0].kind, "agent_message");
+  assert.ok(elisions[0].omittedBytes > 0);
+  assert.equal(elisions[0].path, "input[0].content");
+
+  // An explicit truncation "disabled" fails closed instead of mutating the input.
+  const rejected = toDeepSeekChatMessages([message], null, "reject", []);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, "context_length_exceeded");
 });
 
 Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
