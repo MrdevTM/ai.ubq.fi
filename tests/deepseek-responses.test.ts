@@ -584,7 +584,7 @@ Deno.test("deepseek responses: a streamed freeform call emits custom tool events
 });
 
 Deno.test("deepseek responses: projects a sub-agent message envelope onto a user turn", () => {
-  const result = toDeepSeekChatMessages(
+  const plaintextPayload = toDeepSeekChatMessages(
     [
       { type: "message", role: "user", content: [{ type: "input_text", text: "delegate this" }] },
       {
@@ -593,18 +593,41 @@ Deno.test("deepseek responses: projects a sub-agent message envelope onto a user
         recipient: "/root",
         content: [
           { type: "input_text", text: "ok" },
-          { type: "encrypted_content", encrypted_content: "AAAA" },
+          // A thread whose model runs outside the ChatGPT backend carries its
+          // payload here in the clear, so it must reach the model.
+          { type: "encrypted_content", encrypted_content: "payload-from-worker" },
         ],
       },
     ],
     null
   );
-  assert.equal(result.ok, true);
-  assert.deepEqual(result.value, [
+  assert.equal(plaintextPayload.ok, true);
+  assert.deepEqual(plaintextPayload.value, [
     { role: "user", content: "delegate this" },
+    { role: "user", content: "[agent message] /root/probe_qwen2 -> /root:\nok\npayload-from-worker" },
+  ]);
+
+  // A sealed payload is a Fernet token only the ChatGPT backend can open, so it
+  // is declared instead of forwarded as ciphertext.
+  const sealedPayload = toDeepSeekChatMessages(
+    [
+      {
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/worker",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK" },
+          { type: "encrypted_content", encrypted_content: `gAAAAA${"A".repeat(120)}` },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(sealedPayload.ok, true);
+  assert.deepEqual(sealedPayload.value, [
     {
       role: "user",
-      content: "[agent message] /root/probe_qwen2 -> /root:\nok\n[gateway: 1 encrypted agent-message part(s) were unreadable and omitted]",
+      content: "[agent message] /root -> /root/worker:\nMessage Type: NEW_TASK\n[gateway: 1 sealed agent-message part(s) were not readable and omitted]",
     },
   ]);
 });

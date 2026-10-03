@@ -268,6 +268,14 @@ const appendMessageItem = (
  * part is declared rather than silently dropped, because the model must not
  * treat the forwarded text as the whole message.
  */
+/**
+ * Distinguishes a sealed agent-message payload from a forwarded one. Sealed
+ * payloads are Fernet tokens, which begin with the version byte base64-encoded
+ * as `gAAAAA` and run long; everything else is content the receiving model can
+ * actually read.
+ */
+const isSealedAgentPayload = (value: string): boolean => value.startsWith("gAAAAA") && value.length >= 100;
+
 const chatAgentMessageItem = (item: Record<string, unknown>): DeepSeekResponsesResult<Record<string, unknown>> => {
   const author = getString(item.author) ?? "agent";
   const recipient = getString(item.recipient) ?? "root";
@@ -281,9 +289,19 @@ const chatAgentMessageItem = (item: Record<string, unknown>): DeepSeekResponsesR
       texts.push(text);
       continue;
     }
-    if (typeof part.encrypted_content === "string") unreadable += 1;
+    const encrypted = getString(part.encrypted_content);
+    if (encrypted === null) continue;
+    // A ChatGPT-backed thread carries a sealed payload that only that backend
+    // can open, and it is not worth forwarding as ciphertext. A thread whose
+    // model runs elsewhere carries the payload itself in this field, so it is
+    // forwarded verbatim; dropping it left sub-agents with an empty task.
+    if (isSealedAgentPayload(encrypted)) {
+      unreadable += 1;
+      continue;
+    }
+    texts.push(encrypted);
   }
-  const notice = unreadable ? `\n[gateway: ${unreadable} encrypted agent-message part(s) were unreadable and omitted]` : "";
+  const notice = unreadable ? `\n[gateway: ${unreadable} sealed agent-message part(s) were not readable and omitted]` : "";
   return { ok: true, value: { role: "user", content: `[agent message] ${author} -> ${recipient}:\n${texts.join("\n")}${notice}` } };
 };
 
