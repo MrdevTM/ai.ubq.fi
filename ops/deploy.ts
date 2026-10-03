@@ -94,8 +94,8 @@ async function assertDeployableCheckout(): Promise<string> {
  * unreadable to that user, Caddy's own `ExecStartPre` validation fails and a
  * reload silently keeps the previous configuration serving while the gateway
  * has already moved. Prove the composed proxy config is valid as Caddy before
- * the service is restarted, then apply it with a reload so the validated
- * configuration is the one actually serving. Fail closed otherwise; never
+ * publishing the candidate, without changing the live ingress. Apply it only
+ * after the restarted candidate passes loopback readiness. Fail closed otherwise; never
  * repair the checkout mode, which would hide the real permission fault.
  */
 async function ensureCaddyIngressReady(): Promise<void> {
@@ -127,10 +127,6 @@ async function ensureCaddyIngressReady(): Promise<void> {
     "caddyfile",
   ]);
   console.log(JSON.stringify({ ingress_preflight: "caddy_config_valid", caddy_pid: mainPid }));
-  // Validation alone leaves the previously loaded configuration serving, so a
-  // host upgrading across the port cutover would keep the old upstream even
-  // though this deploy verified the new release on loopback.
-  await reloadCaddyIngress();
 }
 
 async function deploy(): Promise<void> {
@@ -200,6 +196,9 @@ async function deploy(): Promise<void> {
     if (!loopbackVerified) {
       throw new Error("The VPS did not serve the expected release; inspect journalctl -u ai-ubq-fi.service");
     }
+    // Keep the previous ingress serving until the selected candidate is ready,
+    // then apply the validated configuration before checking the public route.
+    await reloadCaddyIngress();
     // The loopback listener proves this host runs the new release, but the public
     // route is the acceptance surface. A Caddy still loaded with the previous
     // upstream answers 502 there while the loopback check passed, so verify the

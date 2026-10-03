@@ -6,6 +6,46 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## The Mac gateway uses a checksum-pinned managed Deno 2.9.5 - 2026-10-03
+
+Only the Mac gateway launcher uses the official aarch64 Deno 2.9.5 artifact in
+`.data/runtimes/deno/2.9.5-b5bd08edab254d42d7b05aa5b6cb4c9b8d4dede4975aff76951ce2cce18866fa/deno`. Released Deno 2.9.6
+and 2.9.7 split read/write permission lists without decoding doubled commas, which breaks literal comma paths in
+`CODEX_HOME`; 2.9.5 retains that decoder. This is a service-specific compatibility rollback, not a global downgrade, and
+omits the later releases' fixes. CI remains pinned to 2.9.5. The released-source comparison is retained in the issue
+#812 runtime prerequisite record, with exact commits `17fadf33a8df3af9488b9f42efd1f2290d6dc7a3` (2.9.5) and
+`0c071246a412575e07423263404a5d13e7ed6aa2` (2.9.7).
+
+The fixed official archive SHA-256 is `b796aadd131f6930560c1ee040cf0d6f53933fbb987464e9ff46bd7ea4830615`; the extracted
+binary SHA-256 is `b5bd08edab254d42d7b05aa5b6cb4c9b8d4dede4975aff76951ce2cce18866fa`. Deployment prepares and verifies
+this immutable path under the existing deployment lock before release selection or service interruption, refuses corrupt
+or symlink destinations, and publishes only completed verified bytes. The launcher checks the binary again, uses it for
+both the dotenv-loading task and frozen application, selects the physical release's configuration, preserves literal
+native-home permissions and limits native writes to `app-server-control`. The application denies writes to
+`.data/runtimes`; missing or corrupt runtime state fails closed without falling back to the global binary.
+
+Existing synthetic proof: runtime preparation and actual disposable deploy ordering passed 14 tests in receipt
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/4fa44cf3-59d5-4fa1-9b5b-dadc5685e414`; the actual
+managed launcher passed all 11 native-home, configuration/lock, write-denial, failure and shutdown cases in
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/6ac18d06-c49d-438e-a398-b22be79ddd65`. A disposable
+native KV roundtrip seeded with 2.9.7, updated with 2.9.5 and reread with 2.9.7 preserved exact values and rejected
+stale CAS, with every child and KV handle settled; its result is
+`.codex-worktrees/plan-issue-812-abcb41d3034/.data/issue-812/kv-compatibility/roundtrip-result.json`. These proofs cover
+synthetic state, not the live gateway database or service.
+
+The normal test task adds three separate scoped Mac fixtures, retaining all existing suite segments and permissions. The
+launcher matrix must execute 2.9.5, including on Linux: only its disposable runtime coordinates and checksum comparison
+are substituted, and comma, symlink, absent-directory and runtime-write-denial cases remain required. Running that
+matrix with 2.9.7 must report the unsupported runtime rather than skip assertions. The existing `verify.sh` task call
+and CI test call include these fixtures without duplicate invocations or new tasks.
+
+Status: source and focused synthetic evidence accepted for integration; committed combined verification and
+whole-gateway synthetic acceptance remain required. Preparing the runtime in the canonical store or adopting it through
+live `deploy:mac`/launchd requires the separately approved concrete rollout. This decision authorizes no global binary
+or PATH change, other service downgrade, real credential mutation, live database probe, automatic upgrade, runtime
+fallback or runtime-store pruning. Reversal risk: restoring the global 2.9.6/7 launcher breaks escaped native-home
+paths; removing integrity checks or the runtime write denial lets the service use or alter an unverified executable.
+
 ## Codex collaboration tools work over the Chat-only routes - 2026-10-03
 
 Codex clients expose the multi-agent tools (`spawn_agent`, `followup_task`, `send_message`, `wait_agent`,

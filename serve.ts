@@ -57,13 +57,10 @@ export const shutdownOptionalTelemetry = async (): Promise<void> => {
   }
 };
 
-const MAC_BILLING_MAINTENANCE_INTERVAL_MS = 60_000;
-const MAC_ANALYTICS_PRUNE_INTERVAL_MS = 60 * 60_000;
-
 /**
- * The Mac has its own KV database, so it cannot rely on the VPS scheduler or
- * on event-driven maintenance when the database is otherwise idle. This is
- * opt-in from `scripts/serve-mac.ts`; the VPS launcher never calls it.
+ * The Mac startup event reconciles due billing and prunes its own KV once.
+ * Later terminal, admin-read and analytics-write events maintain that same KV;
+ * no periodic work runs while it is idle. The VPS launcher never calls this.
  */
 export const startMacMaintenance = (kv: Deno.Kv): (() => Promise<void>) => {
   let stopped = false;
@@ -102,14 +99,10 @@ export const startMacMaintenance = (kv: Deno.Kv): (() => Promise<void>) => {
 
   reconcile();
   prune();
-  const reconciliationTimer = setInterval(reconcile, MAC_BILLING_MAINTENANCE_INTERVAL_MS);
-  const pruningTimer = setInterval(prune, MAC_ANALYTICS_PRUNE_INTERVAL_MS);
 
   return (): Promise<void> => {
     if (stopPromise) return stopPromise;
     stopped = true;
-    clearInterval(reconciliationTimer);
-    clearInterval(pruningTimer);
     stopPromise = Promise.all([reconciliation ?? Promise.resolve(), pruning ?? Promise.resolve()]).then(() => {});
     return stopPromise;
   };
@@ -134,8 +127,8 @@ export const startMacMaintenance = (kv: Deno.Kv): (() => Promise<void>) => {
  * Durable state (pending reconciliation markers, capacity buckets, retained
  * analytics) waits for the next event instead of a timer, and `deno.json` no
  * longer enables the `cron` unstable feature, so `Deno.cron` does not exist here.
- * The Mac launcher is the one explicit exception: it starts the local billing
- * and analytics maintenance above against its own KV.
+ * The Mac launcher also checks due billing and analytics once on startup
+ * against its own KV, then the same event hooks handle subsequent work.
  */
 const serveHandler = createServeHandler();
 

@@ -226,6 +226,93 @@ Deno.test("thread/read fields serve loaded threads and local metadata only enric
   assert.equal(session.usageSource, "state_db");
 });
 
+Deno.test("listed session gaps use probed fields before metadata and preserve nonnull listed values", () => {
+  const thread = {
+    id: "01a0bd67-listed-and-probed",
+    name: "Probed title",
+    preview: "Probed preview",
+    cwd: "/probed-repo",
+    model: "gpt-6.1-sol",
+    effort: "ultra",
+    sourceKind: "subagent",
+    parentThreadId: "probed-parent",
+    updatedAtMs: 2,
+    modelProvider: "uos",
+  };
+  const listed = {
+    id: thread.id,
+    name: null,
+    preview: null,
+    cwd: null,
+    model: null,
+    effort: null,
+    sourceKind: null,
+    parentThreadId: null,
+    updatedAtMs: null,
+    modelProvider: null,
+  };
+  const input = {
+    id: thread.id,
+    source: { id: "local", name: "Test machine", socketPath: "/var/lib/uos-supervisor/local.sock", codexHome: "/Users/example/.codex" },
+    metadata: {
+      title: "Metadata title",
+      preview: "Metadata preview",
+      cwd: "/metadata-repo",
+      model: "metadata-model",
+      effort: "low",
+      tokensUsed: 0,
+      gitBranch: "development",
+      updatedAtMs: 1,
+      archived: false,
+      threadSource: "metadata-source",
+      parentThreadId: "metadata-parent",
+      agentNickname: null,
+    },
+    probe: { runtimeStatus: "active", activeFlags: [], turnStatus: "inProgress", thread, sampled: true },
+    loaded: true,
+    sampledAtMs: 3,
+    childIds: null,
+    unavailable: [],
+  };
+  const filled = sessionFromParts({ ...input, listed });
+  assert.equal(filled.title, thread.name);
+  assert.equal(filled.titleSource, "thread");
+  assert.equal(filled.cwd, thread.cwd);
+  assert.equal(filled.model, thread.model);
+  assert.equal(filled.effort, thread.effort);
+  assert.equal(filled.provider, thread.modelProvider);
+  assert.equal(filled.sourceKind, thread.sourceKind);
+  assert.equal(filled.parentThreadId, thread.parentThreadId);
+  assert.equal(filled.lastActivityAtMs, thread.updatedAtMs);
+  const conflicting = {
+    ...thread,
+    name: "Listed title",
+    preview: "Listed preview",
+    cwd: "/listed-repo",
+    model: "listed-model",
+    effort: "high",
+    sourceKind: "cli",
+    parentThreadId: "listed-parent",
+    updatedAtMs: 0,
+    modelProvider: "listed-provider",
+  };
+  const retained = sessionFromParts({ ...input, listed: conflicting });
+  assert.equal(retained.title, conflicting.name);
+  assert.equal(retained.cwd, conflicting.cwd);
+  assert.equal(retained.model, conflicting.model);
+  assert.equal(retained.effort, conflicting.effort);
+  assert.equal(retained.provider, conflicting.modelProvider);
+  assert.equal(retained.sourceKind, conflicting.sourceKind);
+  assert.equal(retained.parentThreadId, conflicting.parentThreadId);
+  assert.equal(retained.lastActivityAtMs, 0);
+  const mixed = sessionFromParts({ ...input, listed: { ...conflicting, model: null, parentThreadId: null } });
+  assert.equal(mixed.title, conflicting.name);
+  assert.equal(mixed.model, thread.model);
+  assert.equal(mixed.parentThreadId, thread.parentThreadId);
+  const preview = sessionFromParts({ ...input, listed, probe: { ...input.probe, thread: { ...thread, name: null } } });
+  assert.equal(preview.title, thread.preview);
+});
+
 Deno.test("shared quota projection keeps one account-wide bucket per limit", () => {
   const quota = quotaFromRateLimits({
     rateLimits: { limitId: "codex", primary: { usedPercent: 29, windowDurationMins: 10080, resetsAt: 1_790_478_535 } },

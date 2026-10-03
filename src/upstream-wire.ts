@@ -3,8 +3,8 @@
 import { CODEX_AUTH_REAUTH_MESSAGE, CODEX_AUTH_REAUTH_WARNING, CodexError } from "./codex/index.ts";
 import { CEREBRAS_GPT_OSS_120B_MODEL, CerebrasError, getCerebrasProviderRequestId } from "./provider/cerebras.ts";
 import { CEREBRAS_RATE_LIMIT_HEADERS } from "./provider/cerebras-rate-limits.ts";
-import { DeepSeekError, getDeepSeekProviderRequestId } from "./deepseek/index.ts";
-import { getLithosProviderRequestId, LITHOS_RATE_LIMIT_HEADERS, LithosError } from "./provider/lithos.ts";
+import { DEEPSEEK_OFFICIAL_MODEL_IDS, DeepSeekError, getDeepSeekProviderRequestId } from "./deepseek/index.ts";
+import { getLithosProviderRequestId, LITHOS_MODEL_IDS, LITHOS_RATE_LIMIT_HEADERS, LithosError } from "./provider/lithos.ts";
 import { ApiKeyQuotaDispatchError } from "./api-key-policy.ts";
 import { BOUNDED_RESPONSE_BODY_MAX_BYTES, BOUNDED_RESPONSE_BODY_TIMEOUT_MS, readBoundedResponseBody } from "./bounded-response-body.ts";
 import { openaiError } from "./http.ts";
@@ -765,33 +765,45 @@ const diagnosticContentLabel = (value: unknown): string => {
   return Array.isArray(value) ? "parts" : typeof value;
 };
 
+const CHAT_BODY_DIAGNOSTIC_MESSAGE_LIMIT = 16;
+const CHAT_BODY_DIAGNOSTIC_MODELS: readonly string[] = [...DEEPSEEK_OFFICIAL_MODEL_IDS, ...LITHOS_MODEL_IDS];
+const diagnosticKnownString = (value: unknown, known: readonly string[]): string | null => (typeof value === "string" && known.includes(value) ? value : null);
+
 /**
  * Bounded, content-free digest of a projected DeepSeek Chat body. Upstream 4xx
  * answers are client-visible but were previously opaque in the server log: a
  * production HTTP 400 was only diagnosable by reading the client's rollout file.
  * Message text, tool names, arguments, and ids are deliberately excluded — the
- * digest carries shapes, not prompts.
+ * digest carries shapes, not prompts. Only the final 16 message positions are
+ * projected; fixed vocabularies and scalar counts bound nested metadata and
+ * serialization independently of history and content-part sizes.
  */
 export const deepSeekChatBodyDiagnostic = (body: Record<string, unknown>): Record<string, unknown> => {
-  const messages = Array.isArray(body.messages) ? body.messages.filter(isRecord) : [];
-  const lastUser = messages.findLastIndex((message) => message.role === "user");
+  const messages: unknown[] = Array.isArray(body.messages) ? body.messages : [];
+  const lastUser = messages.findLastIndex((message) => isRecord(message) && message.role === "user");
+  const omittedMessages = Math.max(0, messages.length - CHAT_BODY_DIAGNOSTIC_MESSAGE_LIMIT);
   return {
-    model: typeof body.model === "string" ? body.model : null,
-    reasoning_effort: typeof body.reasoning_effort === "string" ? body.reasoning_effort : null,
+    model: diagnosticKnownString(body.model, CHAT_BODY_DIAGNOSTIC_MODELS),
+    reasoning_effort: diagnosticKnownString(body.reasoning_effort, ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]),
     stream: body.stream === true,
     tools: Array.isArray(body.tools) ? body.tools.length : 0,
-    tool_choice: typeof body.tool_choice === "string" ? body.tool_choice : null,
-    max_tokens: typeof body.max_tokens === "number" ? body.max_tokens : null,
+    tool_choice: diagnosticKnownString(body.tool_choice, ["auto", "none", "required"]),
+    max_tokens: typeof body.max_tokens === "number" && Number.isSafeInteger(body.max_tokens) ? body.max_tokens : null,
     message_count: messages.length,
     last_user_index: lastUser,
-    messages: messages.map((message, index) => ({
-      index,
-      role: typeof message.role === "string" ? message.role : null,
-      reasoning: diagnosticReasoningLabel(message.reasoning_content),
-      tool_calls: Array.isArray(message.tool_calls) ? message.tool_calls.length : 0,
-      content: diagnosticContentLabel(message.content),
-      after_last_user: index > lastUser,
-    })),
+    omitted_message_count: omittedMessages,
+    messages: messages.slice(omittedMessages).map((value, offset) => {
+      const message = isRecord(value) ? value : {};
+      const index = omittedMessages + offset;
+      return {
+        index,
+        role: diagnosticKnownString(message.role, ["system", "developer", "user", "assistant", "tool", "function"]),
+        reasoning: diagnosticReasoningLabel(message.reasoning_content),
+        tool_calls: Array.isArray(message.tool_calls) ? message.tool_calls.length : 0,
+        content: diagnosticContentLabel(message.content),
+        after_last_user: index > lastUser,
+      };
+    }),
   };
 };
 

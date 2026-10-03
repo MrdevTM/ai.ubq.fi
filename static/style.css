@@ -1284,6 +1284,11 @@ details[data-usage][open] summary[data-usage-title]::after {
 }
 
 @media (max-width: 760px) {
+  input,
+  textarea {
+    font-size: 16px;
+  }
+
   [data-shell] {
     padding: calc(14px + env(safe-area-inset-top)) 12px calc(48px + env(safe-area-inset-bottom));
     gap: 14px;
@@ -1486,8 +1491,11 @@ details[data-usage][open] summary[data-usage-title]::after {
     transition-duration: var(--duration-fast);
   }
 
-  [data-toast] {
+  [data-toaster] > [data-toast],
+  [data-toaster] > [data-toast][data-visible],
+  [data-toaster] > [data-toast][data-exiting] {
     transform: none;
+    transition: opacity var(--duration-fast) var(--ease-out);
   }
 
   [data-card]:hover,

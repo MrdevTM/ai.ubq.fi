@@ -6552,6 +6552,7 @@ const VIEW_HASHES = {
   kernel: "kernel",
   pubkeys: "pubkeys",
   defaults: "defaults",
+  models: "models",
   analytics: "analytics",
   providers: "providers",
   errors: "errors",
@@ -6724,11 +6725,16 @@ const retentionSkipReasonText = (reason) => {
 const renderErrorsRetention = (payload) => {
   const parts = [];
   const retention = payload?.retention;
-  if (retention && retention.state === "ok") {
-    const used = (retention.stored_bytes ?? 0) + (retention.reserved_bytes ?? 0);
+  if (
+    retention?.state === "ok" &&
+    [retention.stored_bytes, retention.reserved_bytes, retention.budget_bytes, retention.records].every((value) =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0
+    ) && Number.isFinite(retention.stored_bytes + retention.reserved_bytes)
+  ) {
+    const used = retention.stored_bytes + retention.reserved_bytes;
     parts.push(
       `Capture storage ${formatRetentionBytes(used)} of ${formatRetentionBytes(retention.budget_bytes)} · ${
-        formatNumber(retention.records ?? 0)
+        formatNumber(retention.records)
       } recordings`,
     );
     if (typeof retention.evicted_records === "number" && retention.evicted_records > 0) {

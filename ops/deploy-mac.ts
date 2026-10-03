@@ -1,5 +1,6 @@
 // Run from the canonical Mac checkout after committing the candidate.
 import { pruneReleases } from "./release-retention.ts";
+import { prepareMacRuntime } from "./mac-runtime.ts";
 if (Deno.build.os !== "darwin") throw new Error("This deployment requires macOS");
 const root = await Deno.realPath(".");
 if (root !== "/Users/nv/repos/ubiquity/ai.ubq.fi") throw new Error("Run from the canonical Mac repository root");
@@ -17,6 +18,7 @@ try {
   }
   const sha = await command("git", ["rev-parse", "HEAD"]);
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("A full Git revision is required");
+  await prepareMacRuntime(root);
   const release = `.data/releases/${sha}`;
   try {
     await Deno.stat(release);

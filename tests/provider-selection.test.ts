@@ -9,7 +9,7 @@ import { readOpenRouterApiKey } from "../src/provider/openrouter.ts";
 import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/models/codex-models-whitelist.ts";
 import handler from "../src/handler/index.ts";
 import { setKvForTest } from "../src/kv.ts";
-import { handleModels } from "../src/models/catalog.ts";
+import { buildModelCatalogSnapshot, handleModels } from "../src/models/catalog.ts";
 import { RECORD_PROVIDER_IDS } from "../src/provider/health.ts";
 import { PROVIDER_PRESENTATION, PROVIDER_TIERS, providerPresentation } from "../src/provider/presentation.ts";
 import {
@@ -236,7 +236,7 @@ const catalogFixture = () => ({
     { id: "gpt-5.6-sol", providers: [{ id: "codex" as const, owned_by: "openai", supported_endpoints: ["/v1/responses"] }] },
     { id: "gpt-5.6-sol", providers: [{ id: "surplus" as const, owned_by: "moonshot", supported_endpoints: ["/v1/responses"] }] },
     { id: "kimi-k2", providers: [{ id: "surplus" as const, owned_by: "moonshot", supported_endpoints: ["/v1/chat/completions"] }] },
-    { id: "deepseek-flash", providers: [{ id: "deepseek" as const, owned_by: "deepseek", supported_endpoints: ["/v1/chat/completions"] }] },
+    { id: "deepseek-flash", providers: [{ id: "deepseek" as const, owned_by: "deepseek", supported_endpoints: ["/v1/chat/completions", "/v1/responses"] }] },
   ],
   sources: {
     codex: { status: "available" as const, count: 1, updated_at_ms: 1 },
@@ -296,63 +296,81 @@ Deno.test("admin provider picker reports the roster, catalog counts, and the sav
 });
 
 Deno.test("every selectable provider carries a complete presentation and a health key the view reports", async () => {
-  await withKv(new SelectionKv(), async () => {
-    const response = await handleAdminProviderSelectionGet({ buildCatalog: () => Promise.resolve(catalogFixture()) });
-    const body = (await response.json()) as {
-      data: {
-        providers: {
-          id: string;
-          label?: string;
-          tier?: string;
-          tier_label?: string;
-          detail?: string;
-          endpoints?: string[];
-          health_key?: string;
-        }[];
-        tiers: { id: string; label: string }[];
+  const previousDeepSeekKey = Deno.env.get("DEEPSEEK_API_KEY");
+  Deno.env.set("DEEPSEEK_API_KEY", "fixture-deepseek-key");
+  try {
+    await withKv(new SelectionKv(), async () => {
+      const catalog = await buildModelCatalogSnapshot();
+      const response = await handleAdminProviderSelectionGet({ buildCatalog: () => Promise.resolve(catalog) });
+      const body = (await response.json()) as {
+        data: {
+          providers: {
+            id: string;
+            label?: string;
+            tier?: string;
+            tier_label?: string;
+            detail?: string;
+            endpoints?: string[];
+            health_key?: string;
+          }[];
+          tiers: { id: string; label: string }[];
+        };
       };
-    };
-    assert.deepEqual(
-      body.data.providers.map((provider) => provider.id),
-      [...SELECTABLE_PROVIDER_IDS],
-      "the roster keeps the waterfall order"
-    );
-    assert.deepEqual(
-      body.data.tiers.map((tier) => tier.id),
-      PROVIDER_TIERS.map((tier) => tier.id),
-      "the tier filter is ordered"
-    );
+      assert.deepEqual(
+        body.data.providers.map((provider) => provider.id),
+        [...SELECTABLE_PROVIDER_IDS],
+        "the roster keeps the waterfall order"
+      );
+      assert.deepEqual(
+        body.data.tiers.map((tier) => tier.id),
+        PROVIDER_TIERS.map((tier) => tier.id),
+        "the tier filter is ordered"
+      );
 
-    // `/health/providers` is the provider-health view the panel reads, and it
-    // publishes exactly one key per provider it can report.
-    const healthKeys = new Set(Object.keys(await (await handleHealthProviders()).json()));
-    for (const provider of body.data.providers) {
-      const presentation = PROVIDER_PRESENTATION[provider.id as SelectableProviderId];
-      assert.ok(presentation, `${provider.id} must have a presentation entry`);
-      assert.equal(provider.label, presentation.label, `${provider.id} label`);
-      assert.equal(provider.tier, presentation.tier, `${provider.id} tier`);
-      assert.equal(provider.tier_label, PROVIDER_TIERS.find((tier) => tier.id === presentation.tier)?.label, `${provider.id} tier label`);
-      assert.equal(provider.detail, presentation.detail, `${provider.id} detail`);
-      assert.ok(typeof provider.detail === "string" && provider.detail.length > 0, `${provider.id} detail must be copy`);
-      assert.deepEqual(provider.endpoints, [...presentation.endpoints], `${provider.id} endpoints`);
-      assert.equal(provider.health_key, presentation.health_key, `${provider.id} health key`);
-      assert.equal(healthKeys.has(presentation.health_key), true, `${presentation.health_key} must be a published health key`);
-      assert.equal(RECORD_PROVIDER_IDS.includes(presentation.health_key), true, `${presentation.health_key} must be reportable provider health`);
-    }
+      // `/health/providers` is the provider-health view the panel reads, and it
+      // publishes exactly one key per provider it can report.
+      const healthKeys = new Set(Object.keys(await (await handleHealthProviders()).json()));
+      for (const provider of body.data.providers) {
+        const presentation = PROVIDER_PRESENTATION[provider.id as SelectableProviderId];
+        assert.ok(presentation, `${provider.id} must have a presentation entry`);
+        assert.equal(provider.label, presentation.label, `${provider.id} label`);
+        assert.equal(provider.tier, presentation.tier, `${provider.id} tier`);
+        assert.equal(provider.tier_label, PROVIDER_TIERS.find((tier) => tier.id === presentation.tier)?.label, `${provider.id} tier label`);
+        assert.equal(provider.detail, presentation.detail, `${provider.id} detail`);
+        assert.ok(typeof provider.detail === "string" && provider.detail.length > 0, `${provider.id} detail must be copy`);
+        assert.deepEqual(provider.endpoints, [...presentation.endpoints], `${provider.id} endpoints`);
+        assert.equal(provider.health_key, presentation.health_key, `${provider.id} health key`);
+        assert.equal(healthKeys.has(presentation.health_key), true, `${presentation.health_key} must be a published health key`);
+        assert.equal(RECORD_PROVIDER_IDS.includes(presentation.health_key), true, `${presentation.health_key} must be reportable provider health`);
+      }
 
-    const lithos = body.data.providers.find((provider) => provider.id === "lithos");
-    assert.ok(lithos, "the roster must list lithos");
-    assert.equal(lithos.label, "LithosAI");
-    assert.equal(lithos.health_key, "lithos");
+      const deepseek = body.data.providers.find((provider) => provider.id === "deepseek");
+      assert.ok(deepseek, "the roster must list deepseek");
+      assert.deepEqual(deepseek.endpoints, ["/v1/chat/completions", "/v1/responses"]);
+      assert.match(deepseek.detail ?? "", /Chat Completions upstream and Responses through the gateway's translation/);
+      for (const id of DEEPSEEK_OFFICIAL_MODEL_IDS) {
+        const provider = catalog.models.find((model) => model.id === id)?.providers.find((candidate) => candidate.id === "deepseek");
+        assert.ok(provider, `${id} must have a DeepSeek catalog provider`);
+        assert.deepEqual(deepseek.endpoints, provider.supported_endpoints, `${id} catalog and roster endpoints must agree`);
+      }
 
-    // A roster id with no copy yet still renders completely instead of dropping out.
-    const fallback = providerPresentation("future-provider");
-    assert.equal(fallback.label, "future-provider");
-    assert.equal(fallback.tier, "direct");
-    assert.match(fallback.detail, /no presentation entry yet/);
-    assert.deepEqual([...fallback.endpoints], []);
-    assert.equal(fallback.health_key, "future-provider");
-  });
+      const lithos = body.data.providers.find((provider) => provider.id === "lithos");
+      assert.ok(lithos, "the roster must list lithos");
+      assert.equal(lithos.label, "LithosAI");
+      assert.equal(lithos.health_key, "lithos");
+
+      // A roster id with no copy yet still renders completely instead of dropping out.
+      const fallback = providerPresentation("future-provider");
+      assert.equal(fallback.label, "future-provider");
+      assert.equal(fallback.tier, "direct");
+      assert.match(fallback.detail, /no presentation entry yet/);
+      assert.deepEqual([...fallback.endpoints], []);
+      assert.equal(fallback.health_key, "future-provider");
+    });
+  } finally {
+    if (previousDeepSeekKey === undefined) Deno.env.delete("DEEPSEEK_API_KEY");
+    else Deno.env.set("DEEPSEEK_API_KEY", previousDeepSeekKey);
+  }
 });
 
 const stripBase64Padding = (base64: string): string => {

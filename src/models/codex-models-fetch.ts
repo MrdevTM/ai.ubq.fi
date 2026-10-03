@@ -87,6 +87,7 @@ const fetchCodexModelsFromAccounts = async (
       fallback = res;
       break;
     }
+    await recordSingleAccountCodexCatalog(res, accountEntry.auth.account_id, clientVersion);
     return { kind: "response", response: res };
   }
   return { kind: "next_url", fallback };
@@ -228,6 +229,15 @@ const readCodexModelsJsonBody = async (res: Response): Promise<Record<string, un
   } catch {
     return null;
   }
+};
+
+/** Record fresh single-account evidence without consuming or rewriting its upstream response. */
+const recordSingleAccountCodexCatalog = async (res: Response, accountId: string, clientVersion: string): Promise<void> => {
+  if (!res.ok) return;
+  const body = await readCodexModelsJsonBody(res.clone());
+  if (!body) return;
+  const contribution = contributionFromBody(accountId, body);
+  await recordCodexAccountCatalogs([{ accountId, clientVersion, slugs: contribution.slugs }]);
 };
 
 type CodexAccountCatalogAttempt = Readonly<{ catalog: CodexAccountCatalogContribution | null; fallback: Response | null }>;
