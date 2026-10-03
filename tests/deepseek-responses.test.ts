@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload, toResponsesUsage } from "../src/deepseek/responses-payload.ts";
 import { createDeepSeekResponsesStreamTranslator, deepSeekResponsesTerminalKind, encodeResponsesEvent } from "../src/deepseek/responses-stream.ts";
 import { toDeepSeekChatMessages, toDeepSeekResponsesChatBody } from "../src/deepseek/chat-projection.ts";
-import { FORWARDED_PAYLOAD_POLICY } from "../src/deepseek/forwarded-payload-policy.ts";
+import { type ForwardedPayloadElision, FORWARDED_PAYLOAD_POLICY } from "../src/deepseek/forwarded-payload-policy.ts";
 import { deepSeekFinishDisposition, deepSeekThinkingToolChoiceConflict } from "../src/deepseek/index.ts";
 
 const echo: DeepSeekResponsesEcho = { tools: undefined, tool_choice: undefined, parallel_tool_calls: true, instructions: null };
@@ -200,9 +200,72 @@ Deno.test("deepseek responses: flattens namespaced tools and drops what the API 
     tools.map((tool) => tool.function.name),
     ["now", "clock_now", "sleep"]
   );
-  // A disambiguated name maps back to the name the client asked for.
-  assert.equal(toolNames.get("clock_now"), "now");
+  // A namespaced tool keeps the namespace the client resolves the call with, so
+  // a flattened Chat name round-trips to the exact Responses identity.
+  assert.deepEqual(toolNames.get("clock_now"), { name: "now", namespace: "clock" });
+  assert.deepEqual(toolNames.get("sleep"), { name: "sleep", namespace: "clock" });
+  assert.equal(toolNames.has("now"), false);
   assert.deepEqual(body.tool_choice, { type: "function", function: { name: "now" } });
+});
+
+Deno.test("deepseek responses: a namespaced tool call returns its namespace to the client", () => {
+  const body = toDeepSeekResponsesChatBody(
+    {
+      input: "hi",
+      tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object" } }] }],
+    },
+    "deepseek-v4-flash",
+    false
+  );
+  assert.equal(body.ok, true);
+  const toolCall = { id: "call_1", type: "function", function: { name: "spawn_agent", arguments: "{}" } };
+  const payload = toDeepSeekResponsesPayload(
+    chatCompletion({ content: "", tool_calls: [toolCall] }),
+    "deepseek-v4-flash",
+    "resp_ns",
+    echo,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  assert.deepEqual((payload.output as Record<string, unknown>[])[0], {
+    id: "fc_resp_ns_0_0",
+    type: "function_call",
+    status: "completed",
+    call_id: "call_1",
+    name: "spawn_agent",
+    namespace: "collaboration",
+    arguments: "{}",
+  });
+
+  const translator = createDeepSeekResponsesStreamTranslator(
+    "deepseek-v4-flash",
+    "resp_ns_stream",
+    echo,
+    1_780_000_000,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  translator.open();
+  const events = [
+    ...translator.push(chatChunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "spawn_agent", arguments: "{}" } }] })),
+    ...translator.finish(),
+  ];
+  const added = events.find((event) => event.type === "response.output_item.added") as { item: Record<string, unknown> };
+  assert.equal(added.item.name, "spawn_agent");
+  assert.equal(added.item.namespace, "collaboration");
+  const completed = events.filter((event) => event.type === "response.completed");
+  assert.equal(completed.length, 1);
+  assert.deepEqual((completed[0].response as { output: Record<string, unknown>[] }).output, [
+    {
+      id: "fc_resp_ns_stream_0",
+      type: "function_call",
+      status: "completed",
+      call_id: "call_1",
+      name: "spawn_agent",
+      namespace: "collaboration",
+      arguments: "{}",
+    },
+  ]);
 });
 
 Deno.test("deepseek responses: replays reasoning on tool turns because the provider requires it", () => {
@@ -520,6 +583,80 @@ Deno.test("deepseek responses: a streamed freeform call emits custom tool events
   ]);
 });
 
+Deno.test("deepseek responses: projects a sub-agent message envelope onto a user turn", () => {
+  const plaintextPayload = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "delegate this" }] },
+      {
+        type: "agent_message",
+        author: "/root/probe_qwen2",
+        recipient: "/root",
+        content: [
+          { type: "input_text", text: "ok" },
+          // A thread whose model runs outside the ChatGPT backend carries its
+          // payload here in the clear, so it must reach the model.
+          { type: "encrypted_content", encrypted_content: "payload-from-worker" },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(plaintextPayload.ok, true);
+  assert.deepEqual(plaintextPayload.value, [
+    { role: "user", content: "delegate this" },
+    { role: "user", content: "[agent message] /root/probe_qwen2 -> /root:\nok\npayload-from-worker" },
+  ]);
+
+  // A sealed payload is a Fernet token only the ChatGPT backend can open, so it
+  // is declared instead of forwarded as ciphertext.
+  const sealedPayload = toDeepSeekChatMessages(
+    [
+      {
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/worker",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK" },
+          { type: "encrypted_content", encrypted_content: `gAAAAA${"A".repeat(120)}` },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(sealedPayload.ok, true);
+  assert.deepEqual(sealedPayload.value, [
+    {
+      role: "user",
+      content: "[agent message] /root -> /root/worker:\nMessage Type: NEW_TASK\n[gateway: 1 sealed agent-message part(s) were not readable and omitted]",
+    },
+  ]);
+});
+
+Deno.test("deepseek responses: bounds oversized sub-agent payloads under the declared policy", () => {
+  const oversized = "x".repeat(FORWARDED_PAYLOAD_POLICY.perMessageLimit + 1_000);
+  const message = {
+    type: "agent_message",
+    author: "/root/worker",
+    recipient: "/root",
+    content: [{ type: "encrypted_content", encrypted_content: oversized }],
+  };
+  const elisions: ForwardedPayloadElision[] = [];
+  const reduced = toDeepSeekChatMessages([message], null, "reduce", elisions);
+  assert.equal(reduced.ok, true);
+  const content = (reduced.value[0] as { content: string }).content;
+  assert.ok(content.length < oversized.length, "the payload must be reduced below its original size");
+  assert.ok(content.includes(FORWARDED_PAYLOAD_POLICY.version), "the elision marker must name the policy version");
+  assert.equal(elisions.length, 1);
+  assert.equal(elisions[0].kind, "agent_message");
+  assert.ok(elisions[0].omittedBytes > 0);
+  assert.equal(elisions[0].path, "input[0].content");
+
+  // An explicit truncation "disabled" fails closed instead of mutating the input.
+  const rejected = toDeepSeekChatMessages([message], null, "reject", []);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, "context_length_exceeded");
+});
+
 Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
   const schema = toDeepSeekResponsesChatBody({ input: "hi", text: { format: { type: "json_schema", name: "x" } } }, "deepseek-flash", false);
   assert.equal(schema.ok, false);
@@ -552,7 +689,7 @@ Deno.test("deepseek responses: builds a completed Responses object from a Chat c
     "deepseek-v4-flash",
     "resp_test",
     echo,
-    new Map([["clock_now", "now"]])
+    new Map([["clock_now", { name: "now", namespace: "clock" }]])
   );
   assert.equal(payload.object, "response");
   assert.equal(payload.status, "completed");
@@ -1001,14 +1138,7 @@ Deno.test("deepseek responses: a length-truncated tool call closes incomplete be
   // partial call it may execute, so the terminal disposition is decided first
   // and both tool kinds carry the official non-completed status in the done
   // event and in the delivered output.
-  const translator = createDeepSeekResponsesStreamTranslator(
-    "deepseek-flash",
-    "resp_len_tool",
-    echo,
-    1_780_000_000,
-    new Map<string, string>(),
-    new Set(["exec"])
-  );
+  const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_len_tool", echo, 1_780_000_000, new Map(), new Set(["exec"]));
   const events: Record<string, unknown>[] = [];
   events.push(
     ...translator.push(

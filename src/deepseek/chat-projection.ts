@@ -5,6 +5,7 @@ import {
   DEEPSEEK_RESPONSES_PROFILE,
   type DeepSeekResponsesFailure,
   type DeepSeekResponsesResult,
+  type OriginalToolName,
   failure,
   originalToolName,
 } from "./responses.ts";
@@ -145,7 +146,12 @@ const oversizedPayloadFailure = (path: string, bytes: number, callId: string | n
  * Deterministic reduction: keep a byte prefix, append the marker, and stay at
  * or below the declared limit. The same input always produces the same output.
  */
-const reduceForwardedPayload = (value: string, path: string, callId: string | null): Readonly<{ content: string; elision: ForwardedPayloadElision }> => {
+const reduceForwardedPayload = (
+  value: string,
+  path: string,
+  callId: string | null,
+  kind: ForwardedPayloadElision["kind"] = "tool_output"
+): Readonly<{ content: string; elision: ForwardedPayloadElision }> => {
   const originalBytes = forwardedByteLength(value);
   let head = utf8Head(value, FORWARDED_PAYLOAD_POLICY.perMessageLimit);
   for (;;) {
@@ -158,7 +164,7 @@ const reduceForwardedPayload = (value: string, path: string, callId: string | nu
         elision: {
           path,
           callId,
-          kind: "tool_output",
+          kind,
           originalBytes,
           forwardedBytes: forwardedByteLength(content),
           omittedBytes: originalBytes - headBytes,
@@ -260,6 +266,63 @@ const appendMessageItem = (
  * the only shape the Chat contract accepts. A `reasoning` item is carried onto
  * the assistant turn that follows it as `reasoning_content`.
  */
+/**
+ * A sub-agent message envelope. Chat Completions has no agent addressing, so
+ * the envelope becomes a user turn that names its author and recipient; the
+ * client's own multi-agent layer does the routing. An unreadable encrypted
+ * part is declared rather than silently dropped, because the model must not
+ * treat the forwarded text as the whole message.
+ */
+/**
+ * Distinguishes a sealed agent-message payload from a forwarded one. Sealed
+ * payloads are Fernet tokens, which begin with the version byte base64-encoded
+ * as `gAAAAA` and run long; everything else is content the receiving model can
+ * actually read.
+ */
+const isSealedAgentPayload = (value: string): boolean => value.startsWith("gAAAAA") && value.length >= 100;
+
+const chatAgentMessageItem = (
+  item: Record<string, unknown>,
+  reduction: ForwardedPayloadReduction,
+  path: string,
+  elisions: ForwardedPayloadElision[]
+): DeepSeekResponsesResult<Record<string, unknown>> => {
+  const author = getString(item.author) ?? "agent";
+  const recipient = getString(item.recipient) ?? "root";
+  const parts = Array.isArray(item.content) ? item.content : [];
+  const texts: string[] = [];
+  let unreadable = 0;
+  for (const part of parts) {
+    if (!isRecord(part) || Array.isArray(part)) continue;
+    const text = getString(part.text);
+    if (text !== null) {
+      texts.push(text);
+      continue;
+    }
+    const encrypted = getString(part.encrypted_content);
+    if (encrypted === null) continue;
+    // A ChatGPT-backed thread carries a sealed payload that only that backend
+    // can open, and it is not worth forwarding as ciphertext. A thread whose
+    // model runs elsewhere carries the payload itself in this field, so it is
+    // forwarded verbatim; dropping it left sub-agents with an empty task.
+    if (isSealedAgentPayload(encrypted)) {
+      unreadable += 1;
+      continue;
+    }
+    texts.push(encrypted);
+  }
+  const notice = unreadable ? `\n[gateway: ${unreadable} sealed agent-message part(s) were not readable and omitted]` : "";
+  const content = `[agent message] ${author} -> ${recipient}:\n${texts.join("\n")}${notice}`;
+  // An agent message is forwarded payload like any other: it is replayed on
+  // every later parent turn, so it is bounded by the same declared policy.
+  const bytes = forwardedByteLength(content);
+  if (bytes <= FORWARDED_PAYLOAD_POLICY.perMessageLimit) return { ok: true, value: { role: "user", content } };
+  if (reduction === "reject") return oversizedPayloadFailure(path, bytes, null);
+  const reduced = reduceForwardedPayload(content, path, null, "agent_message");
+  elisions.push(reduced.elision);
+  return { ok: true, value: { role: "user", content: reduced.content } };
+};
+
 const appendInputItem = (
   messages: Record<string, unknown>[],
   rawItem: unknown,
@@ -291,6 +354,12 @@ const appendInputItem = (
     const result = chatToolResultItem(rawItem, reduction, `${path}.output`, elisions);
     if (!result.ok) return result;
     messages.push(result.value);
+    return { ok: true, value: undefined };
+  }
+  if (type === "agent_message") {
+    const agentMessage = chatAgentMessageItem(rawItem, reduction, `${path}.content`, elisions);
+    if (!agentMessage.ok) return agentMessage;
+    messages.push(agentMessage.value);
     return { ok: true, value: undefined };
   }
   if (type !== "message") return failure("input.type", `input item type '${type}' is not supported`);
@@ -376,7 +445,7 @@ const uniqueChatName = (used: ReadonlySet<string>, name: string): string => {
   }
 };
 
-type ToolCollector = { tools: Record<string, unknown>[]; toolNames: Map<string, string>; customNames: Set<string>; used: Set<string> };
+type ToolCollector = { tools: Record<string, unknown>[]; toolNames: Map<string, OriginalToolName>; customNames: Set<string>; used: Set<string> };
 
 /**
  * The one parameter a freeform tool is advertised with. Codex's `apply_patch`
@@ -397,7 +466,7 @@ const collectCustom = (collector: ToolCollector, tool: Record<string, unknown>):
   const chatName = uniqueChatName(collector.used, name);
   collector.used.add(chatName);
   collector.customNames.add(chatName);
-  if (chatName !== name) collector.toolNames.set(chatName, name);
+  if (chatName !== name) collector.toolNames.set(chatName, { name, namespace: null });
   collector.tools.push({
     type: "function",
     function: {
@@ -415,7 +484,7 @@ const collectFunction = (collector: ToolCollector, fn: Record<string, unknown>, 
   const preferred = namespace !== null && collector.used.has(name) ? `${namespace}_${name}` : name;
   const chatName = uniqueChatName(collector.used, preferred);
   collector.used.add(chatName);
-  if (chatName !== name) collector.toolNames.set(chatName, name);
+  if (chatName !== name || namespace !== null) collector.toolNames.set(chatName, { name, namespace });
   collector.tools.push(chatFunctionRecord(fn, chatName));
   return { ok: true, value: undefined };
 };
@@ -451,7 +520,9 @@ const collectTool = (collector: ToolCollector, tool: unknown): DeepSeekResponses
 
 const toChatTools = (
   value: unknown
-): DeepSeekResponsesResult<Readonly<{ tools: Record<string, unknown>[]; toolNames: ReadonlyMap<string, string>; customToolNames: ReadonlySet<string> }>> => {
+): DeepSeekResponsesResult<
+  Readonly<{ tools: Record<string, unknown>[]; toolNames: ReadonlyMap<string, OriginalToolName>; customToolNames: ReadonlySet<string> }>
+> => {
   if (!Array.isArray(value)) return failure("tools", "tools must be an array");
   const collector: ToolCollector = { tools: [], toolNames: new Map(), customNames: new Set(), used: new Set() };
   for (const tool of value) {
@@ -461,7 +532,7 @@ const toChatTools = (
   return { ok: true, value: { tools: collector.tools, toolNames: collector.toolNames, customToolNames: collector.customNames } };
 };
 
-const toChatToolChoice = (value: unknown, toolNames: ReadonlyMap<string, string>): DeepSeekResponsesResult<unknown> => {
+const toChatToolChoice = (value: unknown, toolNames: ReadonlyMap<string, OriginalToolName>): DeepSeekResponsesResult<unknown> => {
   if (value === undefined || value === null) return { ok: true, value: undefined };
   if (typeof value === "string") {
     if (value === "none" || value === "auto" || value === "required") return { ok: true, value };
@@ -517,8 +588,8 @@ const applyTools = (
   body: Record<string, unknown>,
   rawRecord: Record<string, unknown>,
   profile: ChatOnlyResponsesProfile
-): DeepSeekResponsesResult<Readonly<{ toolNames: ReadonlyMap<string, string>; customToolNames: ReadonlySet<string> }>> => {
-  const toolNames = new Map<string, string>();
+): DeepSeekResponsesResult<Readonly<{ toolNames: ReadonlyMap<string, OriginalToolName>; customToolNames: ReadonlySet<string> }>> => {
+  const toolNames = new Map<string, OriginalToolName>();
   let customToolNames: ReadonlySet<string> = new Set();
   if (rawRecord.tools !== undefined) {
     const tools = toChatTools(rawRecord.tools);
@@ -593,7 +664,7 @@ export const toDeepSeekResponsesChatBody = (
 ): DeepSeekResponsesResult<
   Readonly<{
     body: Record<string, unknown>;
-    toolNames: ReadonlyMap<string, string>;
+    toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     elisions: readonly ForwardedPayloadElision[];
   }>

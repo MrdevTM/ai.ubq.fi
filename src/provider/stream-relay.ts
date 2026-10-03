@@ -1,7 +1,7 @@
 // Provider stream relay, extracted from src/openai.ts.
 
 import { type DeepSeekStreamFrame } from "../deepseek/stream.ts";
-import { type ChatOnlyResponsesProfile } from "../deepseek/responses.ts";
+import { type ChatOnlyResponsesProfile, type OriginalToolName } from "../deepseek/responses.ts";
 import { type DeepSeekResponsesEcho } from "../deepseek/responses-payload.ts";
 import { createDeepSeekResponsesStreamTranslator, encodeResponsesEvent } from "../deepseek/responses-stream.ts";
 import {
@@ -302,7 +302,7 @@ export const relayResponsesStream = (
     responseId: string;
     createdAtSeconds: number;
     echo: DeepSeekResponsesEcho;
-    toolNames: ReadonlyMap<string, string>;
+    toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     providerRequestId: string | null;
     usageContext: UsageContext | undefined;

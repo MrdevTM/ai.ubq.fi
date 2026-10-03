@@ -1,6 +1,6 @@
 // LithosAI Chat and Responses handlers, extracted from src/openai.ts.
 
-import { LITHOS_RESPONSES_PROFILE } from "../deepseek/responses.ts";
+import { LITHOS_RESPONSES_PROFILE, type OriginalToolName } from "../deepseek/responses.ts";
 import { logForwardedPayloadElisions, toDeepSeekResponsesChatBody } from "../deepseek/chat-projection.ts";
 import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload } from "../deepseek/responses-payload.ts";
 import {
@@ -721,7 +721,7 @@ const finalizeBufferedLithosResponses = async (
     modelRaw: string;
     responseId: string;
     echo: DeepSeekResponsesEcho;
-    toolNames: ReadonlyMap<string, string>;
+    toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     upstreamModel: string;
     servedModel: string;

@@ -344,8 +344,8 @@ Deno.test("chat projection: tools are flattened, renamed on collision and filter
   assert.deepEqual(
     [...named.toolNames.entries()],
     [
-      ["lookup_2", "lookup"],
-      ["exec_2", "exec"],
+      ["lookup_2", { name: "lookup", namespace: null }],
+      ["exec_2", { name: "exec", namespace: null }],
     ]
   );
   assert.deepEqual([...named.customToolNames], ["exec", "exec_2"]);
@@ -364,7 +364,7 @@ Deno.test("chat projection: tools are flattened, renamed on collision and filter
     { type: "function", function: { name: "lookup" } },
     { type: "function", function: { name: "ns_lookup" } },
   ]);
-  assert.deepEqual([...namespaced.toolNames.entries()], [["ns_lookup", "lookup"]]);
+  assert.deepEqual([...namespaced.toolNames.entries()], [["ns_lookup", { name: "lookup", namespace: "ns" }]]);
 
   const rejects: readonly Record<string, unknown>[] = [
     { input: "hi", tools: "none" },

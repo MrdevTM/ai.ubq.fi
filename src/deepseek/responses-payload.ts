@@ -1,6 +1,6 @@
 // Chat completion to Responses payload rendering, split out of src/deepseek_responses.ts.
 
-import { type ChatOnlyResponsesProfile, DEEPSEEK_RESPONSES_PROFILE, originalToolName } from "./responses.ts";
+import { type ChatOnlyResponsesProfile, DEEPSEEK_RESPONSES_PROFILE, type OriginalToolName, originalTool } from "./responses.ts";
 import { type DeepSeekFinishDisposition } from "./index.ts";
 import { getString, isRecord } from "../utils.ts";
 
@@ -24,12 +24,13 @@ export const reasoningItem = (id: string, text: string): Record<string, unknown>
   summary: [{ type: "summary_text", text }],
 });
 
-export const functionCallItem = (id: string, callId: string, name: string, args: string): Record<string, unknown> => ({
+export const functionCallItem = (id: string, callId: string, name: string, args: string, namespace: string | null = null): Record<string, unknown> => ({
   id,
   type: "function_call",
   status: "completed",
   call_id: callId,
   name,
+  ...(namespace ? { namespace } : {}),
   arguments: args,
 });
 
@@ -189,7 +190,7 @@ const outputItemsForChoice = (
   message: Record<string, unknown>,
   choiceIndex: number,
   responseId: string,
-  toolNames: ReadonlyMap<string, string>,
+  toolNames: ReadonlyMap<string, OriginalToolName>,
   customToolNames: ReadonlySet<string>
 ): Record<string, unknown>[] => {
   const items: Record<string, unknown>[] = [];
@@ -204,13 +205,13 @@ const outputItemsForChoice = (
     if (!isRecord(call) || Array.isArray(call) || !isRecord(call.function) || Array.isArray(call.function)) continue;
     const callId = getString(call.id) ?? `${responseId}_call_${callIndex}`;
     const chatName = getString(call.function.name) ?? "";
-    const name = originalToolName(chatName, toolNames);
+    const original = originalTool(chatName, toolNames);
     const args = typeof call.function.arguments === "string" ? call.function.arguments : "";
     if (customToolNames.has(chatName)) {
-      items.push(customToolCallItem(`ctc_${responseId}_${choiceIndex}_${callIndex}`, callId, name, freeformInputFromArguments(args)));
+      items.push(customToolCallItem(`ctc_${responseId}_${choiceIndex}_${callIndex}`, callId, original.name, freeformInputFromArguments(args)));
       continue;
     }
-    items.push(functionCallItem(`fc_${responseId}_${choiceIndex}_${callIndex}`, callId, name, args));
+    items.push(functionCallItem(`fc_${responseId}_${choiceIndex}_${callIndex}`, callId, original.name, args, original.namespace));
   }
   return items;
 };
@@ -226,7 +227,7 @@ export const toDeepSeekResponsesPayload = (
   requestedModel: string,
   responseId: string,
   echo: DeepSeekResponsesEcho,
-  toolNames: ReadonlyMap<string, string> = new Map(),
+  toolNames: ReadonlyMap<string, OriginalToolName> = new Map(),
   customToolNames: ReadonlySet<string> = new Set(),
   profile: ChatOnlyResponsesProfile = DEEPSEEK_RESPONSES_PROFILE
 ): Record<string, unknown> => {

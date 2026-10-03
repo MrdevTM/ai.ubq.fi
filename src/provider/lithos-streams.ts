@@ -1,6 +1,6 @@
 // LithosAI stream plumbing, extracted from src/provider/lithos-handlers.ts.
 
-import { LITHOS_RESPONSES_PROFILE } from "../deepseek/responses.ts";
+import { LITHOS_RESPONSES_PROFILE, type OriginalToolName } from "../deepseek/responses.ts";
 import { type DeepSeekResponsesEcho } from "../deepseek/responses-payload.ts";
 import { iterateLithosChatCompletionStream, LithosError } from "./lithos.ts";
 import { ApiKeyQuotaDispatchError } from "../api-key-policy.ts";
@@ -201,7 +201,7 @@ export const streamLithosResponses = (
   responseId: string,
   createdAtSeconds: number,
   echo: DeepSeekResponsesEcho,
-  toolNames: ReadonlyMap<string, string>,
+  toolNames: ReadonlyMap<string, OriginalToolName>,
   customToolNames: ReadonlySet<string>,
   providerRequestId: string | null,
   usageContext: UsageContext | undefined,
