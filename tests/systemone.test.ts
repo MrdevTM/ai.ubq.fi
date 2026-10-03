@@ -9,7 +9,9 @@ import {
   reserveApiKeyUsageV3,
 } from "../src/api-key-policy.ts";
 import { kernelQuotaRouteForRequest, terminalRouteForRequest } from "../src/handler/http.ts";
+import { setKvForTest } from "../src/kv.ts";
 import { getResponseTelemetry, type UsageContext } from "../src/openai-telemetry.ts";
+import { getOpenRouterProviderHealth, resetProviderHealthThrottleForTest } from "../src/provider/health.ts";
 import { OPENROUTER_SYSTEMONE_URL } from "../src/provider/openrouter.ts";
 import { handleSystemOne, SYSTEMONE_DEFAULT_MODEL } from "../src/systemone/handlers.ts";
 import type { ApiKeyHashRecord, ApiKeyUsageRequestV3, ApiKeyUsageWindowV3 } from "../src/types.ts";
@@ -298,3 +300,53 @@ Deno.test("systemone attaches reported usage telemetry to its response", async (
   assert.equal(telemetry.completed, true);
   assert.equal(telemetry.stream, false);
 });
+
+for (const [status, upstreamBody, expectedEvent, expectedState, clientStatus] of [
+  [402, '{"error":{"message":"Insufficient credits"}}', "quota_exhausted", "exhausted", 502],
+  [402, "{}", "quota_exhausted", "exhausted", 502],
+  [429, "{}", "quota_exhausted", "exhausted", 429],
+  [403, '{"error":{"message":"Insufficient credits"}}', "auth_invalid", "invalid", 502],
+  [500, '{"error":{"message":"Insufficient credits"}}', "upstream_error", "degraded", 502],
+  [503, "{}", "upstream_error", "degraded", 502],
+  [400, '{"error":{"message":"Insufficient credits"}}', "reachable", "degraded", 400],
+  [null, "", "upstream_error", "degraded", 502],
+] as const) {
+  Deno.test(`systemone records upstream ${status ?? "transport failure"} health for ${upstreamBody}`, async () => {
+    const kv = new CountingKv();
+    setKvForTest(kv as unknown as Deno.Kv);
+    resetProviderHealthThrottleForTest();
+    let fetchCalls = 0;
+    try {
+      const response = await handleSystemOne(request({ state, questions }), undefined, {
+        fetcher: (input) => {
+          assert.equal(urlOf(input), OPENROUTER_SYSTEMONE_URL);
+          fetchCalls += 1;
+          if (status === null) return Promise.reject(new Error("connect timeout"));
+          return Promise.resolve(new Response(upstreamBody, { status }));
+        },
+        apiKey: () => "or-test-key",
+      });
+      assert.equal(fetchCalls, 1);
+      assert.equal(response.status, clientStatus);
+      assert.deepEqual(await response.json(), {
+        error: {
+          message: status === null ? "System One upstream unreachable" : "System One upstream error",
+          type: "invalid_request_error",
+          code: status === null ? "openrouter_upstream_unreachable" : "openrouter_upstream_error",
+        },
+      });
+      // Health is intentionally recorded without delaying the response. Let
+      // its pending KV writes settle before reading or replacing the fixture.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const health = await getOpenRouterProviderHealth();
+      assert.equal(health.last_event, expectedEvent);
+      assert.equal(health.last_status, status);
+      assert.equal(health.state, expectedState);
+      assert.equal(health.last_429_at_ms !== null, expectedState === "exhausted");
+    } finally {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      setKvForTest(null);
+      resetProviderHealthThrottleForTest();
+    }
+  });
+}
