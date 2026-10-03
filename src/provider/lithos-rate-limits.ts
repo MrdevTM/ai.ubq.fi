@@ -156,7 +156,13 @@ export const logLithosRateLimitWait = (fields: LithosRateLimitLogFields): void =
 /** Abort-aware sleep: an abandoned request never keeps waiting for a provider window. */
 export const waitForLithosRetry = (milliseconds: number, signal: AbortSignal): Promise<void> => {
   if (milliseconds <= 0) return Promise.resolve();
-  if (signal.aborted) return Promise.reject(new DOMException("The request was aborted while waiting for the LithosAI rate limit to reset.", "AbortError"));
+  if (signal.aborted) {
+    return Promise.reject(
+      signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException("The request was aborted while waiting for the LithosAI rate limit to reset.", "AbortError")
+    );
+  }
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
@@ -164,7 +170,11 @@ export const waitForLithosRetry = (milliseconds: number, signal: AbortSignal): P
     }, milliseconds);
     function onAbort(): void {
       clearTimeout(timer);
-      reject(new DOMException("The request was aborted while waiting for the LithosAI rate limit to reset.", "AbortError"));
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException("The request was aborted while waiting for the LithosAI rate limit to reset.", "AbortError")
+      );
     }
     signal.addEventListener("abort", onAbort, { once: true });
   });
