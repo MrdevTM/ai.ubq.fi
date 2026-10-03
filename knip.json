@@ -6,7 +6,8 @@
     "ops/**/*.ts",
     "benchmarks/**/*.ts",
     "tests/**/*.test.ts",
-    "tests/**/*.e2e.ts"
+    "tests/**/*.e2e.ts",
+    "tests/helpers/codex-native-auth-acceptance.ts"
   ],
   "project": [
     "src/**/*.ts",
