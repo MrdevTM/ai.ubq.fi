@@ -325,10 +325,8 @@ const buildCodexModelsUnionResponse = (contributions: readonly CodexAccountCatal
   for (const contribution of contributions) {
     for (const model of contribution.models) {
       const slug = codexModelRowSlug(model);
-      if (slug !== null) {
-        if (seen.has(slug)) continue;
-        seen.add(slug);
-      }
+      if (!slug || seen.has(slug)) continue;
+      seen.add(slug);
       models.push(model);
     }
   }
