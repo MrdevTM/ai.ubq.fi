@@ -334,7 +334,7 @@ Deno.test("sampler keeps unused additional limits visible while deferring them f
   assert.equal(routingObservation.includes("GPT-5.3-Codex-Spark"), false);
 });
 
-Deno.test("sampler mirrors a reported Spark limit to an available sibling for the admin view", async () => {
+Deno.test("sampler keeps named limits on the reporting account only", async () => {
   seed();
   const live = await refreshProviderCapacity({
     kv: kvStub,
@@ -344,7 +344,7 @@ Deno.test("sampler mirrors a reported Spark limit to an available sibling for th
   const accountOne = live.sources.find((source): source is ProviderCapacityCodexSource => source.source === "codex" && source.slot === 1);
   const accountTwo = live.sources.find((source): source is ProviderCapacityCodexSource => source.source === "codex" && source.slot === 2);
   assert.equal(accountOne?.additional_rate_limits.length, 1);
-  assert.deepEqual(accountTwo?.additional_rate_limits, accountOne.additional_rate_limits);
+  assert.deepEqual(accountTwo?.additional_rate_limits, []);
 
   const storedSnapshot = kvStore.get(keyToString(PROVIDER_CAPACITY_SNAPSHOT_KEY))?.value as
     | {
@@ -355,7 +355,7 @@ Deno.test("sampler mirrors a reported Spark limit to an available sibling for th
 
   const persisted = await getPersistedProviderCapacityView({ kv: kvStub, now: () => nowMs });
   const persistedAccountTwo = persisted.sources.find((source): source is ProviderCapacityCodexSource => source.source === "codex" && source.slot === 2);
-  assert.deepEqual(persistedAccountTwo?.additional_rate_limits, accountTwo.additional_rate_limits);
+  assert.deepEqual(persistedAccountTwo?.additional_rate_limits, []);
   const routingStore = kvStore.get(keyToString(CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY))?.value as
     | {
         observations?: readonly { slot: number; additional_rate_limits: readonly unknown[] }[];
