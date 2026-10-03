@@ -107,6 +107,8 @@ runInNewContext(
 const retentionPresenter = retentionContext as typeof retentionContext & { render: (payload: unknown) => void };
 const validRetention: Record<string, unknown> = {
   state: "ok",
+  accounting_complete: true,
+  accounting_error: null,
   stored_bytes: 2 * 1024 ** 2,
   reserved_bytes: 1024 ** 2,
   budget_bytes: 1024 ** 3,
@@ -130,10 +132,16 @@ Deno.test("shipped retention renderer preserves measured zero, normal accounting
   assert.match(retentionContext.errorsRetention.textContent, /Approaching the storage limit/);
 });
 
-Deno.test("shipped retention renderer refuses unavailable or corrupt accounting without hiding log warnings", () => {
+Deno.test("shipped retention renderer refuses incomplete, errored, unavailable or corrupt accounting without hiding log warnings", () => {
+  const missingCompleteness = { ...validRetention };
+  Reflect.deleteProperty(missingCompleteness, "accounting_complete");
   const invalid: unknown[] = [
     undefined,
     null,
+    missingCompleteness,
+    { ...validRetention, accounting_complete: false },
+    { ...validRetention, accounting_complete: false, stored_bytes: 0, reserved_bytes: 0, records: 0 },
+    { ...validRetention, accounting_error: "ledger_corrupt" },
     { ...validRetention, state: "unavailable" },
     { ...validRetention, state: "corrupt" },
     { ...validRetention, stored_bytes: null, reserved_bytes: null, records: null, accounting_error: "ledger_corrupt" },

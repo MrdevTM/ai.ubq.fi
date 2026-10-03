@@ -3,6 +3,7 @@ import { apiKeyHashKey } from "../src/api-keys.ts";
 import {
   type ApiKeyPolicy,
   apiKeyPolicyFromHashRecord,
+  ApiKeyQuotaDispatchError,
   apiKeyUsageV3RequestKey,
   apiKeyUsageV3WindowKey,
   type ApiKeyUsageReservation,
@@ -12,7 +13,7 @@ import { kernelQuotaRouteForRequest, terminalRouteForRequest } from "../src/hand
 import { setKvForTest } from "../src/kv.ts";
 import { getResponseTelemetry, type UsageContext } from "../src/openai-telemetry.ts";
 import { getOpenRouterProviderHealth, resetProviderHealthThrottleForTest } from "../src/provider/health.ts";
-import { OPENROUTER_SYSTEMONE_URL } from "../src/provider/openrouter.ts";
+import { fetchOpenRouterSystemOne, OpenRouterError, OPENROUTER_SYSTEMONE_URL } from "../src/provider/openrouter.ts";
 import { handleSystemOne, SYSTEMONE_DEFAULT_MODEL } from "../src/systemone/handlers.ts";
 import type { ApiKeyHashRecord, ApiKeyUsageRequestV3, ApiKeyUsageWindowV3 } from "../src/types.ts";
 import { CountingKv } from "./helpers/counting-kv.ts";
@@ -109,6 +110,133 @@ const storedWindow = (kv: CountingKv, policy: ApiKeyPolicy): ApiKeyUsageWindowV3
 
 const storedRequest = (kv: CountingKv, policy: ApiKeyPolicy, requestId: string): ApiKeyUsageRequestV3 | null =>
   (kv.entries.get(JSON.stringify(apiKeyUsageV3RequestKey(policy, requestId)))?.value as ApiKeyUsageRequestV3 | undefined) ?? null;
+
+Deno.test("systemone cancels an expired pre-dispatch reservation before returning a bounded upstream error", async () => {
+  const { kv, policy } = ledgerFixture("deadline", 1);
+  const reservation = await admissionFor(kv, policy, "systemone-deadline");
+  let fetchCalls = 0;
+  let cancelCalls = 0;
+  let transportStarts = 0;
+  await assert.rejects(
+    () =>
+      fetchOpenRouterSystemOne({
+        body: { state, questions },
+        apiKey: "or-test-key",
+        timeoutMs: 1,
+        fetcher: () => {
+          fetchCalls += 1;
+          return Promise.resolve(Response.json(answerPayload));
+        },
+        hooks: {
+          beforeDispatch: async () => {
+            const dispatch = await reservation.beforeProviderDispatch("openrouter");
+            assert.ok(dispatch);
+            await new Promise<void>((resolve) => setTimeout(resolve, 10));
+            return {
+              markTransportStarted: () => {
+                transportStarts += 1;
+                dispatch.markTransportStarted();
+              },
+              cancelBeforeTransport: async () => {
+                cancelCalls += 1;
+                await dispatch.cancelBeforeTransport();
+              },
+            };
+          },
+        },
+      }),
+    (error: unknown) => error instanceof OpenRouterError && error.code === "openrouter_upstream_unreachable" && error.status === 502
+  );
+  assert.equal(fetchCalls, 0);
+  assert.equal(transportStarts, 0);
+  assert.equal(cancelCalls, 1);
+  assert.equal(storedWindow(kv, policy).committed_requests, 0);
+  assert.equal(storedWindow(kv, policy).reserved_requests, 0);
+  assert.equal(storedRequest(kv, policy, "systemone-deadline")?.release_reason, "transport_cancelled_before_fetch");
+});
+
+Deno.test("systemone loopback deadline responses preserve quota hook errors and headers", async () => {
+  const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+  let deadline: AbortSignal | null = null;
+  let fetchCalls = 0;
+  let cancelCalls = 0;
+  const quotaError = new ApiKeyQuotaDispatchError("Synthetic quota refusal", {
+    status: 429,
+    code: "rate_limit_exceeded",
+    errorType: "rate_limit_error",
+    retryAfter: "7",
+    headers: { "RateLimit-Limit": "1", "RateLimit-Remaining": "0" },
+  });
+  const kv = new CountingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetProviderHealthThrottleForTest();
+  AbortSignal.timeout = () => {
+    deadline = originalTimeout(1);
+    return deadline;
+  };
+  const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, (req) =>
+    handleSystemOne(
+      req,
+      {
+        keyId: null,
+        kernelRepo: null,
+        kernelOrg: null,
+        beforeProviderDispatch: async () => {
+          assert.ok(deadline);
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+          assert.equal(deadline.aborted, true);
+          if (new URL(req.url).pathname === "/quota") throw quotaError;
+          return {
+            markTransportStarted: () => assert.fail("expired deadline must not start transport"),
+            cancelBeforeTransport: () => {
+              cancelCalls += 1;
+              if (new URL(req.url).pathname === "/cancel-quota") return Promise.reject(quotaError);
+              return Promise.resolve();
+            },
+          };
+        },
+      },
+      {
+        apiKey: () => "or-test-key",
+        fetcher: () => {
+          fetchCalls += 1;
+          return Promise.resolve(Response.json(answerPayload));
+        },
+      }
+    )
+  );
+  try {
+    for (const path of ["/v1/systemone", "/quota", "/cancel-quota"]) {
+      const response = await fetch(`http://127.0.0.1:${server.addr.port}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ state, questions }),
+      });
+      const quota = path !== "/v1/systemone";
+      assert.equal(response.status, quota ? 429 : 502);
+      assert.deepEqual(await response.json(), {
+        error: {
+          message: quota ? "Synthetic quota refusal" : "System One upstream unreachable",
+          type: quota ? "rate_limit_error" : "invalid_request_error",
+          code: quota ? "rate_limit_exceeded" : "openrouter_upstream_unreachable",
+          ...(quota ? { param: null } : {}),
+        },
+      });
+      const expectedQuotaHeaders = quota ? ["7", "1", "0"] : [null, null, null];
+      assert.equal(response.headers.get("retry-after"), expectedQuotaHeaders[0]);
+      assert.equal(response.headers.get("ratelimit-limit"), expectedQuotaHeaders[1]);
+      assert.equal(response.headers.get("ratelimit-remaining"), expectedQuotaHeaders[2]);
+    }
+    assert.equal(fetchCalls, 0);
+    assert.equal(cancelCalls, 2);
+  } finally {
+    await server.shutdown();
+    AbortSignal.timeout = originalTimeout;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    setKvForTest(null);
+    resetProviderHealthThrottleForTest();
+  }
+});
 
 Deno.test("systemone commits the api-key request reservation exactly once before dispatch", async () => {
   const { kv, policy } = ledgerFixture("commit-once", 2);

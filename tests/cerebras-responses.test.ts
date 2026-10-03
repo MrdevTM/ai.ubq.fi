@@ -12,6 +12,7 @@ import { RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
 import { CEREBRAS_CHAT_COMPLETIONS_URL, CEREBRAS_GPT_OSS_120B_MODEL, CEREBRAS_QWEN_3_8_27B_MODEL } from "../src/provider/cerebras.ts";
 import { CEREBRAS_RESPONSES_PROFILE } from "../src/deepseek/responses.ts";
 import { toDeepSeekResponsesChatBody } from "../src/deepseek/chat-projection.ts";
+import { getCerebrasProviderHealth, PROVIDER_HEALTH_KEY_PREFIX, resetProviderHealthThrottleForTest } from "../src/provider/health.ts";
 
 /**
  * Cerebras ids on the Codex Responses surface (module m01-cerebras-responses).
@@ -39,6 +40,7 @@ Deno.env.delete("LITHOSAI_API_KEY");
 
 const keyOf = (key: Deno.KvKey): string => JSON.stringify(key);
 const kvStore = new Map<string, unknown>();
+const cerebrasHealthWrites: unknown[] = [];
 type KvOp = { type: "set" | "delete"; key: Deno.KvKey; value?: unknown };
 const kvStub = {
   get: (key: Deno.KvKey) =>
@@ -82,8 +84,10 @@ const kvStub = {
       },
       commit: () => {
         for (const op of ops) {
-          if (op.type === "set") kvStore.set(keyOf(op.key), op.value);
-          else kvStore.delete(keyOf(op.key));
+          if (op.type === "set") {
+            kvStore.set(keyOf(op.key), op.value);
+            if (keyOf(op.key) === keyOf([...PROVIDER_HEALTH_KEY_PREFIX, "cerebras", "default", "current"])) cerebrasHealthWrites.push(op.value);
+          } else kvStore.delete(keyOf(op.key));
         }
         return Promise.resolve({ ok: true } as const);
       },
@@ -455,6 +459,88 @@ Deno.test("cerebras responses: a reasoning-only truncation fails closed instead 
     }
   });
 });
+
+for (const stream of [false, true]) {
+  for (const [finishReason, status, failureKind] of [
+    ["length", "incomplete", "incomplete_response"],
+    ["insufficient_system_resource", "failed", "upstream_error"],
+    ["stop", "completed", null],
+  ] as const) {
+    Deno.test(`cerebras responses: ${finishReason} terminal health stream=${stream}`, async () => {
+      await withCerebrasKey(async () => {
+        const originalNow = Date.now;
+        let nowMs = 1_000_000;
+        Date.now = () => nowMs;
+        try {
+          // Drain the optional health writes before resetting the isolated fixture.
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          kvStore.clear();
+          resetProviderHealthThrottleForTest();
+          cerebrasHealthWrites.length = 0;
+          nowMs = 1_000_000;
+          const successAtMs = nowMs;
+          const seeded = await withUpstream(
+            () => chatCompletion(GPT_OSS, { role: "assistant", content: "prior answer" }),
+            () => handleResponses(responsesRequest({ model: GPT_OSS, input: "Seed a success." }))
+          );
+          assert.equal(seeded.result.status, 200);
+          assert.equal(((await seeded.result.json()) as Record<string, unknown>).status, "completed");
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          assert.equal((await getCerebrasProviderHealth()).last_success_at_ms, successAtMs);
+          cerebrasHealthWrites.length = 0;
+          // Separate observations beyond the heartbeat window so an erroneous
+          // success cannot hide behind throttling or equal timestamps.
+          nowMs += 61_000;
+          const { result, calls } = await withUpstream(
+            () => chatCompletion(GPT_OSS, { role: "assistant", content: "partial answer" }, finishReason),
+            () => handleResponses(responsesRequest({ model: GPT_OSS, input: "Answer.", stream }))
+          );
+          assert.equal(result.status, 200);
+          const terminalType = `response.${status}`;
+          let payload: Record<string, unknown>;
+          if (stream) {
+            assert.equal(result.headers.get("content-type"), "text/event-stream");
+            const frames = (await result.text())
+              .split("\n\n")
+              .filter((frame) => frame.startsWith("event: "))
+              .map((frame) => JSON.parse(frame.slice(frame.indexOf("data: ") + "data: ".length)) as Record<string, unknown>);
+            const terminals = frames.filter((frame) => ["response.completed", "response.incomplete", "response.failed"].includes(String(frame.type)));
+            assert.equal(terminals.length, 1);
+            assert.equal(frames.at(-1)?.type, terminalType);
+            payload = terminals[0].response as Record<string, unknown>;
+          } else {
+            payload = (await result.json()) as Record<string, unknown>;
+          }
+          assert.equal(payload.status, status);
+          assert.ok(JSON.stringify(payload.output).includes("partial answer"));
+          if (status === "incomplete") assert.deepEqual(payload.incomplete_details, { reason: "max_output_tokens" });
+          assert.equal(getResponseTelemetry(result)?.streamTerminalType, terminalType);
+          assert.equal(getResponseTelemetry(result)?.failureKind, failureKind);
+          // Both client transports still use one buffered provider dispatch.
+          assert.equal(calls.length, 1);
+          assert.equal(calls[0].body.stream, false);
+          assert.equal("stream_options" in calls[0].body, false);
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          const event = status === "completed" ? "success" : "upstream_error";
+          assert.deepEqual(cerebrasHealthWrites, [{ event, status: 200, observed_at_ms: nowMs, provider_request_id: "cerebras-req-1" }]);
+          const health = await getCerebrasProviderHealth();
+          assert.equal(health.state, status === "completed" ? "healthy" : "degraded");
+          assert.equal(health.last_event, event);
+          assert.equal(health.last_status, 200);
+          assert.equal(health.last_success_at_ms, status === "completed" ? nowMs : successAtMs);
+          assert.equal(health.last_error_at_ms, status === "completed" ? null : nowMs);
+          assert.deepEqual(kvStore.get(keyOf([...PROVIDER_HEALTH_KEY_PREFIX, "cerebras", "default", event])), cerebrasHealthWrites[0]);
+        } finally {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          Date.now = originalNow;
+          resetProviderHealthThrottleForTest();
+          kvStore.clear();
+          cerebrasHealthWrites.length = 0;
+        }
+      });
+    });
+  }
+}
 
 const seedCatalogKv = (): void => {
   kvStore.clear();

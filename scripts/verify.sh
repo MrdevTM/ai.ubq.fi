@@ -30,7 +30,8 @@ run "deno check" deno task build
 # The disposable deployment-guard fixtures need scoped filesystem and subprocess
 # capabilities, so they run in their own invocation; the main suite stays
 # restricted and reports them ignored.
-run "deno test (vps deploy guards)" deno test --frozen --allow-run=deno,git,/bin/ln \
+run "deno test (vps deploy guards)" deno test --frozen --allow-run=deno,git,/bin/sh,/bin/ln \
+  --allow-net=127.0.0.1 \
   --allow-read=ops,.cleanup-evidence/vps-deploy-guards-fixtures \
   --allow-write=.cleanup-evidence/vps-deploy-guards-fixtures \
   --allow-env=PATH tests/vps-deploy-guards.test.ts

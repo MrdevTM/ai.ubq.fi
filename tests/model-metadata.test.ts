@@ -7,7 +7,7 @@ import {
   codexSubscriptionMetadataHint,
 } from "../src/models/metadata.ts";
 import { codexSnapshotMetadataHint, resolveModelMetadata } from "../src/models/metadata.ts";
-import type { OpenRouterModelMetadata } from "../src/models/openrouter-models.ts";
+import { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest, type OpenRouterModelMetadata } from "../src/models/openrouter-models.ts";
 
 const enrichment = (overrides: Partial<OpenRouterModelMetadata> = {}): OpenRouterModelMetadata => ({
   id: "openai/gpt-5.6-sol",
@@ -195,4 +195,95 @@ Deno.test("a Codex record without an explicit default keeps no default effort", 
   const resolved = resolveModelMetadata("any-model", { codex: hint, openRouter: null });
   assert.equal(resolved.default_reasoning_effort, null);
   assert.deepEqual(resolved.supported_reasoning_levels, ["low", "high"]);
+});
+
+Deno.test("a default-only source advertises only its own effort and retains precedence", () => {
+  const codex = resolveModelMetadata("default-only-model", {
+    codex: { default_reasoning_effort: "high" },
+    provider: { supported_reasoning_levels: ["low"], default_reasoning_effort: "low" },
+    openRouter: enrichment(),
+  });
+  assert.deepEqual(codex.supported_reasoning_levels, ["high"]);
+  assert.equal(codex.default_reasoning_effort, "high");
+  assert.equal(codex.reasoning_source, "codex_upload");
+
+  const provider = resolveModelMetadata("default-only-model", {
+    codex: { default_reasoning_effort: " " },
+    provider: { supported_reasoning_levels: [], default_reasoning_effort: "thinking" },
+    openRouter: enrichment(),
+  });
+  assert.deepEqual(provider.supported_reasoning_levels, ["thinking"]);
+  assert.equal(provider.default_reasoning_effort, "thinking");
+  assert.equal(provider.reasoning_source, "provider_discovery");
+
+  const openRouter = resolveModelMetadata("default-only-model", {
+    openRouter: enrichment({ reasoning: { supported_efforts: [], default_effort: "hyper", mandatory: false } }),
+  });
+  assert.deepEqual(openRouter.supported_reasoning_levels, ["hyper"]);
+  assert.equal(openRouter.default_reasoning_effort, "hyper");
+  assert.equal(openRouter.reasoning_source, "openrouter");
+});
+
+Deno.test("a default-only Codex null remains explicit none while an omitted default stays unknown", () => {
+  const explicitNone = resolveModelMetadata("default-only-model", {
+    codex: codexSnapshotMetadataHint({ default_reasoning_level: null }),
+    provider: { supported_reasoning_levels: ["high"] },
+    openRouter: null,
+  });
+  assert.deepEqual(explicitNone.supported_reasoning_levels, ["none"]);
+  assert.equal(explicitNone.default_reasoning_effort, "none");
+  assert.equal(explicitNone.reasoning_source, "codex_upload");
+
+  for (const record of [{}, { default_reasoning_level: "" }, { default_reasoning_level: 42 }]) {
+    const unknown = resolveModelMetadata("default-only-model", { codex: codexSnapshotMetadataHint(record), openRouter: null });
+    assert.equal(unknown.supported_reasoning_levels, null);
+    assert.equal(unknown.default_reasoning_effort, null);
+    assert.equal(unknown.reasoning_source, "unknown");
+  }
+});
+
+Deno.test("the versioned catalog publishes a default-only source and keeps an unknown model none-only", async () => {
+  const { handleModels } = await import("../src/models/catalog.ts");
+  const { setKvForTest } = await import("../src/kv.ts");
+  const { CountingKv } = await import("./helpers/counting-kv.ts");
+  const { resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
+  const { resetProviderSelectionCacheForTest } = await import("../src/provider/selection.ts");
+  const keys = ["CEREBRAS_API_KEY", "DEEPSEEK_API_KEY", "LITHOSAI_API_KEY", "METERED_API_KEY", "SURPLUS_API_KEY", "OPENROUTER_API_KEY"];
+  const originals = keys.map((key) => Deno.env.get(key));
+  for (const key of keys) Deno.env.delete(key);
+  Deno.env.set("OPENROUTER_API_KEY", "synthetic-catalog-key");
+  const kv = new CountingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAuthCacheForTest();
+  resetProviderSelectionCacheForTest();
+  resetOpenRouterModelsCacheForTest();
+  try {
+    await fetchOpenRouterModels({
+      force: true,
+      fetcher: () =>
+        Promise.resolve(Response.json({ data: [{ id: "synthetic/default-only", reasoning: { default_effort: "high" } }, { id: "synthetic/unknown" }] })),
+    });
+    const response = await handleModels(new Request("https://ai.ubq.fi/v1/models?client_version=0.200.0"));
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as { models: Record<string, unknown>[] };
+    const declared = payload.models.find((model) => model.slug === "synthetic/default-only");
+    assert.equal(declared?.default_reasoning_level, "high");
+    assert.deepEqual(declared.supported_reasoning_levels, [{ effort: "high", description: "Reasoning effort: high" }]);
+    assert.equal(resolveModelMetadata("synthetic/default-only").reasoning_source, "openrouter");
+    const unknown = payload.models.find((model) => model.slug === "synthetic/unknown");
+    assert.equal(unknown?.default_reasoning_level, "none");
+    assert.deepEqual(unknown.supported_reasoning_levels, [{ effort: "none", description: "No reasoning" }]);
+    assert.equal(resolveModelMetadata("synthetic/unknown").reasoning_source, "unknown");
+  } finally {
+    setKvForTest(null);
+    resetCodexAuthCacheForTest();
+    resetProviderSelectionCacheForTest();
+    resetOpenRouterModelsCacheForTest();
+    kv.close();
+    for (const [index, key] of keys.entries()) {
+      const original = originals[index];
+      if (original === undefined) Deno.env.delete(key);
+      else Deno.env.set(key, original);
+    }
+  }
 });

@@ -141,21 +141,56 @@ Deno.test("bounded response body releases an incomplete reader exactly once", as
   assert.equal(releases, 1);
 });
 
-Deno.test("bounded response body releases the reader when cancellation never settles", async () => {
-  let releases = 0;
-  let cancellations = 0;
-  const reader = {
-    read: () => Promise.resolve({ done: false, value: new Uint8Array(2) }),
-    cancel: () => {
-      cancellations += 1;
-      return new Promise<void>(() => {});
-    },
-    releaseLock: () => (releases += 1),
-  };
-  const response = { body: { getReader: () => reader } } as unknown as Response;
-
-  const result = await readBoundedResponseBody(response, { maxBytes: 1 });
-  assert.equal(result.complete, false);
-  assert.equal(cancellations, 1);
-  assert.equal(releases, 1);
+Deno.test("bounded response body releases native readers before stalled cancellation settles", async (t) => {
+  for (const mode of ["timeout", "overflow"] as const) {
+    await t.step(mode, async () => {
+      let cancellations = 0;
+      let cancellationSettled = false;
+      const { promise, resolve } = Promise.withResolvers<undefined>();
+      const cancellation = promise.then(() => {
+        cancellationSettled = true;
+      });
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (mode === "overflow") controller.enqueue(new Uint8Array([1, 2]));
+        },
+        cancel() {
+          cancellations += 1;
+          return cancellation;
+        },
+      });
+      const startedAt = performance.now();
+      const boundedRead = readBoundedResponseBody(new Response(body), { maxBytes: 1, timeoutMs: 10 });
+      let watchdog: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          boundedRead,
+          new Promise<never>((_, reject) => {
+            watchdog = setTimeout(() => {
+              reject(new Error("Bounded read waited for stalled cancellation."));
+            }, 500);
+          }),
+        ]);
+        assert.ok(performance.now() - startedAt < 500);
+        assert.equal(result.complete, false);
+        assert.deepEqual(result.bytes, mode === "overflow" ? new Uint8Array([1]) : new Uint8Array());
+        assert.equal(cancellations, 1);
+        assert.equal(cancellationSettled, false);
+        assert.equal(body.locked, false);
+        const reader = body.getReader();
+        try {
+          assert.deepEqual(await reader.read(), { done: true, value: undefined });
+        } finally {
+          reader.releaseLock();
+        }
+      } finally {
+        clearTimeout(watchdog);
+        resolve(undefined);
+        await cancellation;
+        await boundedRead;
+      }
+      assert.equal(cancellations, 1);
+      assert.equal(body.locked, false);
+    });
+  }
 });

@@ -1241,3 +1241,35 @@ Decision evidence: DSH session-8d0f4b3a-9ab5-43e1-96e6-fd092c509c26, recovered d
 
 For the recorded cleanup, delete unused p-ai-ubq-fi and ai-ubq-fi-feat-shared-admin-toke. Retain ai-ubq-fi and
 ubiquity-prospector; the Prospector monorepo's own `DECISIONS.md` owns the latter's retention and migration decisions.
+
+## Local-development key deletion ownership - 2026-10-03
+
+For the local-development API key only, the retained paid-deletion guard keeps created_at_ms and adds local_deletion
+with an exclusive owner and completed_at_ms. Admin deletion CAS-claims ownership while the revoked ID exists, checks
+that claim before deleting the ID, and publishes completion only after all awaited paid-state, request-log, counter and
+V3 usage cleanup finishes, using the same owner version and an absent-ID CAS. A known settled pre-ID refusal or failure
+may release only its own claim for explicit admin retry; legacy and crashed active guards remain blocked without owner
+stealing. Startup reprovision requires a completed local marker, no outstanding billing, pending markers, lease or
+remaining cleanup rows, and atomically checks the absent ID, token hash and unchanged guard while publishing the
+replacement and clearing only that local guard. Empty prefixes and an absent ID alone never prove completion; every
+nonlocal guard keeps its existing meaning.
+
+## Client catalog ETags - 2026-10-03
+
+Client catalog ETags are hashes of the final bytes served to that client, in both the fast path and the assembled path.
+Raw upstream ETags remain source metadata used only for upstream conditional fetches. Enrichment that changes the served
+body changes its client validator even when upstream metadata is unchanged; only a validator for the current served body
+permits a client 304 response.
+
+## Supported VPS activation recovery - 2026-10-03
+
+For supported VPS releases, same-SHA retry uses a private atomic deployment-owned recovery receipt under the existing
+deploy lock, binding the candidate and previous full SHA, source archive and complete immutable tree digests, exact
+selectors, verified fixed listener port and known launcher/unit profile. Before ingress changes, a failed candidate
+restores the supported previous selector and actual listener/public identity; daemon-reload refusal restores only the
+selector and issues no gateway restart. After successful ingress reload, a public verification failure retains the ready
+candidate and ingress-applied intent for nondestructive same-SHA verification retry. Candidate bytes remain immutable,
+and pruning occurs only after exact loopback and public identity acceptance. Unsupported or historical root-relative
+launchers are refused before destructive activation; successful historical restoration and first-deployment rollback
+remain separate unresolved scopes. The normal deployment command must permit the verified prior loopback port, and
+verify/CI must provide the scoped shell and loopback capabilities required by every actual launcher fixture.

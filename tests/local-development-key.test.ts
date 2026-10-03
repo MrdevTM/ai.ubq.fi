@@ -74,12 +74,25 @@ class MemoryKv {
 }
 
 const memoryKv = new MemoryKv();
-const denoWithKv = Deno as unknown as { openKv?: () => Promise<Deno.Kv> };
+const denoWithKv = Deno as unknown as { openKv?: (path?: string) => Promise<Deno.Kv> };
 const originalOpenKv = denoWithKv.openKv;
-denoWithKv.openKv = () => Promise.resolve(memoryKv as unknown as Deno.Kv);
+const openKvDescriptor = Object.getOwnPropertyDescriptor(Deno, "openKv");
+Object.defineProperty(Deno, "openKv", { value: () => Promise.resolve(memoryKv as unknown as Deno.Kv), writable: true, configurable: true });
 
 const { API_KEY_NO_EXPIRATION_MS, API_KEY_NO_USAGE_LIMIT, PAID_FALLBACK_NO_LIMIT, apiKeyHashKey, apiKeyIdKey } = await import("../src/api-keys.ts");
-const { apiKeyUsageV3WindowKey } = await import("../src/api-key-policy.ts");
+const { API_KEY_USAGE_V3_REQUEST_PREFIX, API_KEY_USAGE_V3_WINDOW_PREFIX, apiKeyUsageV3WindowKey } = await import("../src/api-key-policy.ts");
+const { apiKeyRequestLogPrefix } = await import("../src/analytics.ts");
+const { handleAdminApiKeysDelete, handleAdminApiKeysRevoke, handleAdminApiKeysUnrevoke } = await import("../src/admin/api-key-mutations.ts");
+const { admitPaidFallbackV3, deletePaidFallbackStateV3, releaseUndispatchedPaidFallbackV3 } = await import("../src/paid-fallback/ledger-admission.ts");
+const {
+  getPaidFallbackOutstandingV3,
+  paidFallbackDeletionGuardV3Key,
+  paidFallbackPendingV3Key,
+  paidFallbackReconciliationLeaseV3Key,
+  paidFallbackRequestV3Key,
+  paidFallbackRequestV3Prefix,
+  paidFallbackWindowV3Key,
+} = await import("../src/paid-fallback/ledger-state.ts");
 const { hasStrictPaidFallbackKeyPolicy } = await import("../src/paid-fallback/index.ts");
 const { LOCAL_DEVELOPMENT_KEY_ID, ensureLocalDevelopmentApiKey, resolveLocalDevelopmentApiKeyPolicy, setLocalDevelopmentPricingDeadlineMsForTest } =
   await import("../src/auth/local-development-key.ts");
@@ -90,7 +103,8 @@ const { getKv, setKvForTest } = await import("../src/kv.ts");
 const kvEntry = await getKv();
 assert.ok(kvEntry);
 
-denoWithKv.openKv = originalOpenKv;
+if (openKvDescriptor) Object.defineProperty(Deno, "openKv", openKvDescriptor);
+else Reflect.deleteProperty(Deno, "openKv");
 
 const loopbackAddress: Deno.NetAddr = { transport: "tcp", hostname: "127.0.0.1", port: 8000 };
 const enabledOptions: ServeRuntimeOptions = Object.freeze({ disableAdminAuth: true });
@@ -368,4 +382,301 @@ Deno.test("the Mac LAN listener grants the local principal to an actual loopback
       configureAdminAuthPeerForRequest(null);
     }
   });
+});
+
+const localKeyMutationRequest = (id = LOCAL_DEVELOPMENT_KEY_ID) =>
+  new Request("http://127.0.0.1/admin/api-keys", { method: "POST", body: JSON.stringify({ id }) });
+
+const withNativeLocalKeyKv = async (run: (kv: Deno.Kv) => Promise<void>): Promise<void> => {
+  if (!originalOpenKv) throw new Error("Native KV requires --unstable-kv");
+  const isolated = await originalOpenKv(":memory:");
+  setKvForTest(isolated);
+  try {
+    await withPaidProviderKey(() => run(isolated));
+  } finally {
+    setKvForTest(memoryKv as unknown as Deno.Kv);
+    isolated.close();
+  }
+};
+
+Deno.test({
+  name: "native KV re-provisions a completely deleted local key and admits paid work",
+  ignore: !originalOpenKv,
+  fn: async () => {
+    await withNativeLocalKeyKv(async (isolated) => {
+      const idKey = apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID);
+      const guardKey = paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID);
+      const unrelatedGuardKey = paidFallbackDeletionGuardV3Key("unrelated-key");
+      await isolated.set(unrelatedGuardKey, { created_at_ms: Date.now() });
+      const unrelatedGuard = await isolated.get(unrelatedGuardKey);
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+      const originalPolicy = await resolveLocalDevelopmentApiKeyPolicy(isolated);
+      assert.ok(originalPolicy);
+      assert.equal((await handleAdminApiKeysRevoke(localKeyMutationRequest())).status, 200);
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "revoked");
+      assert.equal((await handleAdminApiKeysDelete(localKeyMutationRequest())).status, 200);
+      assert.equal((await isolated.get(idKey)).value, null);
+      assert.equal((await isolated.get(apiKeyHashKey(originalPolicy.token_hash))).value, null);
+      assert.equal((await isolated.get(apiKeyUsageV3WindowKey(originalPolicy))).value, null);
+      const completedGuard = (await isolated.get<Record<string, unknown>>(guardKey)).value;
+      assert.ok(completedGuard);
+      const completion = completedGuard.local_deletion as Record<string, unknown>;
+      assert.equal(typeof completion.owner, "string");
+      assert.equal(typeof completion.completed_at_ms, "number");
+      assert.equal((await getPaidFallbackOutstandingV3(LOCAL_DEVELOPMENT_KEY_ID, isolated))?.has_outstanding, false);
+
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+      assert.equal((await isolated.get(guardKey)).value, null);
+      assert.deepEqual(await isolated.get(unrelatedGuardKey), unrelatedGuard);
+      const policy = await resolveLocalDevelopmentApiKeyPolicy(isolated);
+      assert.ok(policy);
+      assert.notEqual(policy.token_hash, originalPolicy.token_hash);
+      const policyCheck = await isolated.get(apiKeyHashKey(policy.token_hash), { consistency: "strong" });
+      const admission = await admitPaidFallbackV3({
+        keyId: policy.key_id,
+        requestId: "native-reprovision",
+        createdAtMs: Date.now(),
+        policyVersion: policy.policy_version,
+        limitMicrocredits: policy.paid_fallback_limit_microcredits,
+        maximumExposureMicrocredits: null,
+        initialSettledMicrocredits: 0,
+        quotaPerCredit: pricing.paid_fallback_quota_per_credit,
+        windowResetAtMs: policy.usage_reset_at_ms,
+        model: "gpt-6-astra",
+        route: "responses",
+        path: "/v1/responses",
+        stream: false,
+        reasoning: null,
+        policyCheck,
+      });
+      assert.equal(admission.kind, "reserved");
+      await releaseUndispatchedPaidFallbackV3(admission.reservation);
+      assert.equal((await getPaidFallbackOutstandingV3(LOCAL_DEVELOPMENT_KEY_ID, isolated))?.has_outstanding, false);
+    });
+  },
+});
+
+Deno.test({
+  name: "native KV retains local deletion guards while billing or cleanup remains",
+  ignore: !originalOpenKv,
+  fn: async () => {
+    const fixtures: [Deno.KvKey, unknown][] = [
+      [paidFallbackRequestV3Key(LOCAL_DEVELOPMENT_KEY_ID, "pending"), { billing_state: "pending" }],
+      [paidFallbackRequestV3Key(LOCAL_DEVELOPMENT_KEY_ID, "unresolved"), { billing_state: "unresolved" }],
+      [paidFallbackPendingV3Key(LOCAL_DEVELOPMENT_KEY_ID, "pending-marker"), { created_at_ms: Date.now() }],
+      [paidFallbackRequestV3Key(LOCAL_DEVELOPMENT_KEY_ID, "settled"), { billing_state: "settled" }],
+      [paidFallbackWindowV3Key(LOCAL_DEVELOPMENT_KEY_ID, Date.now()), { pending_count: 0 }],
+      [paidFallbackReconciliationLeaseV3Key(LOCAL_DEVELOPMENT_KEY_ID), { token: "synthetic", expires_at_ms: Date.now() + 60_000 }],
+      [[...API_KEY_USAGE_V3_WINDOW_PREFIX, LOCAL_DEVELOPMENT_KEY_ID, "old-policy", 1], { reserved_requests: 0 }],
+      [[...API_KEY_USAGE_V3_REQUEST_PREFIX, LOCAL_DEVELOPMENT_KEY_ID, "old-policy", 1, "old-request"], { state: "committed" }],
+      [[...apiKeyRequestLogPrefix(LOCAL_DEVELOPMENT_KEY_ID), 1, "old-request"], { request_id: "old-request" }],
+    ];
+    for (const [key, value] of fixtures) {
+      await withNativeLocalKeyKv(async (isolated) => {
+        const guardKey = paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID);
+        await isolated.set(guardKey, { created_at_ms: Date.now(), local_deletion: { owner: "synthetic-completed", completed_at_ms: Date.now() } });
+        const guard = await isolated.get(guardKey);
+        await isolated.set(key, value);
+        const retained = await isolated.get(key);
+        assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "conflict", JSON.stringify(key));
+        assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+        assert.deepEqual(await isolated.get(guardKey), guard);
+        assert.deepEqual(await isolated.get(key), retained);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "native KV deletion guard CAS rejects a concurrent deletion during local provisioning",
+  ignore: !originalOpenKv,
+  fn: async () => {
+    for (const retainedGuard of [false, true]) {
+      await withNativeLocalKeyKv(async (isolated) => {
+        const guardKey = paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID);
+        if (retainedGuard) await isolated.set(guardKey, { created_at_ms: 1, local_deletion: { owner: "synthetic-completed", completed_at_ms: 2 } });
+        let concurrentGuard: Deno.KvEntryMaybe<unknown> | null = null;
+        assert.equal(
+          await ensureLocalDevelopmentApiKey(isolated, {
+            initializePolicy: async () => {
+              if (retainedGuard) await isolated.set(guardKey, { created_at_ms: 2 });
+              else assert.equal((await deletePaidFallbackStateV3(LOCAL_DEVELOPMENT_KEY_ID, isolated)).kind, "deleted");
+              concurrentGuard = await isolated.get(guardKey);
+              return pricing;
+            },
+          }),
+          "conflict"
+        );
+        assert.ok(concurrentGuard);
+        assert.deepEqual(await isolated.get(guardKey), concurrentGuard);
+        assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+        const entries = [];
+        for await (const entry of isolated.list({ prefix: API_KEY_USAGE_V3_WINDOW_PREFIX })) entries.push(entry);
+        assert.equal(entries.length, 0);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "native KV keeps provisioning blocked while old deletion scans an empty usage prefix",
+  ignore: !originalOpenKv,
+  fn: async () => {
+    for (const staleOwner of [false, true])
+      await withNativeLocalKeyKv(async (isolated) => {
+        assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+        const policy = await resolveLocalDevelopmentApiKeyPolicy(isolated);
+        assert.ok(policy);
+        // An expired old window leaves an empty prefix before deletion starts.
+        await isolated.delete(apiKeyUsageV3WindowKey(policy));
+        assert.equal((await handleAdminApiKeysRevoke(localKeyMutationRequest())).status, 200);
+        let enterCleanup = (): void => {};
+        const cleanupEntered = new Promise<void>((resolve) => {
+          enterCleanup = resolve;
+        });
+        let resumeCleanup = (): void => {};
+        const cleanupResumed = new Promise<void>((resolve) => {
+          resumeCleanup = resolve;
+        });
+        const originalList = isolated.list.bind(isolated);
+        let pausedCleanup = false;
+        isolated.list = <T>(selector: Deno.KvListSelector, options?: Deno.KvListOptions): Deno.KvListIterator<T> => {
+          const iterator = originalList<T>(selector, options);
+          if (!pausedCleanup && JSON.stringify(selector) === JSON.stringify({ prefix: [...API_KEY_USAGE_V3_WINDOW_PREFIX, LOCAL_DEVELOPMENT_KEY_ID] })) {
+            pausedCleanup = true;
+            const originalNext = iterator.next.bind(iterator);
+            iterator.next = async () => {
+              enterCleanup();
+              await cleanupResumed;
+              return await originalNext();
+            };
+          }
+          return iterator;
+        };
+        const deletion = handleAdminApiKeysDelete(localKeyMutationRequest());
+        let replacementGuard: Deno.KvEntryMaybe<unknown> | null = null;
+        try {
+          await cleanupEntered;
+          assert.equal((await isolated.get(apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID))).value, null);
+          assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "conflict");
+          if (staleOwner) {
+            await isolated.set(paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID), {
+              created_at_ms: Date.now(),
+              local_deletion: { owner: "replacement-owner", completed_at_ms: null },
+            });
+            replacementGuard = await isolated.get(paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID));
+          }
+        } finally {
+          resumeCleanup();
+          assert.equal((await deletion).status, staleOwner ? 409 : 200);
+          isolated.list = originalList;
+        }
+        if (staleOwner) {
+          assert.deepEqual(await isolated.get(paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID)), replacementGuard);
+          assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "conflict");
+        } else {
+          assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+          const replacement = await resolveLocalDevelopmentApiKeyPolicy(isolated);
+          assert.ok(replacement);
+          assert.ok((await isolated.get(apiKeyUsageV3WindowKey(replacement))).value);
+        }
+      });
+  },
+});
+
+Deno.test({
+  name: "native KV local deletion refuses overlapping and crashed owners without changing other guards",
+  ignore: !originalOpenKv,
+  fn: async () => {
+    await withNativeLocalKeyKv(async (isolated) => {
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+      const idKey = apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID);
+      const record = (await isolated.get<Record<string, unknown>>(idKey)).value;
+      assert.ok(record);
+      assert.equal((await handleAdminApiKeysRevoke(localKeyMutationRequest(LOCAL_DEVELOPMENT_KEY_ID))).status, 200);
+      let entered = (): void => {};
+      const enter = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let resume = (): void => {};
+      const resumed = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      const originalList = isolated.list.bind(isolated);
+      let paused = false;
+      isolated.list = <T>(selector: Deno.KvListSelector, options?: Deno.KvListOptions): Deno.KvListIterator<T> => {
+        const iterator = originalList<T>(selector, options);
+        if (!paused && JSON.stringify(selector) === JSON.stringify({ prefix: paidFallbackRequestV3Prefix(LOCAL_DEVELOPMENT_KEY_ID) })) {
+          paused = true;
+          const next = iterator.next.bind(iterator);
+          iterator.next = async () => {
+            entered();
+            await resumed;
+            return await next();
+          };
+        }
+        return iterator;
+      };
+      const firstDeletion = handleAdminApiKeysDelete(localKeyMutationRequest(LOCAL_DEVELOPMENT_KEY_ID));
+      try {
+        await enter;
+        const guardKey = paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID);
+        const claimed = await isolated.get(guardKey);
+        assert.equal((await handleAdminApiKeysDelete(localKeyMutationRequest(LOCAL_DEVELOPMENT_KEY_ID))).status, 409);
+        assert.equal((await handleAdminApiKeysUnrevoke(localKeyMutationRequest(LOCAL_DEVELOPMENT_KEY_ID))).status, 409);
+        assert.deepEqual(await isolated.get(guardKey), claimed);
+        assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "revoked");
+      } finally {
+        resume();
+        assert.equal((await firstDeletion).status, 200);
+        isolated.list = originalList;
+      }
+
+      // A different ID keeps the original retained-guard deletion semantics.
+      const otherId = "unrelated-key";
+      const otherGuardKey = paidFallbackDeletionGuardV3Key(otherId);
+      await isolated.set(apiKeyIdKey(otherId), { ...record, id: otherId, hash: "synthetic-other-hash", revoked_at_ms: Date.now() });
+      await isolated.set(otherGuardKey, { created_at_ms: Date.now() });
+      const otherGuard = await isolated.get(otherGuardKey);
+      assert.equal((await handleAdminApiKeysDelete(localKeyMutationRequest(otherId))).status, 200);
+      assert.deepEqual(await isolated.get(otherGuardKey), otherGuard);
+
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+      assert.equal((await handleAdminApiKeysRevoke(localKeyMutationRequest(LOCAL_DEVELOPMENT_KEY_ID))).status, 200);
+      const guardKey = paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID);
+      await isolated.set(guardKey, { created_at_ms: Date.now(), local_deletion: { owner: "crashed-owner", completed_at_ms: null } });
+      const crashed = await isolated.get(guardKey);
+      assert.equal((await handleAdminApiKeysDelete(localKeyMutationRequest(LOCAL_DEVELOPMENT_KEY_ID))).status, 409);
+      assert.deepEqual(await isolated.get(guardKey), crashed);
+      await isolated.delete(idKey);
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "conflict");
+      assert.deepEqual(await isolated.get(guardKey), crashed);
+      await isolated.set(guardKey, { created_at_ms: Date.now() });
+      const legacyGuard = await isolated.get(guardKey);
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "conflict");
+      assert.deepEqual(await isolated.get(guardKey), legacyGuard);
+    });
+  },
+});
+
+Deno.test({
+  name: "native KV known outstanding billing refusal releases only its local owner for explicit retry",
+  ignore: !originalOpenKv,
+  fn: async () => {
+    await withNativeLocalKeyKv(async (isolated) => {
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+      assert.equal((await handleAdminApiKeysRevoke(localKeyMutationRequest())).status, 200);
+      const pendingKey = paidFallbackRequestV3Key(LOCAL_DEVELOPMENT_KEY_ID, "pending-billing");
+      await isolated.set(pendingKey, { billing_state: "pending" });
+      assert.equal((await handleAdminApiKeysDelete(localKeyMutationRequest())).status, 409);
+      const guardKey = paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID);
+      const guard = (await isolated.get<Record<string, unknown>>(guardKey)).value;
+      assert.ok(guard);
+      assert.deepEqual(guard.local_deletion, { owner: null, completed_at_ms: null });
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "revoked");
+      await isolated.delete(pendingKey);
+      assert.equal((await handleAdminApiKeysDelete(localKeyMutationRequest())).status, 200);
+      assert.equal(await ensureLocalDevelopmentApiKey(isolated, { initializePolicy }), "created");
+    });
+  },
 });

@@ -8,12 +8,29 @@ import {
   calculateNextResetMs,
   generateApiKeyToken,
 } from "../api-keys.ts";
-import { type ApiKeyPolicy, apiKeyPolicyFromHashRecord, apiKeyUsageV3RetentionMs, apiKeyUsageV3WindowKey, makeApiKeyUsageWindowV3 } from "../api-key-policy.ts";
+import {
+  API_KEY_USAGE_V2_PREFIX,
+  API_KEY_USAGE_V3_REQUEST_PREFIX,
+  API_KEY_USAGE_V3_WINDOW_PREFIX,
+  type ApiKeyPolicy,
+  apiKeyPolicyFromHashRecord,
+  apiKeyUsageV3RetentionMs,
+  apiKeyUsageV3WindowKey,
+  makeApiKeyUsageWindowV3,
+} from "../api-key-policy.ts";
+import { apiKeyRequestLogPrefix, legacyApiKeyRequestLogPrefix } from "../analytics.ts";
 import { defaultPaidFallbackPolicy, initializePaidFallbackPolicy, paidFallbackHashFields } from "../paid-fallback/index.ts";
+import {
+  getPaidFallbackOutstandingV3,
+  paidFallbackDeletionGuardV3Key,
+  paidFallbackReconciliationLeaseV3Key,
+  paidFallbackRequestV3Prefix,
+  paidFallbackWindowV3Prefix,
+} from "../paid-fallback/ledger-state.ts";
 import { readMeteredApiKey } from "../provider/metered.ts";
 import { readSurplusApiKey } from "../provider/surplus.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord } from "../types.ts";
-import { sha256Base64Url } from "../utils.ts";
+import { isRecord, sha256Base64Url } from "../utils.ts";
 
 /**
  * The loopback development principal (`--disable-admin-auth` / the Mac service)
@@ -31,6 +48,25 @@ export const LOCAL_DEVELOPMENT_KEY_ID = "local-development";
 
 /** The single account the loopback development server provisions for itself. */
 export const LOCAL_DEVELOPMENT_KEY_NAME = "Local development (loopback)";
+
+/** Extends the retained guard without changing any other guard reader. */
+export type LocalDevelopmentDeletionGuard = Readonly<{
+  created_at_ms: number;
+  local_deletion: Readonly<{ owner: string | null; completed_at_ms: number | null }>;
+}>;
+
+const isCompletedLocalDevelopmentDeletion = (value: unknown): boolean => {
+  if (
+    !isRecord(value) ||
+    typeof value.created_at_ms !== "number" ||
+    !Number.isSafeInteger(value.created_at_ms) ||
+    value.created_at_ms <= 0 ||
+    !isRecord(value.local_deletion)
+  )
+    return false;
+  const { owner, completed_at_ms: completedAtMs } = value.local_deletion;
+  return typeof owner === "string" && owner.length > 0 && typeof completedAtMs === "number" && Number.isSafeInteger(completedAtMs) && completedAtMs > 0;
+};
 
 /**
  * Fixed internal deadline for the local paid-pricing snapshot.
@@ -145,6 +181,27 @@ const buildLocalDevelopmentKey = async (
   return { record, hashKey: apiKeyHashKey(hash), hashRecord, policy };
 };
 
+/** Completion is owner-published only after every old cleanup iterator settles. */
+const localDevelopmentDeletionStateEmpty = async (kv: Deno.Kv): Promise<boolean> => {
+  const outstanding = await getPaidFallbackOutstandingV3(LOCAL_DEVELOPMENT_KEY_ID, kv);
+  if (!outstanding || outstanding.has_outstanding) return false;
+  const lease = await kv.get(paidFallbackReconciliationLeaseV3Key(LOCAL_DEVELOPMENT_KEY_ID), { consistency: "strong" });
+  if (lease.value) return false;
+  const prefixes = [
+    paidFallbackRequestV3Prefix(LOCAL_DEVELOPMENT_KEY_ID),
+    paidFallbackWindowV3Prefix(LOCAL_DEVELOPMENT_KEY_ID),
+    apiKeyRequestLogPrefix(LOCAL_DEVELOPMENT_KEY_ID),
+    legacyApiKeyRequestLogPrefix(LOCAL_DEVELOPMENT_KEY_ID),
+    [...API_KEY_USAGE_V2_PREFIX, LOCAL_DEVELOPMENT_KEY_ID],
+    [...API_KEY_USAGE_V3_WINDOW_PREFIX, LOCAL_DEVELOPMENT_KEY_ID],
+    [...API_KEY_USAGE_V3_REQUEST_PREFIX, LOCAL_DEVELOPMENT_KEY_ID],
+  ];
+  for (const prefix of prefixes) {
+    if (!(await kv.list({ prefix }, { consistency: "strong", limit: 1 }).next()).done) return false;
+  }
+  return true;
+};
+
 /**
  * Creates the loopback development key when it is absent. Idempotent and
  * best-effort: an existing record is never rewritten, so an operator can revoke
@@ -161,6 +218,8 @@ export const ensureLocalDevelopmentApiKey = async (
   const idKey = apiKeyIdKey(LOCAL_DEVELOPMENT_KEY_ID);
   const existing = await kv.get<ApiKeyRecord>(idKey, { consistency: "strong" });
   if (existing.value) return existing.value.revoked_at_ms === null ? "present" : "revoked";
+  const deletionGuard = await kv.get(paidFallbackDeletionGuardV3Key(LOCAL_DEVELOPMENT_KEY_ID), { consistency: "strong" });
+  if (deletionGuard.value && (!isCompletedLocalDevelopmentDeletion(deletionGuard.value) || !(await localDevelopmentDeletionStateEmpty(kv)))) return "conflict";
   if (!readMeteredApiKey() && !readSurplusApiKey()) {
     console.warn("[ai.ubq.fi] Local development key was not provisioned: no paid provider API key is configured.");
     return "unconfigured";
@@ -193,16 +252,18 @@ export const ensureLocalDevelopmentApiKey = async (
 
   const hashEntry = await kv.get<ApiKeyHashRecord>(material.hashKey);
   const window = makeApiKeyUsageWindowV3(material.policy, nowMs);
-  const committed = await kv
+  const atomic = kv
     .atomic()
     .check(existing)
     .check(hashEntry)
+    .check(deletionGuard)
     .set(idKey, material.record)
     .set(material.hashKey, material.hashRecord)
     .set(apiKeyUsageV3WindowKey(material.policy), window, {
       expireIn: apiKeyUsageV3RetentionMs(window.window_reset_at_ms, nowMs),
-    })
-    .commit();
+    });
+  if (deletionGuard.value) atomic.delete(deletionGuard.key);
+  const committed = await atomic.commit();
   if (!committed.ok) return "conflict";
   return "created";
 };

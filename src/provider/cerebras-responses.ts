@@ -145,11 +145,11 @@ const recordCerebrasResponsesTerminal = (
   recordStreamTerminalType(usageContext, terminalType);
   if (terminalType === "response.completed") {
     recordStreamTerminal(usageContext);
+    recordCerebrasResponseHealth(upstreamStatus, providerRequestId);
   } else {
     recordCerebrasFailureKind(usageContext, terminalType === "response.incomplete" ? "incomplete_response" : "upstream_error");
     void recordCerebrasProviderHealth("upstream_error", upstreamStatus, Date.now, providerRequestId);
   }
-  recordCerebrasResponseHealth(upstreamStatus, providerRequestId);
 };
 
 /**

@@ -117,8 +117,11 @@ body[data-page="docs"] [data-docs-content] a {
 
 body[data-page="docs"] [data-docs-content] pre[data-code] {
   max-width: 100%;
-  padding-top: 48px;
   overscroll-behavior-x: contain;
+}
+
+body[data-page="docs"] [data-docs-content] [data-code-block]:has([data-copy-code]) pre[data-code] {
+  padding-top: 48px;
 }
 
 body[data-page="docs"] [data-docs-content] pre[data-code]:focus-visible,
@@ -186,7 +189,7 @@ body[data-page="docs"] [data-copy-code][data-copy-error] {
 }
 
 @media (pointer: coarse) {
-  body[data-page="docs"] [data-docs-content] pre[data-code] {
+  body[data-page="docs"] [data-docs-content] [data-code-block]:has([data-copy-code]) pre[data-code] {
     padding-top: calc(var(--control-height) + 16px);
   }
 
