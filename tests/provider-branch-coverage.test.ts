@@ -4,7 +4,7 @@ import {
   additionalRateLimitsForRouting,
   codexAccountLabel,
   codexUsageUrl,
-  fillMissingCodexSparkLimitForAdmin,
+  fillMissingCodexAdditionalLimitsForAdmin,
   isSafeTimestamp,
   parseCodexUsage,
   providerCapacityLastAvailableKey,
@@ -21,7 +21,6 @@ import type {
   ProviderCapacityCodexSource,
   ProviderCapacityMeteredSource,
   ProviderCapacitySource,
-  ProviderCapacityWindow,
 } from "../src/provider/capacity-contract.ts";
 import { PROVIDER_CAPACITY_SNAPSHOT_KEY } from "../src/provider/capacity-contract.ts";
 
@@ -239,16 +238,20 @@ Deno.test("capacity parse: an unanchored additional window is filtered out of th
   assert.deepEqual(additionalRateLimitsForRouting([overflowing], snapshotAtMs), [overflowing]);
 });
 
-Deno.test("capacity parse: a missing Spark window is filled from a reachable sibling only", () => {
-  const sparkWindow: ProviderCapacityWindow = { limit_window_seconds: 18_000, used_percent: 0, reset_at_ms: 1_700_000_000_000 };
+Deno.test("capacity parse: missing named limits are filled from reachable siblings only", () => {
+  const reserveLimit: ProviderCapacityAdditionalRateLimit = {
+    limit_name: "gpt-reserve",
+    metered_feature: "base_model_inference",
+    windows: { primary: { limit_window_seconds: 604_800, used_percent: 100, reset_at_ms: 1_800_000_000_000 }, secondary: null },
+  };
   const sparkLimit: ProviderCapacityAdditionalRateLimit = {
     limit_name: SPARK_LIMIT_NAME,
     metered_feature: null,
-    windows: { primary: sparkWindow, secondary: null },
+    windows: { primary: { limit_window_seconds: 18_000, used_percent: 0, reset_at_ms: 1_700_000_000_000 }, secondary: null },
   };
-  const withSpark: ProviderCapacityCodexSource = {
+  const baseSource: ProviderCapacityCodexSource = {
     source: "codex",
-    label: "codex-spark",
+    label: "codex-plain",
     slot: 1,
     account_cohort_id: null,
     state: "available",
@@ -257,22 +260,37 @@ Deno.test("capacity parse: a missing Spark window is filled from a reachable sib
     failure_kind: null,
     failure_status: null,
     windows: { primary: null, secondary: null },
-    additional_rate_limits: [sparkLimit],
+    additional_rate_limits: [],
   };
-  const withoutSpark: ProviderCapacityCodexSource = { ...withSpark, label: "codex-plain", slot: 2, additional_rate_limits: [] };
-  const unavailable: ProviderCapacityCodexSource = { ...withSpark, label: "codex-offline", slot: 2, state: "unavailable", additional_rate_limits: [] };
+  const withReserve: ProviderCapacityCodexSource = { ...baseSource, label: "codex-reserve", additional_rate_limits: [reserveLimit] };
+  const withSpark: ProviderCapacityCodexSource = { ...baseSource, label: "codex-spark", slot: 2, additional_rate_limits: [sparkLimit] };
+  const withoutLimits: ProviderCapacityCodexSource = { ...baseSource, label: "codex-plain", slot: 2 };
+  const unavailable: ProviderCapacityCodexSource = { ...baseSource, label: "codex-offline", slot: 2, state: "unavailable" };
 
-  // No sibling publishes the limit, so the list is returned untouched.
-  const sourcesOnlyWithout = [withoutSpark, unavailable];
-  assert.deepEqual(fillMissingCodexSparkLimitForAdmin(sourcesOnlyWithout), sourcesOnlyWithout);
+  // No sibling publishes a limit, so the list is returned untouched.
+  const sourcesOnlyWithout = [withoutLimits, unavailable];
+  assert.deepEqual(fillMissingCodexAdditionalLimitsForAdmin(sourcesOnlyWithout), sourcesOnlyWithout);
 
-  const filled = fillMissingCodexSparkLimitForAdmin([withSpark, withoutSpark, unavailable]);
+  // A missing non-Spark limit is mirrored from the reachable sibling as its row was reported.
+  const filled = fillMissingCodexAdditionalLimitsForAdmin([withReserve, withoutLimits, unavailable]);
   assert.equal(filled[1].additional_rate_limits.length, 1);
-  assert.equal(filled[1].additional_rate_limits[0].limit_name.trim().toLowerCase(), SPARK_LIMIT_NAME.toLowerCase());
+  assert.deepEqual(filled[1].additional_rate_limits, [reserveLimit]);
+  assert.deepEqual(filled[1].additional_rate_limits[0], withReserve.additional_rate_limits[0]);
   // The unavailable account is never given a synthetic limit.
   assert.deepEqual(filled[2].additional_rate_limits, []);
   // The account that already reports it is left alone.
-  assert.equal(filled[0].additional_rate_limits.length, 1);
+  assert.deepEqual(filled[0].additional_rate_limits, [reserveLimit]);
+
+  // Two differently named limits reported on different accounts cross-fill.
+  const crossFilled = fillMissingCodexAdditionalLimitsForAdmin([withReserve, withSpark]);
+  assert.deepEqual(crossFilled[0].additional_rate_limits, [reserveLimit, sparkLimit]);
+  assert.deepEqual(crossFilled[1].additional_rate_limits, [sparkLimit, reserveLimit]);
+
+  // A name already reported under different padding or casing is not duplicated.
+  const padded: ProviderCapacityCodexSource = { ...baseSource, additional_rate_limits: [{ ...reserveLimit, limit_name: " gpt-RESERVE " }] };
+  const normalized = fillMissingCodexAdditionalLimitsForAdmin([padded, withReserve]);
+  assert.deepEqual(normalized[0].additional_rate_limits, padded.additional_rate_limits);
+  assert.deepEqual(normalized[1].additional_rate_limits, [reserveLimit]);
 });
 
 Deno.test("capacity parse: stored codex sources round-trip only well-formed rows", () => {
