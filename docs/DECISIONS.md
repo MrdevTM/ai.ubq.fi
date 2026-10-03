@@ -1253,3 +1253,10 @@ stealing. Startup reprovision requires a completed local marker, no outstanding 
 remaining cleanup rows, and atomically checks the absent ID, token hash and unchanged guard while publishing the
 replacement and clearing only that local guard. Empty prefixes and an absent ID alone never prove completion; every
 nonlocal guard keeps its existing meaning.
+
+## Client catalog ETags - 2026-10-03
+
+Client catalog ETags are hashes of the final bytes served to that client, in both the fast path and the assembled path.
+Raw upstream ETags remain source metadata used only for upstream conditional fetches. Enrichment that changes the served
+body changes its client validator even when upstream metadata is unchanged; only a validator for the current served body
+permits a client 304 response.

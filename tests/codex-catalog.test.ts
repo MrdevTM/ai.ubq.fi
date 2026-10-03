@@ -206,7 +206,7 @@ Deno.test("codex catalog: unversioned models retain the exact OpenAI list shape"
   assert.equal(payload.object, "list");
 });
 
-Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and forward ETags", async () => {
+Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and derive client ETags", async () => {
   seedBaseState("0.100.0");
   const originalFetch = globalThis.fetch;
   const calls: { url: string; headers: Headers }[] = [];
@@ -225,14 +225,14 @@ Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and
   try {
     const first = await handleCodexCatalogModels(request("0.144.3"), "0.144.3");
     assert.equal(first.status, 200);
-    assert.equal(first.headers.get("etag"), '"0.144.3"');
+    const etag = first.headers.get("etag") ?? "";
+    assert.match(etag, /^"uos-catalog-[a-f0-9]{32}"$/);
     assert.deepEqual(await first.json(), JSON.parse(catalogBody("0.144.3", { version_marker: "0.144.3" })));
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "https://chatgpt.com/backend-api/codex/models?client_version=0.144.3");
     assert.equal(calls[0].headers.get("cookie"), null);
     assert.notEqual(calls[0].headers.get("authorization"), "Bearer gateway-client-token");
     assert.match(calls[0].headers.get("user-agent") ?? "", /codex_cli_rs\/0\.144\.3/);
-
     const hit = await handleCodexCatalogModels(request("0.144.3"), "0.144.3");
     assert.equal(hit.headers.get("x-uos-cache"), "hit");
     assert.equal(calls.length, 1);
@@ -242,7 +242,7 @@ Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and
     assert.equal(calls.length, 2);
     assert.equal(((await secondVersion.json()) as { version_marker?: string }).version_marker, "0.145.0");
 
-    const notModified = await handleCodexCatalogModels(request("0.144.3", { "If-None-Match": '"0.144.3"' }), "0.144.3");
+    const notModified = await handleCodexCatalogModels(request("0.144.3", { "If-None-Match": etag }), "0.144.3");
     assert.equal(notModified.status, 304);
     assert.equal(await notModified.text(), "");
     assert.equal(calls.length, 2);
@@ -413,7 +413,7 @@ Deno.test("codex catalog: stale catalogs signal response body transport failures
   }
 });
 
-Deno.test("codex catalog: stale ETags revalidate upstream and matching clients receive 304", async () => {
+Deno.test("codex catalog: stale upstream ETags revalidate upstream without validating client bytes", async () => {
   seedBaseState();
   const version = "0.150.1";
   await storeCodexCatalog(kvStub, {
@@ -431,10 +431,10 @@ Deno.test("codex catalog: stale ETags revalidate upstream and matching clients r
   };
   try {
     const response = await handleCodexCatalogModels(request(version, { "If-None-Match": '"catalog-etag"' }), version);
-    assert.equal(response.status, 304);
+    assert.equal(response.status, 200);
     assert.equal(response.headers.get("x-uos-cache"), "revalidated");
     assert.equal(upstreamIfNoneMatch, '"catalog-etag"');
-    assert.equal(await response.text(), "");
+    assert.equal(await response.text(), catalogBody(version));
   } finally {
     globalThis.fetch = originalFetch;
   }
