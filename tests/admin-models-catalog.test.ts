@@ -22,8 +22,11 @@ import handler from "../src/handler/index.ts";
 import handlerSource from "../src/handler/index.ts" with { type: "text" };
 import type { OpenRouterModelsSnapshot } from "../src/models/openrouter-models.ts";
 import { setKvForTest } from "../src/kv.ts";
-import { buildModelCatalogSnapshot } from "../src/models/catalog.ts";
+import { buildModelCatalogSnapshot, handlePublicModelCatalog } from "../src/models/catalog.ts";
 import openaiSource from "../src/models/catalog.ts" with { type: "text" };
+import { CODEX_MODELS_KV_KEY, loadFullCodexModelsSnapshot } from "../src/codex/index.ts";
+import { buildRuntimeConfig, resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
+import { loadProviderSelection, PROVIDER_SELECTION_KV_KEY, resetProviderSelectionCacheForTest } from "../src/provider/selection.ts";
 
 // The catalog builder reads discovery credentials from the environment. Clearing
 // them keeps these tests on the credential-gated providers they own, and keeps
@@ -55,6 +58,19 @@ class WhitelistKv {
 
   storedWhitelist(): CodexModelsWhitelist | null {
     return (this.values.get(keyOf([...CODEX_MODELS_WHITELIST_KV_KEY])) ?? null) as CodexModelsWhitelist | null;
+  }
+}
+
+/** Reject selected reads asynchronously, leaving the independent runtime/control keys readable. */
+class RejectingReadKv extends WhitelistKv {
+  readonly rejectedKeys = new Set<string>();
+  readonly reads: { key: string; consistency?: "strong" | "eventual" }[] = [];
+
+  override get<T>(key: Deno.KvKey, options?: { consistency?: "strong" | "eventual" }): Promise<Deno.KvEntryMaybe<T>> {
+    const encodedKey = keyOf(key);
+    this.reads.push({ key: encodedKey, consistency: options?.consistency });
+    if (this.rejectedKeys.has(encodedKey)) return Promise.reject(new Error("fixture KV read unavailable"));
+    return super.get<T>(key, options);
   }
 }
 
@@ -217,6 +233,95 @@ Deno.test("the model picker refuses to render without KV", async () => {
     assert.equal(response.status, 500);
     const body = await response.json();
     assert.equal(body.error.type, "server_error");
+  });
+});
+
+Deno.test("catalog builder and public/admin handlers retain runtime ids and tiers when the optional full snapshot rejects", async () => {
+  const kv = new RejectingReadKv();
+  kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+  const runtime = buildRuntimeConfig({
+    source: "runtime-fallback-fixture",
+    updated_at_ms: 1_800_000_000_000,
+    models: [
+      { slug: "runtime-fallback", supported_reasoning_levels: ["low", "ultra"], default_reasoning_level: "ultra" },
+      { slug: "runtime-hidden", supported_reasoning_levels: ["none"], default_reasoning_level: "none" },
+    ],
+  });
+  kv.values.set(keyOf(RUNTIME_CONFIG_V2_KEY), runtime);
+  kv.values.set(keyOf(CODEX_MODELS_WHITELIST_KV_KEY), { model_ids: ["runtime-fallback"], updated_at_ms: 1_800_000_000_001 });
+  kv.values.set(keyOf(PROVIDER_SELECTION_KV_KEY), { provider_ids: ["codex"], updated_at_ms: 1_800_000_000_002 });
+  resetRuntimeConfigCacheForTest();
+  resetProviderSelectionCacheForTest();
+  try {
+    await withKv(kv, async () => {
+      const catalog = await buildModelCatalogSnapshot();
+      const codexRows = catalog.models.filter((model) => model.providers.some((provider) => provider.id === "codex"));
+      assert.deepEqual(
+        codexRows.map((model) => model.id),
+        ["runtime-fallback", "runtime-hidden"]
+      );
+      assert.deepEqual(codexRows[0].supported_reasoning_levels, ["low", "ultra"]);
+      assert.equal(codexRows[0].default_reasoning_effort, "ultra");
+      assert.deepEqual(catalog.sources.codex, { status: "available", count: 2, updated_at_ms: runtime.codex_models.updated_at_ms });
+
+      const publicResponse = await handlePublicModelCatalog();
+      assert.equal(publicResponse.status, 200);
+      const publicBody = await publicResponse.json();
+      assert.equal(publicBody.object, "uos.model_catalog");
+      assert.deepEqual(
+        publicBody.data.map((model: { id: string }) => model.id),
+        ["runtime-fallback"]
+      );
+      assert.deepEqual(publicBody.data[0].supported_reasoning_levels, ["low", "ultra"]);
+      assert.equal(publicBody.data[0].default_reasoning_effort, "ultra");
+
+      const adminResponse = await handleAdminModelsCatalogGet();
+      assert.equal(adminResponse.status, 200);
+      const adminBody = await adminResponse.json();
+      assert.deepEqual(
+        adminBody.data.models
+          .filter((model: { providers: { id: string }[] }) => model.providers.some((provider) => provider.id === "codex"))
+          .map((model: { id: string }) => model.id),
+        ["runtime-fallback", "runtime-hidden"]
+      );
+      const adminRow = adminBody.data.models.find((model: { id: string }) => model.id === "runtime-fallback");
+      assert.deepEqual(adminRow.supported_reasoning_levels, ["low", "ultra"]);
+      assert.equal(adminRow.default_reasoning_effort, "ultra");
+      assert.deepEqual(adminBody.data.whitelist.model_ids, ["runtime-fallback"]);
+      assert.equal(adminBody.data.filter_active, true);
+      assert.equal(kv.reads.filter((read) => read.key === keyOf(CODEX_MODELS_KV_KEY) && read.consistency === "strong").length, 3);
+      assert.ok(kv.reads.some((read) => read.key === keyOf(RUNTIME_CONFIG_V2_KEY) && read.consistency === "strong"));
+    });
+  } finally {
+    resetRuntimeConfigCacheForTest();
+    resetProviderSelectionCacheForTest();
+  }
+});
+
+Deno.test("optional snapshot failure containment preserves snapshot shape checks and critical control read failures", async () => {
+  const kv = new RejectingReadKv();
+  const validSnapshot = { models: [{ slug: "valid-model" }], source: "fixture", updated_at_ms: 1 };
+  await withKv(kv, async () => {
+    kv.values.set(keyOf(CODEX_MODELS_KV_KEY), validSnapshot);
+    assert.deepEqual(await loadFullCodexModelsSnapshot(), validSnapshot);
+    for (const invalidSnapshot of [
+      { ...validSnapshot, models: [] },
+      { ...validSnapshot, models: [null] },
+      { ...validSnapshot, source: " " },
+      { ...validSnapshot, updated_at_ms: 0 },
+      { ...validSnapshot, updated_at_ms: 1.5 },
+    ]) {
+      kv.values.set(keyOf(CODEX_MODELS_KV_KEY), invalidSnapshot);
+      assert.equal(await loadFullCodexModelsSnapshot(), null);
+    }
+    kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+    kv.rejectedKeys.add(keyOf(CODEX_MODELS_WHITELIST_KV_KEY));
+    kv.rejectedKeys.add(keyOf(PROVIDER_SELECTION_KV_KEY));
+    assert.equal(await loadFullCodexModelsSnapshot(), null);
+    await assert.rejects(() => handleAdminModelsCatalogGet(), /fixture KV read unavailable/);
+    await assert.rejects(() => loadProviderSelection(kv as unknown as Deno.Kv), /fixture KV read unavailable/);
+    const unauthenticated = await handler(new Request("https://ai.ubq.fi/admin/models/catalog"));
+    assert.equal(unauthenticated.status, 401);
   });
 });
 
