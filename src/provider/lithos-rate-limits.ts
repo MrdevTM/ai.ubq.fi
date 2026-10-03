@@ -33,36 +33,38 @@ export const lithosIsLadderTarget = (modelRaw: string, target: string): boolean 
 
 /**
  * The in-process failover windows: a tier whose refusal named a reset instant
- * keeps sending its requests to the next ladder tier until that instant passes,
- * and then returns to the requested tier. The window carries its target, so a
- * fast refusal deepens a later request to the normal tier instead of bouncing
- * back to a saturated one. Scoped to models with a ladder, so a bottom tier
- * never accumulates state.
+ * is skipped until that instant passes. Each refused rung has its own deadline,
+ * shared by every request whose ladder contains it, so recovered capacity is
+ * eligible again without inheriting another rung's reset. Scoped to models with
+ * a ladder, so a bottom tier never accumulates state.
  *
  * The state is per process on purpose: it mirrors what this gateway instance has
  * been told by the vendor, and a restart re-learns it from the first refusal.
  */
-type LithosFailoverWindow = Readonly<{ deadlineMs: number; target: string }>;
-const lithosFailoverWindows = new Map<string, LithosFailoverWindow>();
+const lithosFailoverWindows = new Map<string, number>();
 
 /** The ladder tier this request model must start on right now, or null once the window has passed. */
 export const lithosFailoverTargetAt = (modelRaw: string, nowMs: number): string | null => {
-  const window = lithosFailoverWindows.get(modelRaw);
-  if (window === undefined) return null;
-  if (nowMs >= window.deadlineMs || !lithosIsLadderTarget(modelRaw, window.target)) {
-    lithosFailoverWindows.delete(modelRaw);
-    return null;
+  if (!Number.isFinite(nowMs)) return null;
+  for (const rung of [modelRaw, ...lithosFailoverLadderFor(modelRaw)]) {
+    const deadlineMs = lithosFailoverWindows.get(rung);
+    if (deadlineMs !== undefined && nowMs < deadlineMs) continue;
+    lithosFailoverWindows.delete(rung);
+    return rung === modelRaw ? null : rung;
   }
-  return window.target;
+  return null;
 };
 
-/** Opens (or extends) that window: the refusal's own reset instant plus the tier it points at. */
+/** Opens (or extends) the refused rung's own window, inferred from its legal next target. */
 export const lithosOpenFailoverWindow = (modelRaw: string, nowMs: number, waitMs: number, target: string): void => {
+  const ladder = lithosFailoverLadderFor(modelRaw);
+  const targetIndex = ladder.indexOf(target);
   const deadlineMs = nowMs + waitMs;
-  if (!lithosIsLadderTarget(modelRaw, target) || !Number.isFinite(deadlineMs)) return;
-  const current = lithosFailoverWindows.get(modelRaw);
-  const unexpiredDeadlineMs = current && current.deadlineMs > nowMs ? current.deadlineMs : deadlineMs;
-  lithosFailoverWindows.set(modelRaw, { deadlineMs: Math.max(deadlineMs, unexpiredDeadlineMs), target });
+  if (targetIndex === -1 || !Number.isFinite(nowMs) || !Number.isFinite(waitMs) || waitMs <= 0 || !Number.isFinite(deadlineMs)) return;
+  const refusedRung = targetIndex === 0 ? modelRaw : ladder[targetIndex - 1];
+  const currentDeadlineMs = lithosFailoverWindows.get(refusedRung);
+  const unexpiredDeadlineMs = currentDeadlineMs !== undefined && currentDeadlineMs > nowMs ? currentDeadlineMs : deadlineMs;
+  lithosFailoverWindows.set(refusedRung, Math.max(deadlineMs, unexpiredDeadlineMs));
 };
 
 /** Test seam: drop every window so fixtures cannot leak into each other. */
