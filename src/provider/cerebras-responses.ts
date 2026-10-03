@@ -26,7 +26,7 @@ import {
 import { recordCerebrasProviderHealth } from "./health.ts";
 import { readBoundedResponseBody } from "../bounded-response-body.ts";
 import { logForwardedPayloadElisions, toDeepSeekResponsesChatBody } from "../deepseek/chat-projection.ts";
-import { CEREBRAS_RESPONSES_PROFILE } from "../deepseek/responses.ts";
+import { CEREBRAS_RESPONSES_PROFILE, type OriginalToolName } from "../deepseek/responses.ts";
 import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload } from "../deepseek/responses-payload.ts";
 import { createDeepSeekResponsesStreamTranslator, encodeResponsesEvent } from "../deepseek/responses-stream.ts";
 import { deepSeekTerminalTypeForPayload } from "../deepseek/handlers.ts";
@@ -182,7 +182,7 @@ const replayCerebrasResponsesStream = (
     responseId: string;
     createdAtSeconds: number;
     echo: DeepSeekResponsesEcho;
-    toolNames: ReadonlyMap<string, string>;
+    toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     payload: Record<string, unknown>;
     usage: UsageTokens | null;

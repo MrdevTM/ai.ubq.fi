@@ -46,6 +46,51 @@ or PATH change, other service downgrade, real credential mutation, live database
 fallback or runtime-store pruning. Reversal risk: restoring the global 2.9.6/7 launcher breaks escaped native-home
 paths; removing integrity checks or the runtime write denial lets the service use or alter an unverified executable.
 
+## Codex collaboration tools work over the Chat-only routes - 2026-10-03
+
+Codex clients expose the multi-agent tools (`spawn_agent`, `followup_task`, `send_message`, `wait_agent`,
+`interrupt_agent`, `list_agents`) as a single `namespace` tool named `collaboration`, and resolve a returned call by its
+`(namespace, name)` pair. The Chat-only projection behind the DeepSeek, LithosAI, and Cerebras routes flattened
+namespace groups into bare Chat function names and returned only a name, so every call for a namespaced tool reached the
+client unqualified and failed as `unsupported call: spawn_agent` even though the tool had been delivered to the model.
+Three changes to that one adapter fixed the loop, all deployed as Mac release `92493574`:
+
+1. `ee641318` stores `{name, namespace}` for every namespace-grouped function, not only for renamed collisions, and both
+   response emitters write `namespace` on `function_call` items.
+2. `963f44d9` projects an `agent_message` input item (author, recipient, content) onto a user turn that names both
+   endpoints. Before this the projection rejected every input type other than `message`, so a parent turn failed with
+   `input item type 'agent_message' is not supported` as soon as a sub-agent answered.
+3. `92493574` forwards an unsealed `encrypted_content` agent-message payload verbatim and marks a Fernet-shaped payload
+   (`gAAAAA` prefix, at least 100 characters) as omitted. On these routes the client moves the payload text into that
+   field in the clear, so dropping it left every sub-agent with an empty task and its own "payload arrived
+   encrypted/unreadable" report.
+
+Evidence on 2026-10-03, against the local Mac service: `spawn_agent` returns `{"task_name":"/root/<name>"}` from a
+deepseek parent for both a deepseek child and a `qwen-3.8-27b` child; a deepseek worker received its task, wrote its
+handoff file, and the parent read `pong` back from disk; separately a parent received a worker's mailbox reply `pong`
+without any file handoff. Measured overhead: 884 ms from tool call to spawn result and 192 ms more until the child's
+first turn.
+
+Limits recorded with the same evidence: a sealed payload from a ChatGPT-backed thread stays opaque to this gateway
+because the opening key lives in that backend and the client implements no such crypto, so it is declared rather than
+invented; a sub-agent receives no collaboration tools in this client build, so fan-out depth is 1; `qwen-3.8-27b`
+rejects `reasoning_effort: max` (none/low/medium/high only) and its Cerebras quota can be exhausted, so an orchestrator
+should retry a rate-limited child with a deepseek model; and a child is aborted when its parent session exits, so the
+parent must wait for it.
+
+To re-verify the loop, run a headless session on the orchestrator model that spawns a child, waits for it, and prints
+what it received; the client-side knobs that matter are `[agents] default_subagent_model` and
+`default_subagent_reasoning_effort` in `~/.codex/config.toml`, where a `max` default serves deepseek children and is
+rejected by `qwen-3.8-27b`. The Mac service deploys from a clean canonical checkout with `deno task deploy:mac`, which
+snapshots HEAD into `.data/releases/<sha>` and restarts the launch agent; client builds are never patched.
+
+Reason: the owner asked for deepseek orchestrators that spawn deepseek and Qwen workers through this gateway, after
+`spawn_agent` failed with `unsupported call: spawn_agent` on every attempt.
+
+Reversal risk: reverting any one change restores its exact failure (`unsupported call: spawn_agent`, `agent_message`
+request rejection, or empty child tasks). If a future client seals payloads locally the `gAAAAA` heuristic would forward
+ciphertext as text until the marker is updated.
+
 ## Analytics drops the Quota forecast card and the Metered capacity panels - 2026-10-03
 
 The admin Analytics view no longer renders the "Quota forecast" (quota runway) card, and the Provider analytics card
