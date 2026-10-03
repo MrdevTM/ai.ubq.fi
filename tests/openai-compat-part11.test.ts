@@ -22,6 +22,7 @@ import {
   handleResponses,
   isAnswerBearingCompletion,
   keyToString,
+  kvStub,
   kvStore,
   parseResponsesSseEvents,
   rejectOnAbort,
@@ -1251,6 +1252,83 @@ Deno.test("openai: non-capacity first-tier paid failures fail closed on Surplus"
           return typeof state === "string" && state !== "pending";
         });
         assert.equal(terminalWrites.length, 1, `${keyId} terminal provider/request-id pair`);
+      }
+    });
+
+    await t.step("delivered Surplus headers release the attempt deadline before slow health bookkeeping", async () => {
+      const originalAtomic = kvStub.atomic.bind(kvStub);
+      let attemptSignal: AbortSignal | undefined;
+      let healthDelayMs = 0;
+      let abortedDuringHealth: boolean | undefined;
+      let bodyAborted = false;
+      let deliverBody = () => {};
+      const delayHealth = () => new Promise<void>((resolve) => setTimeout(resolve, 60));
+      resetProviderHealthThrottleForTest();
+      setPaidProviderFirstHeadersDeadlineMsForTest(30);
+      kvStub.atomic = () => {
+        const operation = originalAtomic();
+        const originalSet = operation.set.bind(operation);
+        const originalCommit = operation.commit.bind(operation);
+        let slowHealthCommit = false;
+        operation.set = (key, value, options) => {
+          if (key[1] === "provider_health" && key[3] === "surplus" && key[5] === "reachable") slowHealthCommit = true;
+          return originalSet(key, value, options);
+        };
+        operation.commit = async () => {
+          if (slowHealthCommit) {
+            const startedAtMs = performance.now();
+            await delayHealth();
+            healthDelayMs = performance.now() - startedAtMs;
+            abortedDuringHealth = attemptSignal?.aborted;
+            deliverBody();
+          }
+          return await originalCommit();
+        };
+        return operation;
+      };
+      try {
+        const result = await runPaidAttempt("headers-before-slow-health", (signal) => {
+          assert.ok(signal);
+          assert.equal(signal.aborted, false, "headers arrived before the attempt deadline");
+          attemptSignal = signal;
+          let bodyController: ReadableStreamDefaultController<Uint8Array> | null = null;
+          const onAbort = () => {
+            bodyAborted = true;
+            bodyController?.error(signal.reason);
+          };
+          deliverBody = () => {
+            signal.removeEventListener("abort", onAbort);
+            if (bodyAborted) return;
+            assert.ok(bodyController);
+            for (const chunk of baseSseChunks()) bodyController.enqueue(TEXT_ENCODER.encode(chunk));
+            bodyController.close();
+          };
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              bodyController = controller;
+            },
+          });
+          signal.addEventListener("abort", onAbort, { once: true });
+          return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+        });
+        assert.ok(healthDelayMs > 30, "health bookkeeping remained pending beyond the 30 ms headers deadline");
+        assert.equal(abortedDuringHealth, false, "the headers deadline cannot abort a delivered body during bookkeeping");
+        assert.equal(bodyAborted, false);
+        assert.equal(result.status, 200);
+        assert.equal(result.upstream, "surplus");
+        assert.equal(result.surplusCalls, 1);
+        assert.equal(result.meteredCalls, 0);
+        const payload = JSON.parse(result.body) as { output?: { status?: unknown; content?: { text?: unknown }[] }[] };
+        const output = payload.output?.at(-1);
+        assert.ok(output);
+        assert.equal(output.status, "completed");
+        const content = output.content?.at(0);
+        assert.ok(content);
+        assert.equal(content.text, "pong");
+        await waitForPaidFallbackTerminal(result.keyId, result.requestId, "completed");
+      } finally {
+        kvStub.atomic = originalAtomic;
+        setPaidProviderFirstHeadersDeadlineMsForTest(null);
       }
     });
   } finally {
