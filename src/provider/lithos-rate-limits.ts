@@ -60,7 +60,9 @@ export const lithosFailoverTargetAt = (modelRaw: string, nowMs: number): string 
 export const lithosOpenFailoverWindow = (modelRaw: string, nowMs: number, waitMs: number, target: string): void => {
   const deadlineMs = nowMs + waitMs;
   if (!lithosIsLadderTarget(modelRaw, target) || !Number.isFinite(deadlineMs)) return;
-  lithosFailoverWindows.set(modelRaw, { deadlineMs, target });
+  const current = lithosFailoverWindows.get(modelRaw);
+  const unexpiredDeadlineMs = current && current.deadlineMs > nowMs ? current.deadlineMs : deadlineMs;
+  lithosFailoverWindows.set(modelRaw, { deadlineMs: Math.max(deadlineMs, unexpiredDeadlineMs), target });
 };
 
 /** Test seam: drop every window so fixtures cannot leak into each other. */

@@ -792,6 +792,95 @@ Deno.test("lithos rate-limit numeric windows reject nonfinite deadlines and keep
   }
 });
 
+Deno.test("lithos refusal windows retain the later unexpired deadline and the latest legal target", () => {
+  clearLithosFailoverWindows();
+  try {
+    lithosOpenFailoverWindow(LITHOS_MODEL, 1_000, 60_000, LITHOS_SIBLING_MODEL);
+    lithosOpenFailoverWindow(LITHOS_MODEL, 2_000, 1_000, LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 3_001), LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 60_999), LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 61_000), null);
+
+    // An expired window does not extend a fresh short refusal.
+    lithosOpenFailoverWindow(LITHOS_MODEL, 61_000, 1_000, LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 61_999), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 62_000), null);
+
+    lithosOpenFailoverWindow(LITHOS_MODEL, 100_000, 60_000, LITHOS_SIBLING_MODEL);
+    lithosOpenFailoverWindow(LITHOS_MODEL, 101_000, 120_000, LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 160_000), LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 220_999), LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 221_000), null);
+  } finally {
+    clearLithosFailoverWindows();
+  }
+});
+
+Deno.test("lithos refusal windows preserve handler routing across shorter and longer reset hints", async (t) => {
+  await withLithosKey(async () => {
+    const originalNow = Date.now;
+    try {
+      for (const waitMs of [1_000, 120_000]) {
+        await t.step(`60s then ${waitMs}ms refusal`, async () => {
+          clearLithosFailoverWindows();
+          const initialNowMs = originalNow();
+          let nowMs = initialNowMs;
+          Date.now = () => nowMs;
+          const message = [{ role: "user", content: "hi" }];
+          const first = await withUpstream(
+            (_call, calls) => {
+              if (calls.length === 1) return lithosRateLimitRefusal("60000");
+              if (calls.length === 2) {
+                nowMs = initialNowMs + 1_000;
+                return lithosRateLimitRefusal(String(waitMs));
+              }
+              return Response.json(lithosCompletion({ role: "assistant", content: "base-served" }, LITHOS_BASE_MODEL));
+            },
+            () => handleChatCompletions(chatRequest({ model: LITHOS_MODEL, messages: message, stream: false }), usageContext("lithos-window-overlap"))
+          );
+          assert.deepEqual(
+            first.calls.map((call) => call.body.model),
+            [LITHOS_MODEL, LITHOS_SIBLING_MODEL, LITHOS_BASE_MODEL]
+          );
+          assert.equal(first.result.status, 200);
+          await first.result.json();
+
+          nowMs = initialNowMs + 2_001;
+          const second = await withUpstream(
+            () => Response.json(lithosCompletion({ role: "assistant", content: "base-direct" }, LITHOS_BASE_MODEL)),
+            () => handleChatCompletions(chatRequest({ model: LITHOS_MODEL, messages: message, stream: false }), usageContext("lithos-window-retained"))
+          );
+          assert.deepEqual(
+            second.calls.map((call) => call.body.model),
+            [LITHOS_BASE_MODEL],
+            "the latest target survives the shorter reset"
+          );
+          assert.equal(second.result.status, 200);
+          await second.result.json();
+
+          const resetAtMs = initialNowMs + Math.max(60_000, 1_000 + waitMs);
+          assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, resetAtMs - 1), LITHOS_BASE_MODEL);
+          nowMs = resetAtMs;
+          const third = await withUpstream(
+            () => Response.json(lithosCompletion({ role: "assistant", content: "ultra-after-reset" })),
+            () => handleChatCompletions(chatRequest({ model: LITHOS_MODEL, messages: message, stream: false }), usageContext("lithos-window-expired"))
+          );
+          assert.deepEqual(
+            third.calls.map((call) => call.body.model),
+            [LITHOS_MODEL],
+            "the requested tier resumes only after the later reset"
+          );
+          assert.equal(third.result.status, 200);
+          await third.result.json();
+        });
+      }
+    } finally {
+      Date.now = originalNow;
+      clearLithosFailoverWindows();
+    }
+  });
+});
+
 Deno.test("lithos rate-limit snapshots capture the vendor's own budgets, bounded", () => {
   const snapshot = lithosRateLimitSnapshot(
     new Headers({
