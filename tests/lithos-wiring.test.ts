@@ -793,13 +793,13 @@ Deno.test("lithos rate-limit numeric windows reject nonfinite deadlines and keep
   }
 });
 
-Deno.test("lithos refusal windows retain the later unexpired deadline and the latest legal target", () => {
+Deno.test("lithos refusal windows select the highest recovered rung at its own deadline", () => {
   clearLithosFailoverWindows();
   try {
     lithosOpenFailoverWindow(LITHOS_MODEL, 1_000, 60_000, LITHOS_SIBLING_MODEL);
     lithosOpenFailoverWindow(LITHOS_MODEL, 2_000, 1_000, LITHOS_BASE_MODEL);
-    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 3_001), LITHOS_BASE_MODEL);
-    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 60_999), LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 3_001), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 60_999), LITHOS_SIBLING_MODEL);
     assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 61_000), null);
 
     // An expired window does not extend a fresh short refusal.
@@ -809,15 +809,15 @@ Deno.test("lithos refusal windows retain the later unexpired deadline and the la
 
     lithosOpenFailoverWindow(LITHOS_MODEL, 100_000, 60_000, LITHOS_SIBLING_MODEL);
     lithosOpenFailoverWindow(LITHOS_MODEL, 101_000, 120_000, LITHOS_BASE_MODEL);
-    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 160_000), LITHOS_BASE_MODEL);
-    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 220_999), LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 160_000), null);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 220_999), null);
     assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 221_000), null);
   } finally {
     clearLithosFailoverWindows();
   }
 });
 
-Deno.test("lithos refusal windows preserve handler routing across shorter and longer reset hints", async (t) => {
+Deno.test("lithos refusal windows preserve each rung's own reset in handler routing", async (t) => {
   await withLithosKey(async () => {
     const originalNow = Date.now;
     try {
@@ -848,19 +848,19 @@ Deno.test("lithos refusal windows preserve handler routing across shorter and lo
 
           nowMs = initialNowMs + 2_001;
           const second = await withUpstream(
-            () => Response.json(lithosCompletion({ role: "assistant", content: "base-direct" }, LITHOS_BASE_MODEL)),
+            (call) => Response.json(lithosCompletion({ role: "assistant", content: "served" }, String(call.body.model))),
             () => handleChatCompletions(chatRequest({ model: LITHOS_MODEL, messages: message, stream: false }), usageContext("lithos-window-retained"))
           );
           assert.deepEqual(
             second.calls.map((call) => call.body.model),
-            [LITHOS_BASE_MODEL],
-            "the latest target survives the shorter reset"
+            [waitMs === 1_000 ? LITHOS_SIBLING_MODEL : LITHOS_BASE_MODEL],
+            "the highest recovered rung is selected"
           );
           assert.equal(second.result.status, 200);
           await second.result.json();
 
-          const resetAtMs = initialNowMs + Math.max(60_000, 1_000 + waitMs);
-          assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, resetAtMs - 1), LITHOS_BASE_MODEL);
+          const resetAtMs = initialNowMs + 60_000;
+          assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, resetAtMs - 1), second.calls[0].body.model);
           nowMs = resetAtMs;
           const third = await withUpstream(
             () => Response.json(lithosCompletion({ role: "assistant", content: "ultra-after-reset" })),
@@ -869,7 +869,7 @@ Deno.test("lithos refusal windows preserve handler routing across shorter and lo
           assert.deepEqual(
             third.calls.map((call) => call.body.model),
             [LITHOS_MODEL],
-            "the requested tier resumes only after the later reset"
+            "the requested tier resumes at its own reset"
           );
           assert.equal(third.result.status, 200);
           await third.result.json();

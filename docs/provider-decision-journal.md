@@ -508,3 +508,10 @@ probe refutes. Reversal risk: collapsing the ladder back to one hop re-shares th
 status for a streamed refusal restores the banner and the client's pointless retry loop. Coverage:
 `tests/lithos-wiring.test.ts` asserts the full descent, the deepening sticky window, in-band refusals on both wires, and
 the buffered status path.
+
+## Independent Lithos tier refusal windows - 2026-10-03
+
+A refusal deadline belongs to the refused rung of the requested model ladder. New refusals extend only that rung’s
+unexpired deadline, and selection chooses the highest eligible rung in the existing ladder. Each rung recovers at its
+own reset; preserve native deadline and caller-cancellation reasons, bounded opt-in waits, and the existing provider
+waterfall.
