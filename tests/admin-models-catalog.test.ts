@@ -20,13 +20,16 @@ import {
 } from "../src/models/codex-models-whitelist.ts";
 import handler from "../src/handler/index.ts";
 import handlerSource from "../src/handler/index.ts" with { type: "text" };
-import type { OpenRouterModelsSnapshot } from "../src/models/openrouter-models.ts";
+import { resetOpenRouterModelsCacheForTest, type OpenRouterModelsSnapshot } from "../src/models/openrouter-models.ts";
 import { setKvForTest } from "../src/kv.ts";
-import { buildModelCatalogSnapshot, handlePublicModelCatalog } from "../src/models/catalog.ts";
+import { buildModelCatalogSnapshot, handleModels, handlePublicModelCatalog } from "../src/models/catalog.ts";
 import openaiSource from "../src/models/catalog.ts" with { type: "text" };
 import { CODEX_MODELS_KV_KEY, loadFullCodexModelsSnapshot } from "../src/codex/index.ts";
 import { buildRuntimeConfig, resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
 import { loadProviderSelection, PROVIDER_SELECTION_KV_KEY, resetProviderSelectionCacheForTest } from "../src/provider/selection.ts";
+import { CODEX_CATALOG_AUTH_GENERATION_KEY } from "../src/catalog/types.ts";
+import { resetMeteredModelsCacheForTest, setMeteredModelsFetchForTest } from "../src/provider/metered.ts";
+import { resetSurplusModelsCacheForTest } from "../src/provider/surplus.ts";
 
 // The catalog builder reads discovery credentials from the environment. Clearing
 // them keeps these tests on the credential-gated providers they own, and keeps
@@ -323,6 +326,103 @@ Deno.test("optional snapshot failure containment preserves snapshot shape checks
     const unauthenticated = await handler(new Request("https://ai.ubq.fi/admin/models/catalog"));
     assert.equal(unauthenticated.status, 401);
   });
+});
+
+Deno.test("versioned rich paid catalog survives rejected optional snapshots without invented enrichment or relaxed controls", async () => {
+  const kv = new RejectingReadKv();
+  // A cold, unreadable catalog generation takes the real paid recovery branch.
+  kv.rejectedKeys.add(keyOf(CODEX_CATALOG_AUTH_GENERATION_KEY));
+  kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+  kv.values.set(keyOf(PROVIDER_SELECTION_KV_KEY), { provider_ids: ["openlux"], updated_at_ms: 1_800_000_000_000 });
+  kv.values.set(keyOf(CODEX_MODELS_WHITELIST_KV_KEY), { model_ids: ["paid-fallback-fixture"], updated_at_ms: 1_800_000_000_001 });
+  const originalFetch = globalThis.fetch;
+  const originalMeteredKey = Deno.env.get("METERED_API_KEY");
+  const originalSurplusKey = Deno.env.get("SURPLUS_API_KEY");
+  let paidFetches = 0;
+  let unexpectedFetches = 0;
+  Deno.env.set("METERED_API_KEY", "fixture-paid-catalog-key");
+  Deno.env.set("SURPLUS_API_KEY", "fixture-disabled-surplus-key");
+  resetMeteredModelsCacheForTest();
+  resetSurplusModelsCacheForTest();
+  resetOpenRouterModelsCacheForTest();
+  resetProviderSelectionCacheForTest();
+  setMeteredModelsFetchForTest((input) => {
+    assert.equal(input instanceof Request ? input.url : input.toString(), "https://api.openlux.ai/v1/models");
+    paidFetches += 1;
+    return Promise.resolve(
+      Response.json({
+        data: [
+          { id: "paid-fallback-fixture", description: "Synthetic paid discovery", owned_by: "fixture", supported_endpoint_types: ["openai-response"] },
+          { id: "paid-not-whitelisted", owned_by: "fixture", supported_endpoint_types: ["openai-response"] },
+          { id: "paid-chat-only", owned_by: "fixture", supported_endpoint_types: ["openai"] },
+        ],
+      })
+    );
+  });
+  globalThis.fetch = () => {
+    unexpectedFetches += 1;
+    return Promise.reject(new Error("unexpected provider fetch"));
+  };
+  const request = () => new Request("https://ai.ubq.fi/v1/models?client_version=0.203.0");
+  try {
+    await withKv(kv, async () => {
+      // Preserve the original rejected strong-read trigger independently of the handler's recovery.
+      await assert.rejects(() => kv.get(CODEX_MODELS_KV_KEY, { consistency: "strong" }), /fixture KV read unavailable/);
+      for (const rejected of [true, false]) {
+        if (!rejected) {
+          kv.rejectedKeys.delete(keyOf(CODEX_MODELS_KV_KEY));
+          kv.values.set(keyOf(CODEX_MODELS_KV_KEY), {
+            source: " ",
+            updated_at_ms: 1_800_000_000_000,
+            models: [{ slug: "paid-fallback-fixture", context_window: 999_999, supported_reasoning_levels: ["high"] }],
+          });
+        }
+        const response = await handleModels(request());
+        assert.equal(response.status, 200);
+        assert.equal(response.headers.get("x-uos-upstream"), "metered");
+        assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+        const body = await response.json();
+        assert.equal(body.data, undefined, "the versioned response stays a rich Codex catalog");
+        assert.deepEqual(
+          body.models.map((model: { slug: string }) => model.slug),
+          ["paid-fallback-fixture"]
+        );
+        const row = body.models[0];
+        assert.equal(row.description, "Synthetic paid discovery");
+        assert.deepEqual(row.supported_endpoint_types, ["openai-response"]);
+        assert.deepEqual(row.supported_reasoning_levels, [{ effort: "none", description: "No reasoning" }]);
+        assert.equal(row.default_reasoning_level, "none");
+        assert.equal(row.context_window, undefined);
+        assert.equal(row.max_context_window, undefined);
+        assert.equal(row.auto_compact_token_limit, undefined);
+        assert.equal(row.visibility, "list");
+        assert.equal(row.supported_in_api, true);
+      }
+      assert.equal(paidFetches, 2);
+      const readsBeforeInvalidVersion = kv.reads.length;
+      const invalidVersion = await handleModels(new Request("https://ai.ubq.fi/v1/models?client_version=invalid"));
+      assert.equal(invalidVersion.status, 400);
+      assert.equal((await invalidVersion.json()).error.code, "invalid_client_version");
+      assert.equal(kv.reads.length, readsBeforeInvalidVersion);
+      assert.equal(paidFetches, 2);
+      kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+      kv.rejectedKeys.add(keyOf(CODEX_MODELS_WHITELIST_KV_KEY));
+      await assert.rejects(() => handleModels(request()), /fixture KV read unavailable/);
+      assert.equal(unexpectedFetches, 0, "disabled Surplus and other providers make no requests");
+      assert.ok(kv.reads.filter((read) => read.key === keyOf(CODEX_MODELS_KV_KEY)).every((read) => read.consistency === "strong"));
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    setMeteredModelsFetchForTest(null);
+    resetMeteredModelsCacheForTest();
+    resetSurplusModelsCacheForTest();
+    resetOpenRouterModelsCacheForTest();
+    resetProviderSelectionCacheForTest();
+    if (originalMeteredKey === undefined) Deno.env.delete("METERED_API_KEY");
+    else Deno.env.set("METERED_API_KEY", originalMeteredKey);
+    if (originalSurplusKey === undefined) Deno.env.delete("SURPLUS_API_KEY");
+    else Deno.env.set("SURPLUS_API_KEY", originalSurplusKey);
+  }
 });
 
 Deno.test("saving a selection trims, de-duplicates, and preserves the operator's order", async () => {
