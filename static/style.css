@@ -1283,12 +1283,14 @@ details[data-usage][open] summary[data-usage-title]::after {
   }
 }
 
-@media (max-width: 760px) {
+@media (max-width: 760px), (pointer: coarse) {
   input,
   textarea {
     font-size: 16px;
   }
+}
 
+@media (max-width: 760px) {
   [data-shell] {
     padding: calc(14px + env(safe-area-inset-top)) 12px calc(48px + env(safe-area-inset-bottom));
     gap: 14px;
