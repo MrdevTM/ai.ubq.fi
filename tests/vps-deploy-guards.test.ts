@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import VPS_LAUNCHER from "../scripts/serve-vps.ts" with { type: "text" };
+import VPS_UNIT from "../ops/ai-ubq-fi.service" with { type: "text" };
 
 const OPS_DEPLOY_SOURCE = fileURLToPath(new URL("../ops/deploy.ts", import.meta.url));
 const OPS_RELEASE_RETENTION_SOURCE = fileURLToPath(new URL("../ops/release-retention.ts", import.meta.url));
@@ -41,8 +43,8 @@ const fixtureIgnored = fixtureHostPath === undefined;
 const ingressFixtureIgnored = fixtureIgnored || (await Deno.permissions.query({ name: "run", command: "/bin/ln" })).state !== "granted";
 
 type FixtureRun = { code: number; stdout: string; stderr: string };
-type Fixture = { root: string; script: string; env: Record<string, string>; dispose: () => Promise<void> };
-type DeployOptions = { write?: string; env?: Record<string, string>; fakeCommands?: string[]; script?: string; allowLn?: boolean };
+type Fixture = { root: string; script: string; env: Record<string, string>; dispose: () => Promise<void>; previous?: string };
+type DeployOptions = { write?: string; env?: Record<string, string>; fakeCommands?: string[]; script?: string; allowLn?: boolean; network?: boolean };
 
 const decode = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
@@ -167,9 +169,10 @@ const launchDeployFixture = (fixture: Fixture, options: DeployOptions = {}): Den
       "run",
       "--no-config",
       "--no-prompt",
-      `--allow-run=${["git", ...(options.fakeCommands ?? []), ...(options.allowLn ? ["/bin/ln"] : [])].join(",")}`,
+      `--allow-run=${["git", ...(options.fakeCommands ?? []), ...(options.allowLn ? ["/bin/ln", Deno.execPath()] : [])].join(",")}`,
       `--allow-read=${fixture.root}`,
       ...(options.write === undefined ? [] : [`--allow-write=${options.write}`]),
+      ...(options.network ? ["--allow-net=127.0.0.1"] : []),
       options.script ?? fixture.script,
     ],
     cwd: fixture.root,
@@ -237,327 +240,566 @@ const waitForPath = async (path: string, timeoutMs: number, label: string): Prom
   throw new Error(`timed out waiting for ${label}`);
 };
 
-const PREVIOUS_RELEASE = "b".repeat(40);
-const CADDY_FIXTURE_CONFIG = "fixture proxy configuration\n";
-const INGRESS_COMMANDS = [
-  "sudo -n systemctl show caddy -p MainPID --value",
-  "sudo -n nsenter -t 42 -m -- sudo -u caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile",
-];
 const RELOAD_COMMAND = "sudo -n systemctl reload caddy";
+const RESTART_COMMAND = "sudo -n systemctl restart ai-ubq-fi.service";
+const quote = (s: string): string => "'" + s.replaceAll("'", "'\\''") + "'";
+const hash = async (b: Uint8Array): Promise<string> =>
+  Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(b))))
+    .map((x) => x.toString(16).padStart(2, "0"))
+    .join("");
+const calls = async (f: Fixture): Promise<string[]> => (await Deno.readTextFile(f.root + "/.data/trace")).trim().split("\n");
+type Profile = "current" | "unknown" | "env-port" | "legacy";
+type Active = { options: DeployOptions; sha: string; oldSha: string; publicHealth: () => Promise<Response> };
+const write = (root: string, path: string, source: string): Promise<void> => Deno.writeTextFile(root + "/" + path, source);
+const archivePrevious = async (f: Fixture, sha: string): Promise<void> => {
+  const release = f.root + "/.data/releases/" + sha;
+  const archive = f.root + "/.data/previous.tar";
+  await Deno.mkdir(release, { recursive: true });
+  await runFixtureGit(f.root, f.env, ["archive", "--format=tar", "--output=" + archive, sha]);
+  const result = await new Deno.Command("/bin/sh", {
+    args: ["-c", "exec /usr/bin/tar -xf " + quote(archive) + " -C " + quote(release)],
+    env: f.env,
+    clearEnv: true,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  assert.equal(result.code, 0, decode(result.stderr));
+  await Deno.writeTextFile(release + "/src/release.ts", '// Generated for this immutable VPS release.\nexport const RELEASE_GIT_SHA = "' + sha + '";\n', {
+    mode: 0o600,
+  });
+  await Deno.chmod(release + "/src/release.ts", 0o600);
+  await Deno.writeTextFile(
+    release + "/.uos-release.json",
+    JSON.stringify({ git_sha: sha, source_archive_sha256: await hash(await Deno.readFile(archive)) }) + "\n",
+    { mode: 0o600 }
+  );
+  await Deno.remove(archive);
+};
 
-/**
- * Only these regular fixture files are executable beyond Git. The child PATH
- * contains this directory alone, so a missing fake cannot fall through to a
- * host sudo or tar. Git retains the fixture's isolated configuration and uses
- * the system executable through a task-owned wrapper.
- */
-const prepareIngressFixture = async (fixture: Fixture, activate = false): Promise<DeployOptions> => {
-  const root = fixture.root;
-  const bin = `${root}/bin`;
-  await Deno.mkdir(bin);
-  await Deno.mkdir(`${root}/ops`);
-  // This synthetic public config is nonsecret and its containing temp directory
-  // is private. Other-read is required by the actual ingress preflight.
-  await Deno.writeTextFile(`${root}/ops/Caddyfile`, CADDY_FIXTURE_CONFIG, { mode: 0o604 });
-  const shellRoot = "'" + root.replaceAll("'", "'\\''") + "'";
-  const shellLog = "'" + `${root}/${activate ? ".data/activation.log" : "commands.log"}`.replaceAll("'", "'\\''") + "'";
-  const prefix = `#!/bin/sh\nset -eu\nfixture_root=${shellRoot}\nfixture_log=${shellLog}\n`;
+const prepareActivationFixture = async (f: Fixture, profile: Profile = "current"): Promise<Active> => {
+  const root = f.root;
+  for (const dir of ["bin", "ops", "scripts", "src", ".data/releases"]) await Deno.mkdir(root + "/" + dir, { recursive: true });
+  await write(root, ".data/trace", "");
+  await Deno.writeTextFile(root + "/ops/Caddyfile", "fixture config\n", { mode: 0o604 });
+  await write(root, "ops/ai-ubq-fi.service", VPS_UNIT);
+  let oldLauncher = String(VPS_LAUNCHER).replace("port: 7999", "port: 8001");
+  if (profile === "unknown") oldLauncher += "\n// Unknown body.\n";
+  if (profile === "env-port") oldLauncher = oldLauncher.replace("port: 8001", 'port: Number(Deno.env.get("PORT"))');
+  if (profile === "legacy") {
+    oldLauncher =
+      '// Keep the database and secrets in the repository root across code updates.\nconst root = new URL("../", import.meta.url);\nDeno.chdir(root);\n// Resolve the symlink once: static assets and lazy imports must stay on this release.\nconst releasePath = await Deno.realPath(new URL(".data/current", root));\nconst release = new URL(`file://${releasePath}/`);\nconst { config, runtimeGitSha } = await import(new URL("src/config.ts", release).href);\nconst { initializeKv } = await import(new URL("src/kv.ts", release).href);\nif (config.isDeploy) throw new Error("The VPS entrypoint cannot run in Deno Deploy");\nif (!config.adminTokens.size) throw new Error("DENO_DEPLOY_TOKEN must configure administrator authentication");\nif (Deno.env.get("DENO_TIMELINE") !== "production") throw new Error("The VPS service requires the production timeline");\n\nconst gitSha = runtimeGitSha();\nif (!/^[0-9a-f]{40}$/.test(gitSha) || !releasePath.endsWith(`/releases/${gitSha}`)) {\n  throw new Error("The immutable release does not match its Git identity");\n}\n\nconst database = new URL(".data/kv.sqlite3", root);\nif (!(await Deno.stat(database)).isFile) {\n  throw new Error("Migrate the production KV database before starting the service");\n}\nconst kv = await Deno.openKv(database.pathname);\ninitializeKv(kv);\n\nconst { default: handler } = (await import(new URL("serve.ts", release).href)) as typeof import("../serve.ts");\nconst server = Deno.serve({ hostname: "127.0.0.1", port: 8001, onListen: handler.onListen }, handler.fetch);\nlet stopping = false;\nconst shutdown = () => {\n  if (stopping) return;\n  stopping = true;\n  console.log("[ai.ubq.fi] Draining requests before shutdown");\n  void server.shutdown();\n};\nDeno.addSignalListener("SIGTERM", shutdown);\nDeno.addSignalListener("SIGINT", shutdown);\nconsole.log(`[ai.ubq.fi] VPS serving Git revision ${gitSha}`);\nawait server.finished;\nkv.close();\nDeno.exit(0);\n';
+    assert.equal(await hash(new TextEncoder().encode(oldLauncher)), "fde18debbfe01ba17716d34d0e8de2415ec92de75b7d9e3804e4e5cdb627e8ea");
+  }
+  await write(root, "scripts/serve-vps.ts", oldLauncher);
+  await write(
+    root,
+    "src/config.ts",
+    'import { RELEASE_GIT_SHA } from "./release.ts";\nexport const config = { isDeploy: false, adminTokens: new Set(["synthetic"]) };\nexport const runtimeGitSha = () => RELEASE_GIT_SHA;\n'
+  );
+  await write(root, "src/release.ts", 'export const RELEASE_GIT_SHA = "unprepared";\n');
+  await write(root, "src/kv.ts", "export const initializeKv = (_kv: unknown) => {};\n");
+  await write(
+    root,
+    "serve.ts",
+    [
+      'import { RELEASE_GIT_SHA as sha } from "./src/release.ts";',
+      'const id = "vps-" + sha;',
+      "export default { onListen() {}, fetch() {",
+      ' let refused = false; try { Deno.statSync("readiness-refused"); refused = Deno.env.get("FIXTURE_CANDIDATE") === sha; } catch {}',
+      ' return new Response(JSON.stringify({ release: { git_sha: sha, deployment_id: id } }), { status: refused ? 503 : 200, headers: { "content-type": "application/json", "x-uos-git-sha": sha, "x-uos-deployment-id": id } });',
+      "} };",
+      "export async function shutdownOptionalTelemetry() {}",
+    ].join("\n")
+  );
+  await write(root, "deno.json", "{}\n");
+  await write(root, "deno.lock", '{"version":"5","specifiers":{},"jsr":{},"npm":{},"redirects":{},"remote":{}}\n');
+  await runFixtureGit(root, f.env, ["add", "--", "ops", "scripts", "src", "serve.ts", "deno.json", "deno.lock"]);
+  await runFixtureGit(root, f.env, ["commit", "-q", "-m", "previous launcher"]);
+  const oldSha = await runFixtureGit(root, f.env, ["rev-parse", "HEAD"]);
+  await archivePrevious(f, oldSha);
+  const link = await new Deno.Command("/bin/ln", {
+    args: ["-s", "releases/" + oldSha, root + "/.data/current"],
+    env: f.env,
+    clearEnv: true,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  assert.equal(link.code, 0, decode(link.stderr));
+  await write(root, ".data/kv.sqlite3", "");
+  await write(root, ".env", "PORT=8001\n");
+  await write(root, "scripts/serve-vps.ts", VPS_LAUNCHER);
+  await write(root, "release.txt", "candidate\n");
+  await runFixtureGit(root, f.env, ["add", "--", "scripts/serve-vps.ts", "release.txt"]);
+  await runFixtureGit(root, f.env, ["commit", "-q", "-m", "candidate launcher"]);
+  const sha = await runFixtureGit(root, f.env, ["rev-parse", "HEAD"]);
+  await runFixtureGit(root, f.env, ["update-ref", "refs/remotes/origin/development", sha]);
+  const reservations = [Deno.listen({ hostname: "127.0.0.1", port: 0 }), Deno.listen({ hostname: "127.0.0.1", port: 0 })];
+  const ports = reservations.map((listener) => (listener.addr as Deno.NetAddr).port);
+  reservations.forEach((listener) => {
+    listener.close();
+  });
+  assert.notEqual(ports[0], ports[1]);
+  assert.ok(!ports.includes(7999) && !ports.includes(8001));
+  const record = (event: string): Promise<void> =>
+    write(root, ".data/last-event", event).then(() => Deno.writeTextFile(root + "/.data/trace", event + "\n", { append: true }));
+  const preload = root + "/launcher-preload.ts";
+  await Deno.writeTextFile(
+    preload,
+    [
+      "const serve = Deno.serve;",
+      "Deno.serve = (options, handler) => {",
+      " const requested = options.port;",
+      ' if (requested !== 7999 && requested !== 8001) throw new Error("unexpected declared port");',
+      " Deno.writeTextFileSync(" +
+        JSON.stringify(root + "/.data/trace") +
+        ', "launcher-options " + JSON.stringify({ requested_port: requested, physical_port: requested === 8001 ? ' +
+        String(ports[0]) +
+        " : " +
+        String(ports[1]) +
+        ', env_port: Deno.env.get("PORT"), module: Deno.mainModule }) + "\\n", { append: true });',
+      " return serve({ ...options, port: requested === 8001 ? " + String(ports[0]) + " : " + String(ports[1]) + " }, handler);",
+      "};",
+    ].join("\n")
+  );
+  let child: Deno.ChildProcess | undefined;
+  let output: Promise<Deno.CommandOutput> | undefined;
+  const stop = async (): Promise<void> => {
+    if (!child) return;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* settled */
+    }
+    const timer = setTimeout(() => {
+      if (child) killChild(child);
+    }, 1500);
+    try {
+      await output;
+    } finally {
+      clearTimeout(timer);
+      child = undefined;
+      output = undefined;
+    }
+  };
+  const unitLine = String(VPS_UNIT)
+    .split("\n")
+    .find((line) => line.startsWith("ExecStart="));
+  assert.ok(unitLine);
+  const start = async (legacy = false): Promise<void> => {
+    await stop();
+    const selected = await Deno.readLink(root + "/.data/current");
+    if (selected === "releases/" + sha && (await pathExists(root + "/restart-refused"))) throw new Error("fixture restart refused");
+    let command = unitLine
+      .slice("ExecStart=/bin/sh -c '".length, -1)
+      .replaceAll("$$", "$")
+      .replace("/usr/local/bin/deno", quote(Deno.execPath()))
+      .replace("run --config=", "run --import=" + quote(preload) + " --config=")
+      .replace("--allow-read=/home/codex/repos/ubiquity/ai.ubq.fi,/home/codex/.codex", "--allow-read=" + root)
+      .replace("--allow-write=/home/codex/repos/ubiquity/ai.ubq.fi/.data,/home/codex/.codex/app-server-control", "--allow-write=" + root + "/.data");
+    if (legacy) {
+      await write(root, "scripts/legacy.fixture.ts", oldLauncher);
+      command = command.replace('"$release/scripts/serve-vps.ts"', quote(root + "/scripts/legacy.fixture.ts"));
+    }
+    await record("unit-exec " + command);
+    child = new Deno.Command("/bin/sh", {
+      args: ["-c", command],
+      cwd: root,
+      env: { ...f.env, DENO_TIMELINE: "production", FIXTURE_CANDIDATE: sha },
+      clearEnv: true,
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    output = child.output();
+    const port = selected === "releases/" + oldSha ? ports[0] : ports[1];
+    const deadline = performance.now() + 5000;
+    while (performance.now() < deadline) {
+      try {
+        const response = await fetch("http://127.0.0.1:" + String(port) + "/health");
+        await response.body?.cancel();
+        return;
+      } catch {
+        /* startup */
+      }
+      const state = await Promise.race([
+        output.then((result) => ({ result })),
+        new Promise<null>((resolve) => {
+          setTimeout(() => {
+            resolve(null);
+          }, 25);
+        }),
+      ]);
+      if (state) throw new Error("actual launcher failed: " + decode(state.result.stderr));
+    }
+    throw new Error("actual launcher did not bind mapped physical port");
+  };
+  let loadedPort = ports[0];
+  const proxy = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async () => {
+    const response = await fetch("http://127.0.0.1:" + String(loadedPort) + "/health");
+    const body = await response.text();
+    await record("proxy-observed " + JSON.stringify({ loaded_port: loadedPort, status: response.status, body }));
+    const refused = loadedPort === ports[1] && (await pathExists(root + "/public-refused"));
+    return new Response(body, { status: refused ? 503 : response.status, headers: response.headers });
+  });
+  const proxyPort = (proxy.addr as Deno.NetAddr).port;
+  const control = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, async (request) => {
+    try {
+      const action = new URL(request.url).pathname;
+      if (action === "/restart") {
+        await write(root, ".env", "PORT=43210\n");
+        await start();
+      } else if (action === "/reload") {
+        if (await pathExists(root + "/reload-refused")) throw new Error("fixture reload refused");
+        loadedPort = ports[1];
+        await record("ingress-loaded " + String(loadedPort));
+      } else throw new Error("unexpected control action");
+      return new Response("applied");
+    } catch (error) {
+      return new Response(error instanceof Error ? error.message : String(error), { status: 500 });
+    }
+  });
+  await write(
+    root,
+    "control-client.ts",
+    'const response = await fetch("http://127.0.0.1:' +
+      String((control.addr as Deno.NetAddr).port) +
+      '/" + Deno.args[0]);\nif (!response.ok) { console.error(await response.text()); Deno.exit(72); }\nawait response.body?.cancel();\n'
+  );
+  const dispose = f.dispose;
+  f.dispose = async () => {
+    await stop();
+    await control.shutdown();
+    await proxy.shutdown();
+    await dispose();
+  };
+  try {
+    await start(profile === "legacy");
+  } catch (error) {
+    await f.dispose();
+    throw error;
+  }
+  const prefix = "#!/bin/sh\nset -eu\nfixture_root=" + quote(root) + "\nfixture_log=" + quote(root + "/.data/trace") + "\n";
   const scripts = {
     git:
       prefix +
-      'printf "git %s\\n" "$*" >> "$fixture_log"\n' +
-      'if [ "$1" = "archive" ] && [ -f "$fixture_root/archive-refused" ]; then printf "fixture archive refused\\n" >&2; exit 76; fi\n' +
-      'exec /usr/bin/git "$@"\n',
-    sudo:
-      prefix +
-      `printf "sudo %s\n" "$*" >> "$fixture_log"
-case "$*" in
-  "-n systemctl show caddy -p MainPID --value")
-    if [ -f "$fixture_root/no-caddy" ]; then printf "0\n"; else printf "42\n"; fi ;;
-  "-n nsenter -t 42 -m -- sudo -u caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile")
-    if [ -f "$fixture_root/invalid-caddy" ]; then printf "fixture validation refused\n" >&2; exit 71; fi ;;
-  "-n systemctl reload caddy")
-    if [ -f "$fixture_root/reload-refused" ]; then printf "fixture reload refused\n" >&2; exit 72; fi ;;
-  "-n systemctl daemon-reload") ;;
-  "-n systemctl restart ai-ubq-fi.service")
-    if [ -f "$fixture_root/restart-refused" ]; then printf "fixture restart refused\n" >&2; exit 77; fi
-    if [ ! -f "$fixture_root/activate" ]; then printf "fixture stop after publication\n" >&2; exit 73; fi ;;
-  *) printf "unexpected fixture sudo arguments\n" >&2; exit 74 ;;
-esac
-`,
+      'printf "git %s\\n" "$*" >> "$fixture_log"\nif [ "$1" = "archive" ] && [ -f "$fixture_root/archive-refused" ]; then printf "fixture archive refused\\n" >&2; exit 76; fi\nexec /usr/bin/git "$@"\n',
     tar:
       prefix +
-      `printf "tar %s\n" "$*" >> "$fixture_log"
-[ "$#" -eq 4 ] && [ "$1" = "-xf" ] && [ "$3" = "-C" ] && [ "$2" = "$4.tar" ]
-case "$4" in .data/releases/.staging-*) ;; *) exit 75 ;; esac
-if [ -f "$fixture_root/preparation-refused" ]; then printf "fixture preparation refused\n" >&2; exit 78; fi
-/bin/mkdir "$4/src"
-`,
+      'printf "tar %s\\n" "$*" >> "$fixture_log"\n[ "$#" -eq 4 ] && [ "$1" = "-xf" ] && [ "$3" = "-C" ] && [ "$2" = "$4.tar" ]\ncase "$4" in .data/releases/.staging-*) ;; *) exit 75 ;; esac\nif [ -f "$fixture_root/preparation-refused" ]; then printf "fixture preparation refused\\n" >&2; exit 78; fi\nexec /usr/bin/tar "$@"\n',
+    sudo:
+      prefix +
+      [
+        'printf "sudo %s\\n" "$*" >> "$fixture_log"',
+        'case "$*" in',
+        ' "-n systemctl show caddy -p MainPID --value") if [ -f "$fixture_root/no-caddy" ]; then printf "0\\n"; else printf "42\\n"; fi ;;',
+        ' "-n nsenter -t 42 -m -- sudo -u caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile") if [ -f "$fixture_root/invalid-caddy" ]; then printf "fixture validation refused\\n" >&2; exit 71; fi ;;',
+        ' "-n systemctl daemon-reload") if [ -f "$fixture_root/daemon-refused" ]; then printf "fixture daemon-reload refused\\n" >&2; exit 79; fi ;;',
+        ' "-n systemctl restart ai-ubq-fi.service") exec ' +
+          quote(Deno.execPath()) +
+          ' run --no-config --allow-net=127.0.0.1 "$fixture_root/control-client.ts" restart ;;',
+        ' "-n systemctl reload caddy") exec ' + quote(Deno.execPath()) + ' run --no-config --allow-net=127.0.0.1 "$fixture_root/control-client.ts" reload ;;',
+        ' *) printf "unexpected fixture sudo arguments\\n" >&2; exit 74 ;;',
+        "esac",
+      ].join("\n") +
+      "\n",
   };
   for (const [name, source] of Object.entries(scripts)) {
-    const path = `${bin}/${name}`;
-    await Deno.writeTextFile(path, source);
-    await Deno.chmod(path, 0o700);
-    assert.equal(await Deno.realPath(path), path, "fake executables must be regular files inside the resolved fixture root");
+    const path = root + "/bin/" + name;
+    await Deno.writeTextFile(path, source, { mode: 0o700 });
+    assert.equal(await Deno.realPath(path), path);
     assert.equal((await Deno.lstat(path)).isFile, true);
   }
-  await Deno.mkdir(`${root}/.data/releases/${PREVIOUS_RELEASE}`, { recursive: true });
-  await Deno.writeTextFile(`${root}/.data/releases/${PREVIOUS_RELEASE}/retained.txt`, "previous immutable release\n");
-  const previousRelease = `${root}/.data/releases/${PREVIOUS_RELEASE}`;
-  const current = `${root}/.data/current`;
-  assert.equal(await Deno.realPath(previousRelease), previousRelease, "the previous release must be inside the non-symlink fixture");
-  assert.equal(await Deno.realPath(`${root}/.data`), `${root}/.data`);
-  // Deno.symlink requires unscoped filesystem grants. The dedicated ingress
-  // fixture permits only this exact ln executable to create its initial link.
-  const args = ["-s", previousRelease, current];
-  const link = await new Deno.Command("/bin/ln", { args, cwd: root, env: fixture.env, clearEnv: true, stdout: "piped", stderr: "piped" }).output();
-  console.log(JSON.stringify({ ingress_fixture: "initial_selector", command: ["/bin/ln", ...args], exit_code: link.code }));
-  assert.equal(link.code, 0, decode(link.stderr));
-  if (activate) await Deno.writeTextFile(`${root}/activate`, "synthetic activation\n");
-  return { write: `${root}/.data`, env: { ...fixture.env, PATH: bin }, fakeCommands: [`${bin}/sudo`, `${bin}/tar`] };
-};
-
-const assertPublishedIngressFixture = async (fixture: Fixture, sha: string, run: FixtureRun): Promise<void> => {
-  assert.notStrictEqual(run.code, 0, "scoped filesystem permissions must stop at the actual selector symlink");
-  assert.match(run.stderr, /Deno.symlink\(\) requires unscoped --allow-read and --allow-write permissions/);
-  assert.doesNotMatch(run.stderr, /This release already exists|Requires (run|write|read) access/);
-  assert.equal(await Deno.readLink(`${fixture.root}/.data/current`), `${fixture.root}/.data/releases/${PREVIOUS_RELEASE}`);
-  assert.deepEqual(
-    await readDirNames(`${fixture.root}/.data/releases`),
-    [sha, PREVIOUS_RELEASE].sort((a, b) => a.localeCompare(b))
-  );
-  assert.equal(await Deno.readTextFile(`${fixture.root}/.data/releases/${PREVIOUS_RELEASE}/retained.txt`), "previous immutable release\n");
-  const releaseSource = await Deno.readTextFile(`${fixture.root}/.data/releases/${sha}/src/release.ts`);
-  assert.match(releaseSource, new RegExp(`RELEASE_GIT_SHA = "${sha}"`));
-  const receipt = JSON.parse(await Deno.readTextFile(`${fixture.root}/.data/releases/${sha}/.uos-release.json`));
-  assert.equal(receipt.git_sha, sha);
-  assert.match(receipt.source_archive_sha256, /^[0-9a-f]{64}$/);
-  const calls = (await Deno.readTextFile(`${fixture.root}/commands.log`)).trim().split("\n");
-  const ingress = calls.filter((call) => call.startsWith("sudo "));
-  assert.deepEqual(ingress, INGRESS_COMMANDS);
-  const archiveIndex = calls.findIndex((call) => call.startsWith("git archive "));
-  assert.ok(archiveIndex > calls.indexOf(INGRESS_COMMANDS[1]), "ingress validation must precede the immutable archive");
-  assert.ok(calls.findIndex((call) => call.startsWith("tar ")) > archiveIndex);
-  assert.match(run.stdout, /"ingress_preflight":"caddy_config_valid"/);
-  assert.equal(calls.includes(RELOAD_COMMAND), false, "ingress must not reload before the selector boundary");
-  assert.doesNotMatch(run.stdout, /"caddy_ingress":"reloaded"/);
-  assert.doesNotMatch(run.stdout, /systemd_daemon_reload|health_verified|public_health_verified/);
-  console.log(JSON.stringify({ ingress_fixture: "published_before_scoped_selector_refusal", git_sha: sha, exit_code: run.code, commands: calls }));
-};
-
-/**
- * Keep the root-relocated production bytes unchanged. This prefix supplies only
- * the scoped symlink OS call, exact synthetic health responses and readiness
- * sleep; validation, publication, selection, restart and acceptance run through
- * the actual deployment entry point. No HTTP or service command reaches a host.
- */
-const prepareActivationFixture = async (fixture: Fixture): Promise<DeployOptions> => {
-  const options = await prepareIngressFixture(fixture, true);
-  const source = await Deno.readTextFile(fixture.script);
-  const bootstrap = `const fixtureRoot = ${JSON.stringify(fixture.root)};
-const recordFixture = (event: string): void => Deno.writeTextFileSync(".data/activation.log", event + "\\n", { append: true });
-const fixtureFault = (name: string): boolean => {
-  try { Deno.statSync(name); return true; } catch (error) {
-    if (error instanceof Deno.errors.NotFound) return false;
-    throw error;
-  }
-};
-Deno.symlink = async (target: string, path: string): Promise<void> => {
-  const [folder, sha] = target.split("/");
-  if (folder !== "releases" || target !== "releases/" + sha || !/^[0-9a-f]{40}$/.test(sha) ||
-      !path.startsWith(".data/current-") || !/^[0-9a-f-]{36}$/.test(path.slice(14))) throw new Error("fixture symlink scope refused");
-  if (await Deno.realPath(".data") !== fixtureRoot + "/.data" ||
-      await Deno.realPath(".data/" + target) !== fixtureRoot + "/.data/" + target) throw new Error("fixture symlink ownership refused");
-  const result = await new Deno.Command("/bin/ln", { args: ["-s", target, path], stdout: "piped", stderr: "piped" }).output();
-  if (!result.success) throw new Error("fixture ln failed");
-  recordFixture("selector-link " + sha);
-};
-globalThis.fetch = (input: RequestInfo | URL): Promise<Response> => {
-  const url = String(input);
-  if (url !== "http://127.0.0.1:7999/health" && url !== "https://ai.ubq.fi/health") throw new Error("fixture fetch scope refused");
-  const selected = Deno.readLinkSync(".data/current");
-  const sha = selected.slice("releases/".length);
-  if (selected !== "releases/" + sha || !/^[0-9a-f]{40}$/.test(sha)) throw new Error("fixture selected identity refused");
-  const loopback = url === "http://127.0.0.1:7999/health";
-  const status = loopback && fixtureFault("readiness-refused") ? 503 : 200;
-  recordFixture("fetch-" + (loopback ? "loopback" : "public") + "-" + (status === 200 ? "ready " : "not-ready ") + sha);
-  const deploymentId = "vps-" + sha;
-  return Promise.resolve(new Response(JSON.stringify({ release: { git_sha: sha, deployment_id: deploymentId } }), {
-    status, headers: { "content-type": "application/json", "x-uos-git-sha": sha, "x-uos-deployment-id": deploymentId }
-  }));
-};
-const fixtureSetTimeout = globalThis.setTimeout;
-globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
-  if (delay === 1000) recordFixture("wait-readiness 1000");
-  return fixtureSetTimeout(handler, delay === 1000 ? 0 : delay, ...args);
-}) as typeof setTimeout;
-`;
-  const script = `${fixture.root}/deploy.activation.fixture.ts`;
+  const source = await Deno.readTextFile(f.script);
+  const bootstrap = [
+    "const fixtureRoot = " + JSON.stringify(root) + ";",
+    "const actualFetch = globalThis.fetch;",
+    'const log = (event: string): void => Deno.writeTextFileSync(".data/trace", event + "\\n", { append: true });',
+    "Deno.symlink = async (target: string, path: string): Promise<void> => {",
+    ' if (!/^releases\\/[0-9a-f]{40}$/.test(target) || !/^\\.data\\/current-[0-9a-f-]{36}$/.test(path)) throw new Error("fixture symlink scope refused");',
+    ' if (await Deno.realPath(".data") !== fixtureRoot + "/.data" || await Deno.realPath(".data/" + target) !== fixtureRoot + "/.data/" + target) throw new Error("fixture symlink ownership refused");',
+    ' const result = await new Deno.Command("/bin/ln", { args: ["-s", target, path], stdout: "piped", stderr: "piped" }).output();',
+    ' if (!result.success) throw new Error("fixture ln failed"); log("selector-link " + target);',
+    "};",
+    "globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {",
+    " const url = String(input);",
+    ' const port = url === "https://ai.ubq.fi/health" ? ' +
+      String(proxyPort) +
+      ' : url === "http://127.0.0.1:7999/health" ? ' +
+      String(ports[1]) +
+      ' : url === "http://127.0.0.1:8001/health" ? ' +
+      String(ports[0]) +
+      " : null;",
+    ' if (port === null) throw new Error("fixture fetch scope refused");',
+    ' const response = await actualFetch("http://127.0.0.1:" + String(port) + "/health", init);',
+    ' log("fetch-observed " + JSON.stringify({ url, status: response.status, sha: response.headers.get("x-uos-git-sha") })); return response;',
+    "};",
+    "const timer = globalThis.setTimeout;",
+    "globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => timer(handler, delay === 1000 ? 1 : delay, ...args)) as typeof setTimeout;",
+    "",
+  ].join("\n");
+  const script = root + "/deploy.activation.fixture.ts";
   await Deno.writeTextFile(script, bootstrap + source);
-  assert.equal((await Deno.readTextFile(script)).slice(bootstrap.length), source, "activation must preserve every relocated production byte");
-  const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bootstrap))))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  console.log(JSON.stringify({ activation_fixture: "bootstrap", bootstrap_sha256: digest, symlink_command: "/bin/ln", network: "synthetic-only" }));
-  return { ...options, script, allowLn: true };
+  assert.equal((await Deno.readTextFile(script)).slice(bootstrap.length), source);
+  console.log(
+    JSON.stringify({
+      fixture: "actual_launcher",
+      profile,
+      sha,
+      oldSha,
+      physical_ports: ports,
+      launcher_hash: await hash(new TextEncoder().encode(oldLauncher)),
+      unit_hash: await hash(new TextEncoder().encode(VPS_UNIT)),
+      bootstrap_hash: await hash(new TextEncoder().encode(bootstrap)),
+    })
+  );
+  return {
+    options: {
+      write: root + "/.data",
+      env: { ...f.env, PATH: root + "/bin" },
+      fakeCommands: [root + "/bin/sudo", root + "/bin/tar"],
+      script,
+      allowLn: true,
+      network: true,
+    },
+    sha,
+    oldSha,
+    publicHealth: () => fetch("http://127.0.0.1:" + String(proxyPort) + "/health"),
+  };
 };
-
-const activationCalls = async (fixture: Fixture): Promise<string[]> => (await Deno.readTextFile(`${fixture.root}/.data/activation.log`)).trim().split("\n");
-
-Deno.test({
-  name: "VPS activation reloads Caddy only after the selected restarted candidate passes loopback readiness",
-  ignore: ingressFixtureIgnored,
-  fn: async () => {
-    const fixture = await createFixture({ branch: "development", tracking: "match", relocate: true });
-    try {
-      const options = await prepareActivationFixture(fixture);
-      const sha = await runFixtureGit(fixture.root, fixture.env, ["rev-parse", "HEAD"]);
-      const run = await runDeployFixture(fixture, options);
-      assert.equal(run.code, 0, run.stderr);
-      assert.equal(await Deno.readLink(`${fixture.root}/.data/current`), `releases/${sha}`);
-      const calls = await activationCalls(fixture);
-      const ordered = [
-        INGRESS_COMMANDS[1],
-        calls.find((call) => call.startsWith("git archive ")),
-        calls.find((call) => call.startsWith("tar ")),
-        `selector-link ${sha}`,
-        "sudo -n systemctl daemon-reload",
-        "sudo -n systemctl restart ai-ubq-fi.service",
-        `fetch-loopback-ready ${sha}`,
-        RELOAD_COMMAND,
-        `fetch-public-ready ${sha}`,
-      ];
-      let previous = -1;
-      for (const event of ordered) {
-        assert.ok(event !== undefined);
-        const index = calls.indexOf(event);
-        assert.ok(index > previous, `activation event must follow its predecessor: ${event}`);
-        previous = index;
-      }
-      assert.equal(calls.filter((call) => call === RELOAD_COMMAND).length, 1);
-      assert.match(run.stdout, /"public_health_verified":true/);
-      assert.match(run.stdout, /"health_verified":true/);
-      console.log(JSON.stringify({ activation_fixture: "ready", exit_code: run.code, commands: calls }));
-    } finally {
-      await fixture.dispose();
+const identity = async (response: Response): Promise<string> => {
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.release.git_sha, response.headers.get("x-uos-git-sha"));
+  assert.equal(body.release.deployment_id, "vps-" + String(body.release.git_sha));
+  assert.equal(response.headers.get("x-uos-deployment-id"), body.release.deployment_id);
+  return body.release.git_sha;
+};
+const snapshot = async (root: string): Promise<string> => {
+  const entries: unknown[] = [];
+  const walk = async (path: string): Promise<void> => {
+    for (const name of await readDirNames(path)) {
+      const full = path + "/" + name;
+      const stat = await Deno.lstat(full);
+      let entryContent = "directory";
+      if (stat.isSymlink) entryContent = await Deno.readLink(full);
+      else if (stat.isFile) entryContent = await hash(await Deno.readFile(full));
+      entries.push([full.slice(root.length), stat.mode, stat.mtime?.getTime(), entryContent]);
+      if (stat.isDirectory) await walk(full);
     }
-  },
-});
-
-const activationFailures = [
-  { marker: "archive-refused", error: /fixture archive refused/, ready: false },
-  { marker: "preparation-refused", error: /fixture preparation refused/, ready: false },
-  { marker: "restart-refused", error: /fixture restart refused/, ready: false },
-  { marker: "readiness-refused", error: /did not serve the expected release/, ready: false },
-  { marker: "reload-refused", error: /fixture reload refused/, ready: true },
-];
-
-for (const failure of activationFailures) {
+  };
+  await walk(root);
+  return hash(new TextEncoder().encode(JSON.stringify(entries)));
+};
+const withLauncher = (name: string, test: (f: Fixture, active: Active) => Promise<void>, profile: Profile = "current"): void => {
   Deno.test({
-    name: `VPS activation contains ingress mutation on ${failure.marker}`,
+    name,
     ignore: ingressFixtureIgnored,
     fn: async () => {
-      const fixture = await createFixture({ branch: "development", tracking: "match", relocate: true });
+      const f = await createFixture({ branch: "development", tracking: "match", relocate: true });
       try {
-        const options = await prepareActivationFixture(fixture);
-        await Deno.writeTextFile(`${fixture.root}/${failure.marker}`, "synthetic activation fault\n");
-        const run = await runDeployFixture(fixture, options);
-        assert.notStrictEqual(run.code, 0);
-        assert.match(run.stderr, failure.error);
-        const calls = await activationCalls(fixture);
-        assert.equal(calls.filter((call) => call === RELOAD_COMMAND).length, failure.ready ? 1 : 0);
-        assert.equal(
-          calls.some((call) => call.startsWith("fetch-public-")),
-          false,
-          "public acceptance must not precede readiness and successful reload"
-        );
-        assert.doesNotMatch(run.stdout, /"public_health_verified":true|"health_verified":true/);
-        if (failure.marker === "archive-refused" || failure.marker === "preparation-refused") {
-          assert.equal(await Deno.readLink(`${fixture.root}/.data/current`), `${fixture.root}/.data/releases/${PREVIOUS_RELEASE}`);
-        }
-        if (failure.marker === "readiness-refused") {
-          assert.equal(calls.filter((call) => call.startsWith("fetch-loopback-not-ready ")).length, 30);
-          assert.equal(calls.filter((call) => call === "wait-readiness 1000").length, 30);
-        }
-        if (failure.ready) {
-          assert.ok(calls.findIndex((call) => call.startsWith("fetch-loopback-ready ")) < calls.indexOf(RELOAD_COMMAND));
-        }
-        console.log(JSON.stringify({ activation_fixture: failure.marker, exit_code: run.code, commands: calls }));
+        await test(f, await prepareActivationFixture(f, profile));
       } finally {
-        await fixture.dispose();
+        await f.dispose();
       }
     },
   });
-}
-
-Deno.test({
-  name: "VPS deployment validates ingress before publication without reloading the live proxy",
-  ignore: ingressFixtureIgnored,
-  fn: async () => {
-    const fixture = await createFixture({ branch: "development", tracking: "match", relocate: true });
-    try {
-      const options = await prepareIngressFixture(fixture);
-      const sha = await runFixtureGit(fixture.root, fixture.env, ["rev-parse", "HEAD"]);
-      await assertPublishedIngressFixture(fixture, sha, await runDeployFixture(fixture, options));
-    } finally {
-      await fixture.dispose();
-    }
-  },
+};
+withLauncher("VPS actual rollback and persistent/cleared same-SHA retry preserve immutable bytes", async (f, a) => {
+  assert.equal(await identity(await a.publicHealth()), a.oldSha);
+  const retainedBeforeAcceptance: string[] = [];
+  for (let index = 1; index <= 7; index++) {
+    const name = "0".repeat(39) + String(index);
+    const path = f.root + "/.data/releases/" + name;
+    await Deno.mkdir(path);
+    await Deno.utime(path, 1, 1);
+    retainedBeforeAcceptance.push(name);
+  }
+  await write(f.root, "reload-refused", "fault\n");
+  let saved: string | undefined;
+  for (let i = 0; i < 2; i++) {
+    const run = await runDeployFixture(f, a.options);
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, /fixture reload refused/);
+    assert.equal(await Deno.readLink(f.root + "/.data/current"), "releases/" + a.oldSha);
+    assert.equal(await identity(await a.publicHealth()), a.oldSha);
+    assert.equal(JSON.parse(await Deno.readTextFile(f.root + "/.data/deploy-recovery.json")).phase, "rolled_back");
+    assert.doesNotMatch(run.stdout, /"health_verified":true/);
+    for (const name of retainedBeforeAcceptance) assert.equal(await pathExists(f.root + "/.data/releases/" + name), true);
+    const current = await snapshot(f.root + "/.data/releases/" + a.sha);
+    if (saved) assert.equal(current, saved);
+    saved = current;
+  }
+  await Deno.remove(f.root + "/reload-refused");
+  const run = await runDeployFixture(f, a.options);
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(await identity(await a.publicHealth()), a.sha);
+  assert.equal(await snapshot(f.root + "/.data/releases/" + a.sha), saved);
+  assert.equal(await pathExists(f.root + "/.data/deploy-recovery.json"), false);
+  assert.equal((await readDirNames(f.root + "/.data/releases")).length, 5);
+  const trace = await calls(f);
+  assert.ok(trace.some((line) => line.includes('"requested_port":8001') && line.includes('"env_port":"43210"')));
+  assert.equal(trace.filter((line) => line === RESTART_COMMAND).length, 5);
+  console.log(JSON.stringify({ proof: "same_sha_actual_recovery", candidate: a.sha, previous: a.oldSha, snapshot: saved, trace }));
 });
-
-const ingressFailures = [
-  { label: "an unreadable config", marker: undefined, error: /not readable by the caddy user/, commandCount: 0 },
-  { label: "a stopped Caddy", marker: "no-caddy", error: /Caddy is not running/, commandCount: 1 },
-  { label: "a validation failure", marker: "invalid-caddy", error: /fixture validation refused/, commandCount: 2 },
-];
-
-for (const failure of ingressFailures) {
-  Deno.test({
-    name: `VPS ingress preflight preserves releases on ${failure.label} and permits a corrected same-SHA retry`,
-    ignore: ingressFixtureIgnored,
-    fn: async () => {
-      const fixture = await createFixture({ branch: "development", tracking: "match", relocate: true });
-      try {
-        const options = await prepareIngressFixture(fixture);
-        const sha = await runFixtureGit(fixture.root, fixture.env, ["rev-parse", "HEAD"]);
-        if (failure.marker === undefined) await Deno.chmod(`${fixture.root}/ops/Caddyfile`, 0o600);
-        else await Deno.writeTextFile(`${fixture.root}/${failure.marker}`, "synthetic ingress fault\n");
-        const run = await runDeployFixture(fixture, options);
-        assert.notStrictEqual(run.code, 0);
-        assert.match(run.stderr, failure.error);
-        assert.equal(await Deno.readLink(`${fixture.root}/.data/current`), `${fixture.root}/.data/releases/${PREVIOUS_RELEASE}`);
-        assert.deepEqual(
-          await readDirNames(`${fixture.root}/.data/releases`),
-          [PREVIOUS_RELEASE],
-          "preflight failure must create no archive, staging or release"
-        );
-        assert.deepEqual(await readDirNames(`${fixture.root}/.data`), ["current", "deploy.lock", "releases"]);
-        assert.equal(await Deno.readTextFile(`${fixture.root}/.data/releases/${PREVIOUS_RELEASE}/retained.txt`), "previous immutable release\n");
-        const calls = (await Deno.readTextFile(`${fixture.root}/commands.log`)).trim().split("\n");
-        assert.deepEqual(
-          calls.filter((call) => call.startsWith("sudo ")),
-          INGRESS_COMMANDS.slice(0, failure.commandCount)
-        );
-        assert.equal(
-          calls.some((call) => call.startsWith("git archive ") || call.startsWith("tar ")),
-          false
-        );
-        console.log(JSON.stringify({ ingress_fixture: "preflight_failed", fault: failure.label, git_sha: sha, exit_code: run.code, commands: calls }));
-        // Only the injected fault changes between runs; candidate and fakes stay
-        // byte-identical, and the previous namespace must not block this SHA.
-        if (failure.marker === undefined) {
-          await Deno.remove(`${fixture.root}/ops/Caddyfile`);
-          await Deno.writeTextFile(`${fixture.root}/ops/Caddyfile`, CADDY_FIXTURE_CONFIG, { mode: 0o604 });
-        } else await Deno.remove(`${fixture.root}/${failure.marker}`);
-        await Deno.writeTextFile(`${fixture.root}/commands.log`, "");
-        assert.equal(await runFixtureGit(fixture.root, fixture.env, ["rev-parse", "HEAD"]), sha);
-        await assertPublishedIngressFixture(fixture, sha, await runDeployFixture(fixture, options));
-      } finally {
-        await fixture.dispose();
-      }
+withLauncher("VPS post-ingress failure retains candidate and retries without restart", async (f, a) => {
+  await write(f.root, "public-refused", "fault\n");
+  const first = await runDeployFixture(f, a.options);
+  assert.notEqual(first.code, 0);
+  assert.match(first.stderr, /public route/);
+  const saved = await snapshot(f.root + "/.data/releases/" + a.sha);
+  assert.equal(JSON.parse(await Deno.readTextFile(f.root + "/.data/deploy-recovery.json")).phase, "ingress_applied");
+  await write(f.root, "reload-refused", "later fault\n");
+  const later = await runDeployFixture(f, a.options);
+  assert.notEqual(later.code, 0);
+  assert.match(later.stderr, /fixture reload refused/);
+  assert.equal(await Deno.readLink(f.root + "/.data/current"), "releases/" + a.sha);
+  await Deno.remove(f.root + "/reload-refused");
+  const persistent = await runDeployFixture(f, a.options);
+  assert.notEqual(persistent.code, 0);
+  await Deno.remove(f.root + "/public-refused");
+  const accepted = await runDeployFixture(f, a.options);
+  assert.equal(accepted.code, 0, accepted.stderr);
+  assert.equal(await identity(await a.publicHealth()), a.sha);
+  assert.equal(await snapshot(f.root + "/.data/releases/" + a.sha), saved);
+  assert.equal((await calls(f)).filter((line) => line === RESTART_COMMAND).length, 1);
+  console.log(JSON.stringify({ proof: "post_ingress_retry", trace: await calls(f) }));
+});
+withLauncher("VPS daemon-reload refusal preserves prior listener and issues no gateway restart (#264)", async (f, a) => {
+  await write(f.root, "daemon-refused", "fault\n");
+  const run = await runDeployFixture(f, a.options);
+  assert.notEqual(run.code, 0);
+  assert.match(run.stderr, /fixture daemon-reload refused/);
+  const trace = await calls(f);
+  assert.equal(trace.filter((line) => line === RESTART_COMMAND).length, 0);
+  assert.equal(trace.filter((line) => line === RELOAD_COMMAND).length, 0);
+  assert.ok(!trace.some((line) => line.startsWith("fetch-observed ") && line.includes(":7999/health")));
+  assert.doesNotMatch(run.stdout, /public_health_verified|health_verified/);
+  assert.equal(await Deno.readLink(f.root + "/.data/current"), "releases/" + a.oldSha);
+  assert.equal(await identity(await a.publicHealth()), a.oldSha);
+  assert.equal(trace.filter((line) => line.startsWith("unit-exec ")).length, 1);
+  console.log(JSON.stringify({ proof: "daemon_refusal_prior_listener_untouched", exit_code: run.code, trace }));
+});
+for (const profile of ["unknown", "env-port", "legacy"] as const)
+  withLauncher(
+    "VPS refuses unsupported predecessor " + profile + " before activation",
+    async (f, a) => {
+      assert.equal(await identity(await a.publicHealth()), a.oldSha);
+      const run = await runDeployFixture(f, a.options);
+      assert.notEqual(run.code, 0);
+      assert.match(run.stderr, /Unsupported previous launcher or service layout/);
+      const trace = await calls(f);
+      assert.ok(!trace.includes(RESTART_COMMAND) && !trace.includes(RELOAD_COMMAND) && !trace.some((line) => line.startsWith("selector-link ")));
+      assert.equal(await Deno.readLink(f.root + "/.data/current"), "releases/" + a.oldSha);
+      assert.equal(await identity(await a.publicHealth()), a.oldSha);
+      assert.equal(await pathExists(f.root + "/.data/releases/" + a.sha), false);
+      console.log(JSON.stringify({ proof: "unsupported_predecessor_preserved", profile, trace }));
     },
+    profile
+  );
+for (const marker of ["archive-refused", "preparation-refused", "restart-refused", "readiness-refused"] as const)
+  withLauncher("VPS prior listener survives " + marker, async (f, a) => {
+    await write(f.root, marker, "fault\n");
+    const run = await runDeployFixture(f, a.options);
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, marker === "readiness-refused" ? /did not serve the expected release/ : /fixture .* refused/);
+    assert.equal(await Deno.readLink(f.root + "/.data/current"), "releases/" + a.oldSha);
+    assert.equal(await identity(await a.publicHealth()), a.oldSha);
+    assert.doesNotMatch(run.stdout, /"health_verified":true/);
+    assert.ok(!(await calls(f)).includes(RELOAD_COMMAND));
   });
-}
+for (const corruption of [
+  "no-receipt",
+  "malformed",
+  "stale",
+  "symlink",
+  "wrong-selector",
+  "candidate-file",
+  "manifest",
+  "extra-file",
+  "candidate-symlink",
+  "manifest-symlink",
+  "generated-identity",
+  "previous-file",
+] as const)
+  withLauncher("VPS rejects unsafe recovery " + corruption, async (f, a) => {
+    await write(f.root, "reload-refused", "fault\n");
+    const first = await runDeployFixture(f, a.options);
+    assert.notEqual(first.code, 0);
+    assert.match(first.stderr, /fixture reload refused/);
+    const receipt = f.root + "/.data/deploy-recovery.json";
+    const candidate = f.root + "/.data/releases/" + a.sha;
+    if (corruption === "no-receipt") await Deno.remove(receipt);
+    if (corruption === "malformed") await Deno.writeTextFile(receipt, "{}\n");
+    if (corruption === "stale") {
+      const data = JSON.parse(await Deno.readTextFile(receipt));
+      data.candidate.tree = "0".repeat(64);
+      await Deno.writeTextFile(receipt, JSON.stringify(data));
+    }
+    if (corruption === "symlink") {
+      await Deno.rename(receipt, receipt + ".saved");
+      const r = await new Deno.Command("/bin/ln", { args: ["-s", receipt + ".saved", receipt] }).output();
+      assert.equal(r.code, 0);
+    }
+    if (corruption === "wrong-selector") {
+      await Deno.remove(f.root + "/.data/current");
+      const r = await new Deno.Command("/bin/ln", { args: ["-s", "./releases/" + a.oldSha, f.root + "/.data/current"] }).output();
+      assert.equal(r.code, 0);
+    }
+    if (corruption === "candidate-file") await write(candidate, "release.txt", "changed\n");
+    if (corruption === "manifest") await write(candidate, ".uos-release.json", "{}\n");
+    if (corruption === "extra-file") await write(candidate, "unexpected.txt", "extra\n");
+    if (corruption === "candidate-symlink") {
+      await Deno.rename(candidate, candidate + ".saved");
+      const result = await new Deno.Command("/bin/ln", { args: ["-s", candidate + ".saved", candidate] }).output();
+      assert.equal(result.code, 0);
+    }
+    if (corruption === "manifest-symlink") {
+      await Deno.rename(candidate + "/.uos-release.json", candidate + "/manifest.saved");
+      const result = await new Deno.Command("/bin/ln", { args: ["-s", "manifest.saved", candidate + "/.uos-release.json"] }).output();
+      assert.equal(result.code, 0);
+    }
+    if (corruption === "generated-identity") await write(candidate, "src/release.ts", "changed identity\n");
+    if (corruption === "previous-file") await write(f.root + "/.data/releases/" + a.oldSha, "release.txt", "changed prior bytes\n");
+    const before = (await calls(f)).length;
+    const run = await runDeployFixture(f, a.options);
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, /recovery|Immutable release/i);
+    const trace = (await calls(f)).slice(before);
+    assert.ok(!trace.includes(RESTART_COMMAND) && !trace.includes(RELOAD_COMMAND) && !trace.some((line) => line.startsWith("selector-link ")));
+    assert.equal(await identity(await a.publicHealth()), a.oldSha);
+  });
+withLauncher("VPS selected immutable release retries without restart and refuses not-ready identity", async (f, a) => {
+  const first = await runDeployFixture(f, a.options);
+  assert.equal(first.code, 0, first.stderr);
+  const saved = await snapshot(f.root + "/.data/releases/" + a.sha);
+  const retry = await runDeployFixture(f, a.options);
+  assert.equal(retry.code, 0, retry.stderr);
+  assert.equal(await snapshot(f.root + "/.data/releases/" + a.sha), saved);
+  await write(f.root, "readiness-refused", "fault\n");
+  const refused = await runDeployFixture(f, a.options);
+  assert.notEqual(refused.code, 0);
+  assert.match(refused.stderr, /not ready/);
+  assert.equal((await calls(f)).filter((line) => line === RESTART_COMMAND).length, 1);
+});
+for (const failure of [
+  { marker: "unreadable", error: /not readable by the caddy user/ },
+  { marker: "no-caddy", error: /Caddy is not running/ },
+  { marker: "invalid-caddy", error: /fixture validation refused/ },
+])
+  withLauncher("VPS ingress preflight preserves same-SHA retry on " + failure.marker, async (f, a) => {
+    if (failure.marker === "unreadable") await Deno.chmod(f.root + "/ops/Caddyfile", 0o600);
+    else await write(f.root, failure.marker, "fault\n");
+    const first = await runDeployFixture(f, a.options);
+    assert.notEqual(first.code, 0);
+    assert.match(first.stderr, failure.error);
+    assert.equal(await pathExists(f.root + "/.data/releases/" + a.sha), false);
+    assert.equal(await identity(await a.publicHealth()), a.oldSha);
+    if (failure.marker === "unreadable") {
+      await Deno.remove(f.root + "/ops/Caddyfile");
+      await Deno.writeTextFile(f.root + "/ops/Caddyfile", "fixture config\n", { mode: 0o604 });
+    } else await Deno.remove(f.root + "/" + failure.marker);
+    const retry = await runDeployFixture(f, a.options);
+    assert.equal(retry.code, 0, retry.stderr);
+  });
 
 Deno.test({
   name: "VPS deployment rejects a non-canonical root before any Git subprocess runs",
