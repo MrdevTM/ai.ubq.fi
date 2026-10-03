@@ -41,7 +41,6 @@ import {
   SENTINEL_REPLAY_STATUS_TTL_MS,
   SENTINEL_REPLAY_TTL_MS,
   type SentinelReplayCaptureStatusRow,
-  type SentinelReplayManifest,
 } from "./replay-model.ts";
 import { SENTINEL_REPLAY_MAX_RECORDS, SENTINEL_REPLAY_MAX_STATUS_RECORDS, sentinelReplayReservationBytes } from "./replay-limits.ts";
 import { isSentinelReplayCaptureStatusRow } from "./replay-observation.ts";
@@ -502,11 +501,13 @@ const recordSkipReason = async (kv: Deno.Kv, reason: string | null, nowMs: numbe
  * fingerprint, and a manifest that no longer matches the claim is left alone.
  */
 const deleteClaimedVictimPayload = async (kv: Deno.Kv, row: SentinelReplayAccountingRow, manifestKey: Deno.KvKey): Promise<void> => {
-  const manifestEntry = await kv.get<SentinelReplayManifest>(manifestKey);
-  if (!isSentinelReplayManifest(manifestEntry.value)) return;
-  if (!manifestKeyMatches(manifestKey, manifestEntry.value) || manifestEntry.value.fingerprint !== row.fingerprint) return;
-  fault("delete");
-  await kv.delete(manifestKey);
+  const manifestEntry = await kv.get(manifestKey);
+  if (manifestEntry.value !== null || manifestEntry.versionstamp !== null) {
+    if (!isSentinelReplayManifest(manifestEntry.value)) return;
+    if (!manifestKeyMatches(manifestKey, manifestEntry.value) || manifestEntry.value.fingerprint !== row.fingerprint) return;
+    fault("delete");
+    await kv.delete(manifestKey);
+  }
   const dedupeKey = [...SENTINEL_REPLAY_DEDUPE_PREFIX, row.fingerprint];
   const dedupeEntry = await kv.get<{ manifest_key?: unknown }>(dedupeKey);
   if (!Array.isArray(dedupeEntry.value?.manifest_key)) return;
