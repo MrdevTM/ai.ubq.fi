@@ -5,6 +5,7 @@
 // whitelist is no filter at all, so those rows then list on the upstream TTL.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 /** URL text of a fetch input (the transports under test always pass a string URL). */
 const fetchUrl = (input: RequestInfo | URL): string => {
@@ -71,6 +72,7 @@ const kvStub = {
 } as unknown as Deno.Kv;
 
 const { handleCodexCatalogModels } = await import("../src/catalog/index.ts");
+const { handleModels } = await import("../src/models/catalog.ts");
 const { storeCodexCatalog } = await import("../src/catalog/store.ts");
 const { CODEX_CATALOG_AUTH_GENERATION_KEY } = await import("../src/catalog/types.ts");
 const { CODEX_AUTH_POOL_KV_KEY, resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
@@ -293,6 +295,55 @@ Deno.test("codex catalog: an active whitelist filters a fresh stored-catalog hit
         "the enabled-model policy narrows the stored body"
       );
       assert.match(response.headers.get("ETag") ?? "", /^"uos-catalog-/, "the unfiltered upstream body's tag is not forwarded");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+Deno.test("codex catalog: served-byte ETags change when OpenRouter enriches an unchanged upstream catalog", async () => {
+  await withFixture([], async () => {
+    kvStore.set(keyToString([...PROVIDER_SELECTION_KV_KEY]), {
+      value: { provider_ids: ["codex", "openrouter"], updated_at_ms: 1 },
+      versionstamp: nextVersion(),
+    });
+    resetProviderSelectionCacheForTest();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () => Promise.reject(new Error("a fresh catalog must not reach upstream"));
+    try {
+      const body = JSON.stringify({ models: [{ slug: "gpt-stored" }] });
+      resetOpenRouterModelsCacheForTest();
+      await fetchOpenRouterModels({ force: true, fetcher: () => Promise.resolve(Response.json({ data: [] })) });
+      const stored = await storeCodexCatalog(kvStub, {
+        clientVersion: "0.100.0",
+        authGeneration: AUTH_GENERATION,
+        body,
+        etag: '"upstream-only"',
+        fetchedAtMs: Date.now(),
+      });
+      assert.equal(stored, true, "the unchanged upstream catalog is cached");
+      const first = await handleModels(codexCatalogRequest());
+      assert.equal(first.status, 200);
+      assert.equal(await first.text(), body, "the assembled path initially serves the exact upstream bytes");
+      const oldTag = first.headers.get("ETag") ?? "";
+      assert.equal(oldTag, `"uos-catalog-${createHash("sha256").update(body).digest("hex").slice(0, 32)}"`);
+      await fetchOpenRouterModels({
+        force: true,
+        fetcher: () => Promise.resolve(Response.json({ data: [{ id: "vendor/beta", context_length: 128_000 }] })),
+      });
+      const changedRequest = new Request(codexCatalogRequest(), { headers: { "If-None-Match": oldTag } });
+      const changed = await handleModels(changedRequest);
+      assert.equal(changed.status, 200, "an old body validator cannot hide newly widened metadata");
+      const changedBody = await changed.text();
+      assert.notEqual(changedBody, body);
+      const changedTag = changed.headers.get("ETag") ?? "";
+      assert.equal(changedTag, `"uos-catalog-${createHash("sha256").update(changedBody).digest("hex").slice(0, 32)}"`);
+      assert.notEqual(changedTag, oldTag);
+      assert.equal((JSON.parse(changedBody) as { models: { context_window: number }[] }).models[1].context_window, 128_000);
+      const current = await handleModels(new Request(codexCatalogRequest(), { headers: { "If-None-Match": changedTag } }));
+      assert.equal(current.status, 304);
+      assert.equal(current.headers.get("ETag"), changedTag);
+      assert.equal(await current.text(), "");
     } finally {
       globalThis.fetch = originalFetch;
     }

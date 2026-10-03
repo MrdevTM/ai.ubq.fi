@@ -45,13 +45,13 @@ import {
   withOpenRouterModels,
 } from "./models.ts";
 
-const catalogBodyEtag = async (body: string, catalog: LoadedCodexCatalog): Promise<string | null> =>
-  body === catalog.body ? catalog.metadata.etag : `"uos-catalog-${(await sha256Hex(body)).slice(0, 32)}"`;
+const catalogBodyEtag = async (body: string): Promise<string> => `"uos-catalog-${(await sha256Hex(body)).slice(0, 32)}"`;
 
 /** Answer with the stored catalog alone, honoring the request's conditional headers. */
-const catalogOnlyResponse = (catalog: LoadedCodexCatalog, req: Request, headers: Headers): Response => {
-  if (catalog.metadata.etag) headers.set("ETag", catalog.metadata.etag);
-  if (etagMatches(req.headers.get("If-None-Match"), catalog.metadata.etag)) {
+const catalogOnlyResponse = async (catalog: LoadedCodexCatalog, req: Request, headers: Headers): Promise<Response> => {
+  const etag = await catalogBodyEtag(catalog.body);
+  headers.set("ETag", etag);
+  if (etagMatches(req.headers.get("If-None-Match"), etag)) {
     return new Response(null, { status: 304, headers });
   }
   return new Response(catalog.body, { status: 200, headers });
@@ -162,8 +162,8 @@ const catalogResponse = async (catalog: LoadedCodexCatalog, req: Request, cacheS
   parsed.models = cerebrasEnabled ? withCerebrasModels(parsed.models) : parsed.models;
   parsed.models = applyCatalogWhitelist(parsed.models, openRouterEnabled, catalogWhitelist);
   const body = JSON.stringify(parsed);
-  const etag = await catalogBodyEtag(body, catalog);
-  if (etag) headers.set("ETag", etag);
+  const etag = await catalogBodyEtag(body);
+  headers.set("ETag", etag);
   if (etagMatches(req.headers.get("If-None-Match"), etag)) {
     return new Response(null, { status: 304, headers });
   }
