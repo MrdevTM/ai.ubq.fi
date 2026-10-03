@@ -763,7 +763,7 @@ Deno.test("upstream wire: provider error bodies are bounded, whitelisted and nev
 
 Deno.test("upstream wire: the chat-body digest carries shapes and never prompt content", () => {
   const diagnostic = deepSeekChatBodyDiagnostic({
-    model: "deepseek-chat",
+    model: "deepseek-flash",
     reasoning_effort: "high",
     stream: true,
     tools: [{}, {}],
@@ -779,24 +779,91 @@ Deno.test("upstream wire: the chat-body digest carries shapes and never prompt c
   });
 
   assert.deepEqual(diagnostic, {
-    model: "deepseek-chat",
+    model: "deepseek-flash",
     reasoning_effort: "high",
     stream: true,
     tools: 2,
     tool_choice: "auto",
     max_tokens: 128,
-    message_count: 4,
+    message_count: 5,
     last_user_index: 3,
+    omitted_message_count: 0,
     messages: [
       { index: 0, role: "system", reasoning: "absent", tool_calls: 0, content: "string", after_last_user: false },
       { index: 1, role: "user", reasoning: "absent", tool_calls: 0, content: "parts", after_last_user: false },
       { index: 2, role: "assistant", reasoning: "present", tool_calls: 1, content: "null", after_last_user: false },
       { index: 3, role: "user", reasoning: "absent", tool_calls: 0, content: "null", after_last_user: false },
+      { index: 4, role: null, reasoning: "absent", tool_calls: 0, content: "null", after_last_user: true },
     ],
   });
 
   const malformedSample = deepSeekChatBodyDiagnostic({ messages: [{ role: "user", reasoning_content: "", content: 7 }] });
   assert.equal((malformedSample.messages as unknown[]).length, 1);
+});
+
+Deno.test("upstream wire: large chat diagnostics log a bounded private tail with original indices", async () => {
+  const markers = ["PRIVATE_CONTENT_666", "PRIVATE_TOOL_NAME_666", "PRIVATE_ID_666", "PRIVATE_COOKIE_666", "PRIVATE_METADATA_666"];
+  const parts = Array.from({ length: 50_000 }, () => ({ type: markers[4], text: markers[0] }));
+  const calls = Array.from({ length: 50_000 }, () => ({ id: markers[2], function: { name: markers[1], arguments: markers[0] } }));
+  const messages: unknown[] = Array.from({ length: 50_000 }, () => ({
+    role: "assistant",
+    content: parts,
+    reasoning_content: markers[0],
+    tool_calls: calls,
+    cookie: markers[3],
+  }));
+  messages[0] = markers[4];
+  messages[7] = { role: "user", content: markers[0] };
+  messages[49_999] = { role: markers[4].repeat(10_000), content: parts, tool_calls: calls };
+  const diagnostic = deepSeekChatBodyDiagnostic({
+    model: markers[4].repeat(10_000),
+    reasoning_effort: markers[4],
+    tool_choice: markers[4],
+    tools: calls,
+    max_tokens: Number.POSITIVE_INFINITY,
+    messages,
+  });
+  assert.equal(diagnostic.message_count, 50_000);
+  assert.equal(diagnostic.last_user_index, 7);
+  assert.equal(diagnostic.omitted_message_count, 49_984);
+  assert.equal(diagnostic.model, null);
+  assert.equal(diagnostic.reasoning_effort, null);
+  assert.equal(diagnostic.tool_choice, null);
+  assert.equal(diagnostic.max_tokens, null);
+  assert.equal(diagnostic.tools, 50_000);
+  const tail = diagnostic.messages as Record<string, unknown>[];
+  assert.equal(tail.length, 16);
+  assert.deepEqual(
+    tail.map((message) => message.index),
+    Array.from({ length: 16 }, (_, offset) => 49_984 + offset)
+  );
+  assert.equal(tail[15].role, null);
+  assert.ok(tail.every((message) => message.after_last_user === true && message.content === "parts" && message.tool_calls === 50_000));
+
+  const logged: unknown[][] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => logged.push(args);
+  try {
+    for (const translate of [toDeepSeekUpstreamErrorResponse, toLithosUpstreamErrorResponse]) {
+      const response = await translate(
+        new Response(JSON.stringify({ error: { message: "\0".repeat(2_000), code: "\0".repeat(400) } }), { status: 400 }),
+        undefined,
+        diagnostic
+      );
+      assert.equal(response.status, 400);
+      await response.body?.cancel();
+    }
+  } finally {
+    console.warn = original;
+  }
+  assert.equal(logged.length, 2);
+  for (const [, line] of logged) {
+    assert.equal(typeof line, "string");
+    const output = String(line);
+    assert.ok(new TextEncoder().encode(output).length < 16_384);
+    assert.deepEqual((JSON.parse(output) as { request: unknown }).request, diagnostic);
+    for (const marker of markers) assert.equal(output.includes(marker), false);
+  }
 });
 
 Deno.test("upstream wire: cancelling an already-closed response body is swallowed", () => {
