@@ -5,6 +5,7 @@ import {
   DEEPSEEK_RESPONSES_PROFILE,
   type DeepSeekResponsesFailure,
   type DeepSeekResponsesResult,
+  type OriginalToolName,
   failure,
   originalToolName,
 } from "./responses.ts";
@@ -376,7 +377,7 @@ const uniqueChatName = (used: ReadonlySet<string>, name: string): string => {
   }
 };
 
-type ToolCollector = { tools: Record<string, unknown>[]; toolNames: Map<string, string>; customNames: Set<string>; used: Set<string> };
+type ToolCollector = { tools: Record<string, unknown>[]; toolNames: Map<string, OriginalToolName>; customNames: Set<string>; used: Set<string> };
 
 /**
  * The one parameter a freeform tool is advertised with. Codex's `apply_patch`
@@ -397,7 +398,7 @@ const collectCustom = (collector: ToolCollector, tool: Record<string, unknown>):
   const chatName = uniqueChatName(collector.used, name);
   collector.used.add(chatName);
   collector.customNames.add(chatName);
-  if (chatName !== name) collector.toolNames.set(chatName, name);
+  if (chatName !== name) collector.toolNames.set(chatName, { name, namespace: null });
   collector.tools.push({
     type: "function",
     function: {
@@ -415,7 +416,7 @@ const collectFunction = (collector: ToolCollector, fn: Record<string, unknown>, 
   const preferred = namespace !== null && collector.used.has(name) ? `${namespace}_${name}` : name;
   const chatName = uniqueChatName(collector.used, preferred);
   collector.used.add(chatName);
-  if (chatName !== name) collector.toolNames.set(chatName, name);
+  if (chatName !== name || namespace !== null) collector.toolNames.set(chatName, { name, namespace });
   collector.tools.push(chatFunctionRecord(fn, chatName));
   return { ok: true, value: undefined };
 };
@@ -451,7 +452,9 @@ const collectTool = (collector: ToolCollector, tool: unknown): DeepSeekResponses
 
 const toChatTools = (
   value: unknown
-): DeepSeekResponsesResult<Readonly<{ tools: Record<string, unknown>[]; toolNames: ReadonlyMap<string, string>; customToolNames: ReadonlySet<string> }>> => {
+): DeepSeekResponsesResult<
+  Readonly<{ tools: Record<string, unknown>[]; toolNames: ReadonlyMap<string, OriginalToolName>; customToolNames: ReadonlySet<string> }>
+> => {
   if (!Array.isArray(value)) return failure("tools", "tools must be an array");
   const collector: ToolCollector = { tools: [], toolNames: new Map(), customNames: new Set(), used: new Set() };
   for (const tool of value) {
@@ -461,7 +464,7 @@ const toChatTools = (
   return { ok: true, value: { tools: collector.tools, toolNames: collector.toolNames, customToolNames: collector.customNames } };
 };
 
-const toChatToolChoice = (value: unknown, toolNames: ReadonlyMap<string, string>): DeepSeekResponsesResult<unknown> => {
+const toChatToolChoice = (value: unknown, toolNames: ReadonlyMap<string, OriginalToolName>): DeepSeekResponsesResult<unknown> => {
   if (value === undefined || value === null) return { ok: true, value: undefined };
   if (typeof value === "string") {
     if (value === "none" || value === "auto" || value === "required") return { ok: true, value };
@@ -517,8 +520,8 @@ const applyTools = (
   body: Record<string, unknown>,
   rawRecord: Record<string, unknown>,
   profile: ChatOnlyResponsesProfile
-): DeepSeekResponsesResult<Readonly<{ toolNames: ReadonlyMap<string, string>; customToolNames: ReadonlySet<string> }>> => {
-  const toolNames = new Map<string, string>();
+): DeepSeekResponsesResult<Readonly<{ toolNames: ReadonlyMap<string, OriginalToolName>; customToolNames: ReadonlySet<string> }>> => {
+  const toolNames = new Map<string, OriginalToolName>();
   let customToolNames: ReadonlySet<string> = new Set();
   if (rawRecord.tools !== undefined) {
     const tools = toChatTools(rawRecord.tools);
@@ -593,7 +596,7 @@ export const toDeepSeekResponsesChatBody = (
 ): DeepSeekResponsesResult<
   Readonly<{
     body: Record<string, unknown>;
-    toolNames: ReadonlyMap<string, string>;
+    toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     elisions: readonly ForwardedPayloadElision[];
   }>

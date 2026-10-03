@@ -234,5 +234,12 @@ export const CEREBRAS_RESPONSES_PROFILE: ChatOnlyResponsesProfile = {
   requiresStreamUsageOption: false,
 };
 
+/** The Responses identity a flattened Chat tool name was derived from. */
+export type OriginalToolName = Readonly<{ name: string; namespace: string | null }>;
+
+/** Maps a flattened Chat tool name back to the identity the client asked for. */
+export const originalTool = (name: string, toolNames: ReadonlyMap<string, OriginalToolName>): OriginalToolName =>
+  toolNames.get(name) ?? { name, namespace: null };
+
 /** Maps a flattened Chat tool name back to the name the client asked for. */
-export const originalToolName = (name: string, toolNames: ReadonlyMap<string, string>): string => toolNames.get(name) ?? name;
+export const originalToolName = (name: string, toolNames: ReadonlyMap<string, OriginalToolName>): string => originalTool(name, toolNames).name;

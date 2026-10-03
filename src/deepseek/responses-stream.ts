@@ -1,6 +1,6 @@
 // Chat SSE to Responses event stream translation, split out of src/deepseek_responses.ts.
 
-import { type ChatOnlyResponsesProfile, DEEPSEEK_RESPONSES_PROFILE, originalToolName } from "./responses.ts";
+import { type ChatOnlyResponsesProfile, DEEPSEEK_RESPONSES_PROFILE, type OriginalToolName, originalTool, originalToolName } from "./responses.ts";
 import {
   customToolCallItem,
   type DeepSeekResponsesEcho,
@@ -164,7 +164,7 @@ export const createDeepSeekResponsesStreamTranslator = (
   responseId: string,
   echo: DeepSeekResponsesEcho,
   createdAtSeconds: number,
-  toolNames: ReadonlyMap<string, string> = new Map(),
+  toolNames: ReadonlyMap<string, OriginalToolName> = new Map(),
   customToolNames: ReadonlySet<string> = new Set(),
   profile: ChatOnlyResponsesProfile = DEEPSEEK_RESPONSES_PROFILE
 ) => {
@@ -344,6 +344,7 @@ export const createDeepSeekResponsesStreamTranslator = (
     call.announced = true;
     call.outputIndex = state.nextOutputIndex++;
     const custom = isCustomCall(call);
+    const original = originalTool(call.name, toolNames);
     call.id = `${custom ? "ctc" : "fc"}_${responseId}_${call.key}`;
     return [
       ...events,
@@ -355,7 +356,8 @@ export const createDeepSeekResponsesStreamTranslator = (
           type: custom ? "custom_tool_call" : "function_call",
           status: "in_progress",
           call_id: call.callId,
-          name: originalToolName(call.name, toolNames),
+          name: original.name,
+          ...(original.namespace ? { namespace: original.namespace } : {}),
           ...(custom ? { input: "" } : { arguments: "" }),
         },
       },
@@ -515,7 +517,8 @@ export const createDeepSeekResponsesStreamTranslator = (
         continue;
       }
       events.push({ type: "response.function_call_arguments.done", item_id: call.id, output_index: call.outputIndex, arguments: call.arguments });
-      const item = { ...functionCallItem(call.id, call.callId, originalToolName(call.name, toolNames), call.arguments), status };
+      const original = originalTool(call.name, toolNames);
+      const item = { ...functionCallItem(call.id, call.callId, original.name, call.arguments, original.namespace), status };
       state.output[call.outputIndex] = item;
       events.push({ type: "response.output_item.done", output_index: call.outputIndex, item });
     }

@@ -29,7 +29,7 @@ import {
   normalizeDeepSeekChatCompletion,
 } from "./index.ts";
 import { DeepSeekStreamError, iterateDeepSeekChatCompletionStream } from "./stream.ts";
-import { DEEPSEEK_RESPONSES_PROFILE } from "./responses.ts";
+import { DEEPSEEK_RESPONSES_PROFILE, type OriginalToolName } from "./responses.ts";
 import { ApiKeyQuotaDispatchError } from "../api-key-policy.ts";
 import { recordDeepSeekProviderHealth } from "../provider/health.ts";
 import {
@@ -571,7 +571,7 @@ const finalizeBufferedDeepSeekResponses = async (
     modelRaw: string;
     responseId: string;
     echo: DeepSeekResponsesEcho;
-    toolNames: ReadonlyMap<string, string>;
+    toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     upstreamModel: string;
     providerRequestId: string | null;
@@ -726,7 +726,7 @@ const streamDeepSeekResponses = (
   responseId: string,
   createdAtSeconds: number,
   echo: DeepSeekResponsesEcho,
-  toolNames: ReadonlyMap<string, string>,
+  toolNames: ReadonlyMap<string, OriginalToolName>,
   customToolNames: ReadonlySet<string>,
   providerRequestId: string | null,
   usageContext: UsageContext | undefined,
