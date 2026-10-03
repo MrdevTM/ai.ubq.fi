@@ -234,6 +234,57 @@ Deno.test("Stage 0 cache telemetry analyzer keeps invalid completed usage out of
   });
 });
 
+Deno.test("Stage 0 cache telemetry analyzer preserves model-unavailable account transitions", () => {
+  // The terminal logger carries the selected account's routing reason on both
+  // successful and failed requests after skipping a model-ineligible account.
+  const routing = {
+    model: "gpt-daybreak-blue-latest",
+    account_slot: 2,
+    account_cohort_id: "a".repeat(64),
+    active_generation: 2,
+    active_transition_reason: "model_unavailable",
+  };
+  const report = analyzeStage0CacheTelemetryLines([
+    terminalLine({ ...routing, cached_input_tokens: 25 }),
+    terminalLine({
+      ...routing,
+      status: 502,
+      stream_terminal_type: "response.failed",
+      input_tokens: null,
+      cached_input_tokens: null,
+      cache_write_input_tokens: null,
+      usage_observed: false,
+      usage_telemetry_status: "missing",
+    }),
+  ]);
+
+  assert.deepEqual(report.inference_terminal_outcomes.active_transition_reason_totals, {
+    none: 0,
+    quota_exhausted: 0,
+    credential_invalid: 0,
+    account_removed_or_replaced: 0,
+    model_unavailable: 2,
+  });
+  assert.deepEqual(report.inference_terminal_outcomes.outcome_totals, { completed: 1, failed: 1, incomplete: 0, cancelled: 0 });
+  assert.equal(report.inference_terminal_outcomes.terminal_without_usage, 1);
+  assert.equal(report.completed_inference, 1);
+  assert.equal(report.cohorts.length, 1);
+  assert.equal(report.cohorts[0].provider, "chatgpt_codex");
+  assert.equal(report.cohorts[0].route, "responses");
+  assert.equal(report.cohorts[0].completed_inference, 1);
+  assert.equal(report.cache_dimension_cohorts.length, 1);
+  assert.equal(report.cache_dimension_cohorts[0].account_cohort_id, routing.account_cohort_id);
+  assert.deepEqual(report.valid_reported_cache_metrics.cache_read, {
+    aggregate_input_tokens: 100,
+    aggregate_cached_input_tokens: 25,
+    ratio: 0.25,
+  });
+  assert.throws(
+    () => analyzeStage0CacheTelemetryLines([terminalLine({ ...routing, active_transition_reason: "model_unavailable_typo" })]),
+    /invalid active_transition_reason field/
+  );
+});
+
 Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplete terminal outcomes", () => {
   const rawCacheKey = "cache-key-secret-must-not-appear";
   const completed = terminalLine({
@@ -364,6 +415,7 @@ Deno.test("Stage 0 cache telemetry analyzer reports bounded failed and incomplet
     quota_exhausted: 2,
     credential_invalid: 1,
     account_removed_or_replaced: 1,
+    model_unavailable: 0,
   });
 
   const failedCohort = outcomes.cohorts.find((cohort) => cohort.outcome === "failed" && cohort.usage_telemetry_status_totals.missing === 1);
