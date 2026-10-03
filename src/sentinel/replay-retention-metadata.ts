@@ -29,7 +29,7 @@ const isTombstone = (value: unknown): value is Readonly<Record<string, unknown>>
   );
 };
 
-const metadataEntryMatches = (entry: Deno.KvEntry<unknown>, prefix: Deno.KvKey): boolean => {
+export const metadataEntryMatches = (entry: Deno.KvEntry<unknown>, prefix: Deno.KvKey): boolean => {
   if (entry.key.length !== prefix.length + 1 || !prefix.every((part, index) => entry.key[index] === part)) return false;
   if (prefix === SENTINEL_REPLAY_REQUEST_PREFIX) {
     return isSentinelReplayCaptureStatusRow(entry.value) && entry.key[prefix.length] === entry.value.request_id;
