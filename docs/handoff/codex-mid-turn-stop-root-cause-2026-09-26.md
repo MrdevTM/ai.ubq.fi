@@ -9,14 +9,14 @@ What stands after all of them:
 
 1. **Codex ends a turn when a whole response contains no tool call.** Verified in source and by measurement. This is the
    mechanism and it is not in dispute.
-2. **The defect the owner reports is real, but it is not specific to the DeepSeek tiers.** On the cleanest measure
-   available — the owner typing `proceed` or a similar continuation instruction after a turn that ended normally — the
-   GPT family stops mid-task about **1.6× as often** as the DeepSeek tiers (0.578% against 0.361%, p = 0.17), and the
-   weakest GPT tiers are the worst.
-3. **The owner's own interruptions must be filtered out of any such measurement.** `thread_turns.status` carries
-   `interrupted` for a stray ESC or a mis-clicked stop button, and those number 1,354 GPT turns against 79 DeepSeek. A
-   metric that ignores this attributes the owner's mis-clicks to the model. This is the error that produced the
-   incorrect DeepSeek-specific result in the first twelve rounds.
+2. **The corpus measures continuation-message frequency, not a mid-task-stop rate.** The recorded frequency of `proceed`
+   or similar replies after a completed turn is 0.578% for the GPT family and 0.361% for DeepSeek (ratio **1.6×**, p =
+   0.17). Such replies can authorize a next step; they do not prove that unfinished authorized work remained. These
+   figures establish no per-model defect ranking.
+3. **Turn status distinguishes interrupted predecessors from completed ones.** The recorded corpus has 1,354 interrupted
+   GPT turns against 79 DeepSeek, including the owner's reported stray ESC or stop-button interruptions. Filtering these
+   is necessary for describing completed predecessors, but a completed status does not make a continuation reply a
+   validated failure label.
 4. **Nothing in this repository was changed, deployed, or pushed while preparing this document.** The gateway patch
    described below is falsified by backtesting; see "Backtest result" and "Proposed patch surface — withdrawn".
 
@@ -28,6 +28,12 @@ What does _not_ stand, and should not be reused:
 - Any use of `ok` as an outcome measure. It is ambiguous between acknowledgement and nudge, and the split differs by
   model.
 
+**Metric correction:** the retained historical rounds below used acknowledgement or continuation replies as failure
+labels without independently verifying unfinished authorized work. Their raw counts, arithmetic and experimental
+provenance are preserved, but their stop-rate comparisons and rate-dependent negative or causal conclusions are
+unvalidated pending a separate correction. Independent source observations remain distinct from those conclusions; no
+experiment or corpus recount was performed for this correction.
+
 Scope: why Codex turns appear to stop before the task is finished, how that interacts with the DeepSeek tiers served by
 this gateway, why DeepSeek Harness (DSH) never exhibits the symptom against the same gateway and the same model, and
 where a scoped LithosAI `-ultra` patch would live if one were warranted.
@@ -38,9 +44,9 @@ A Codex turn ends while work remains. The observable shape is consistent: the as
 me check the files…", "Now holding one long wait on the worker", "Proceeding. Let me read the exact markup…") and the
 turn terminates immediately after. No error, no failure banner. The owner resumes by typing `ok`, `proceed`, or `k`.
 
-The symptom is real to the owner across thousands of turns. What this document retracts is the attribution: the recorded
-evidence does not support it being a DeepSeek-tier property, and points instead at the GPT tiers, with the owner's
-accidental interruptions as a contaminating factor in every earlier measurement.
+The owner reports the symptom across thousands of turns. The recorded reply frequencies do not establish its incidence
+or attribute it to either model family: they mix continuation, authorization and interruption recovery without
+independently validating unfinished authorized work.
 
 ## Round ledger, and what each round established or retracted
 
@@ -320,7 +326,11 @@ serve as a control.
 it. But round 5's replacement correction was itself confounded, and is retracted; the settled position is the
 matched-comparison table under "The round-5 model contrast was confounded".
 
-## Ground-truth signal validated
+## Historical ground-truth validation claim — superseded
+
+The inspection recorded below checked reply text, not whether authorized work was unfinished. It does not validate
+acknowledgement or continuation replies as ground truth for a premature stop; the historical claim and numbers are
+retained here.
 
 The `ok` acknowledgement was treated as ground truth without checking it. It holds up:
 
@@ -789,10 +799,9 @@ The date onset is worth recording anyway, because it narrows what to look for: s
 
 ## The acknowledgement metric was measuring the wrong thing, and this is the central correction
 
-> **Partly superseded.** The observation below — that `ok` does not detect failure — is correct, and the initial
-> conclusion drawn from it was that no defect exists. That went too far. A better continuation signal (`proceed`) shows
-> the defect is real but lies in the GPT family rather than the DeepSeek tiers. See "The corrected outcome measure, and
-> the reversal it produces".
+> **Superseded as an outcome claim.** Neither `ok` nor `proceed` validates a failure without evidence that authorized
+> work remained unfinished. The following section reports continuation-message frequency; it does not establish that a
+> defect is absent or rank model families by defect incidence.
 
 Reading the actual text of the 57 DeepSeek turns a user replied `ok` to changes the interpretation of every measurement
 above. Those turns are not stalls. Their outputs are mid-task narration:
@@ -821,7 +830,7 @@ Note the limit of this measurement, which was missed at the time: a turn that pe
 half-way through a twenty-step job also "contains tool actions". Counting tool activity distinguishes a turn that did
 nothing from one that did something, but not one that did enough from one that stopped short. The conclusion drawn here
 — that there was no failure to reproduce — was therefore wrong in the opposite direction, and the corrected result is
-under "The corrected outcome measure".
+under "Continuation-message frequency, and the changed ordering".
 
 So the metric was counting a normal conversational event — the owner acknowledging a progress update mid-task, or
 replying to a question — and treating it as a failure. The reason the rate was stable, spread across all turn lengths,
@@ -838,39 +847,40 @@ supports a narrower and different statement: DeepSeek's turns end on a text mess
 the next action, which invites the owner to reply and continue. Whether any of those cases genuinely stopped early,
 rather than merely appearing to, cannot be determined from this corpus, and the 94.7% figure says most did not.
 
-## The corrected outcome measure, and the reversal it produces
+## Continuation-message frequency, and the changed ordering
 
-The `ok` count used for thirteen rounds was a poor workaround signal. Enumerating every short user message in the corpus
-gives a much better one: **`proceed`**, 226 occurrences against 62 for `ok`, and unlike `ok` it is an unambiguous
-instruction to continue — nobody tells a finished task to proceed.
+The recorded enumeration found **`proceed`**, 226 occurrences against 62 for `ok`. A continuation instruction is clearer
+about the user's next requested action than an acknowledgement, but it can authorize a new or proposed step after a
+legitimate completion. It does not establish that the preceding turn left authorized work unfinished.
 
-Counting turns that contain a continuation instruction (`proceed`, `continue`, `go ahead`, `keep going`, `finish`,
-`do it`, `next`, `yes`) and comparing families:
+The reported measure counts turns associated with a continuation message (`proceed`, `continue`, `go ahead`,
+`keep going`, `finish`, `do it`, `next`, `yes`) and compares families. The historical query and numbers are preserved;
+these are reply frequencies, not validated stop outcomes:
 
-| Family     | Turns  | Turns with a continuation instruction | Rate      |
-| ---------- | ------ | ------------------------------------- | --------- |
-| DeepSeek   | 3,033  | 35                                    | **1.15%** |
-| GPT family | 13,017 | 200                                   | **1.54%** |
+| Family     | Turns  | Turns with a continuation message | Continuation-message frequency |
+| ---------- | ------ | --------------------------------- | ------------------------------ |
+| DeepSeek   | 3,033  | 35                                | **1.15%**                      |
+| GPT family | 13,017 | 200                               | **1.54%**                      |
 
-Fisher p = 0.13. **The direction is the opposite of the one reported for the first twelve rounds.** On the better
-measure, the GPT family is nudged to continue more often than the DeepSeek tiers, not less, and the difference is not
-significant at this sample size.
+Fisher p = 0.13. The recorded continuation-message ordering is the opposite of the earlier acknowledgement ordering, and
+the frequency difference is not statistically significant at this sample size. Neither ordering measures comparative
+failure incidence.
 
-Per model, the spread that the earlier rounds attributed to the DeepSeek Flash tiers is absent:
+Per-model continuation-message frequencies, with no inferred defect ranking:
 
-| Model                                   | Turns | Continuation turns | Rate  |
-| --------------------------------------- | ----- | ------------------ | ----- |
-| `gpt-5.3-codex-spark`                   | 181   | 7                  | 3.87% |
-| `gpt-5.6-sol`                           | 3,033 | 67                 | 2.21% |
-| `gpt-6-astra`                           | 1,180 | 25                 | 2.12% |
-| `gpt-5.6-luna`                          | 3,934 | 62                 | 1.58% |
-| `gpt-5.6-terra`                         | 2,901 | 38                 | 1.31% |
-| `deepseek-flash`                        | 2,626 | 33                 | 1.26% |
-| `deepseek-ai/DeepSeek-V4.1-Flash-ultra` | 193   | 2                  | 1.04% |
-| `deepseek/deepseek-v4-pro`              | 160   | 0                  | 0.00% |
+| Model                                   | Turns | Continuation-message turns | Continuation-message frequency |
+| --------------------------------------- | ----- | -------------------------- | ------------------------------ |
+| `gpt-5.3-codex-spark`                   | 181   | 7                          | 3.87%                          |
+| `gpt-5.6-sol`                           | 3,033 | 67                         | 2.21%                          |
+| `gpt-6-astra`                           | 1,180 | 25                         | 2.12%                          |
+| `gpt-5.6-luna`                          | 3,934 | 62                         | 1.58%                          |
+| `gpt-5.6-terra`                         | 2,901 | 38                         | 1.31%                          |
+| `deepseek-flash`                        | 2,626 | 33                         | 1.26%                          |
+| `deepseek-ai/DeepSeek-V4.1-Flash-ultra` | 193   | 2                          | 1.04%                          |
+| `deepseek/deepseek-v4-pro`              | 160   | 0                          | 0.00%                          |
 
-Every DeepSeek tier sits at or below every GPT tier with a usable sample. The owner's own reading matches this: the GPT
-family stops more, and the weakest GPT tiers most of all.
+In this recorded table, every DeepSeek tier sits at or below every GPT tier with a usable sample in continuation-message
+frequency. This does not establish which family or tier stops with unfinished authorized work more often.
 
 ### Why the first twelve rounds inverted it
 
@@ -884,68 +894,69 @@ typed `ok`, not in how often turns failed, and the version analysis that grew ou
 
 ### What replaces the earlier conclusion
 
-The defect the owner reports is real and the client is the cause, but its signature is not model-specific in the way
-this document argued. The accurate statement available from this corpus is that a response containing no tool call ends
-the turn, and that all these tiers reach that state routinely. The tiers differ in how often the owner responds with a
-continuation instruction, and on that measure the GPT family is worse.
+The tiers differ in the recorded frequency of continuation replies. The corpus does not distinguish a legitimate
+authorization reply from a nudge after unfinished authorized work, so this measure establishes neither a comparative
+stop rate nor a cause.
 
-> **A `k`-only continuation signal would sharpen this further.** There are zero bare `k` messages in this corpus, so the
-> cleaner signal the owner pointed to is not present in `~/.codex` and its location is still unconfirmed.
+> **A `k`-only signal would still require outcome validation.** There are zero bare `k` messages in this corpus, so the
+> signal the owner pointed to is not present in `~/.codex` and its location is still unconfirmed. A shorter reply alone
+> would not establish unfinished authorized work.
 
-> **Superseded in part by "Separating accidental stops from real ones".** The rates below do not remove accidentally
-> interrupted turns, which are heavily concentrated in the GPT family and which inflate every GPT figure. The direction
-> survives the correction; the magnitudes do not.
+> **Stratified below by predecessor status.** The frequencies above include interrupted predecessors, which are heavily
+> concentrated in the GPT family. The later split describes replies after completed predecessors; it does not validate
+> them as premature-stop outcomes.
 
-## Separating accidental stops from real ones, which is the decisive correction
+## Separating interrupted predecessors from completed predecessors
 
-The owner identified a confound that invalidates the continuation-instruction metric as it was first computed: a
-`proceed` is often typed after an **accidentally interrupted** turn, where a stray ESC or a mis-clicked stop button
-ended the turn by hand. Those are not model failures and must be removed.
+The owner reported that a `proceed` often follows an accidentally interrupted turn, where a stray ESC or a mis-clicked
+stop button ended the turn by hand. Excluding interrupted predecessors removes those cases from the
+completed-predecessor frequency, but it does not establish that the remaining replies indicate model failures.
 
 `thread_turns.status` records this directly, with values `completed`, `interrupted`, `failed`, and `inProgress`.
 Splitting every continuation instruction by the status of the turn it follows:
 
-| Family     | Turns  | Nudge after **completed** | After **interrupted** | After other |
-| ---------- | ------ | ------------------------- | --------------------- | ----------- |
-| DeepSeek   | 3,047  | **11**                    | 2                     | 22          |
-| GPT family | 13,138 | **76**                    | 38                    | 80          |
+| Family     | Turns  | Message after **completed** | After **interrupted** | After other |
+| ---------- | ------ | --------------------------- | --------------------- | ----------- |
+| DeepSeek   | 3,047  | **11**                      | 2                     | 22          |
+| GPT family | 13,138 | **76**                      | 38                    | 80          |
 
-Two distinct facts fall out, and they point in opposite directions:
+The recorded split supports two descriptions:
 
-1. **Accidental stops are overwhelmingly a GPT-family event.** The corpus holds 1,354 interrupted GPT turns against 79
-   DeepSeek, a 17× difference. Whatever the owner is hitting ESC on, it is mostly the GPT runs.
-2. **Real mid-task stops, defined as a continuation instruction after a turn that completed normally**, are still more
-   frequent in the GPT family: 76/13,138 = 0.578% against 11/3,047 = 0.361%. Ratio 1.60×, Fisher p = 0.17.
+1. **Recorded interrupted turns are concentrated in the GPT family.** The corpus holds 1,354 interrupted GPT turns
+   against 79 DeepSeek, a 17× difference. Status alone does not identify every interruption's cause.
+2. **Continuation-message frequency after completed predecessors** is 76/13,138 = 0.578% for GPT against 11/3,047 =
+   0.361% for DeepSeek. Ratio 1.60×, Fisher p = 0.17. A completed predecessor and a continuation reply do not prove
+   unfinished authorized work.
 
 The remaining 84 non-completed predecessors are `failed` turns, and 18 are `inProgress`; both are correctly excluded,
 since a failed turn is not a model stopping short.
 
 ### The corrected conclusion
 
-On the cleanest measure available, the GPT family stops mid-task roughly 1.6 times as often as the DeepSeek tiers, and
-the difference is not statistically significant at this sample size. The DeepSeek-specific defect asserted in the first
-twelve rounds of this document does not exist on this evidence.
+The recorded GPT continuation-message frequency after completed predecessors is roughly 1.6 times the DeepSeek
+frequency, and the difference is not statistically significant at this sample size. This establishes neither a
+DeepSeek-specific defect nor its absence, and it does not validate the owner's reported stops as model-specific
+outcomes.
 
-Per model, on the defect rate alone:
+Per model, on continuation-message frequency after completed predecessors:
 
-| Model                                   | Turns | Mid-task stops | Rate  |
-| --------------------------------------- | ----- | -------------- | ----- |
-| `gpt-5.3-codex-spark`                   | 192   | 4              | 2.08% |
-| `gpt-6-astra`                           | 1,192 | 17             | 1.43% |
-| `deepseek-ai/DeepSeek-V4.1-Flash-ultra` | 193   | 2              | 1.04% |
-| `gpt-5.6-sol`                           | 3,089 | 25             | 0.81% |
-| `gpt-5.6-terra`                         | 2,945 | 14             | 0.48% |
-| `gpt-5.6-luna`                          | 4,005 | 15             | 0.38% |
-| `deepseek-flash`                        | 2,632 | 9              | 0.34% |
-| `deepseek/deepseek-v4-pro`              | 162   | 0              | 0.00% |
+| Model                                   | Turns | Continuation-message turns | Continuation-message frequency |
+| --------------------------------------- | ----- | -------------------------- | ------------------------------ |
+| `gpt-5.3-codex-spark`                   | 192   | 4                          | 2.08%                          |
+| `gpt-6-astra`                           | 1,192 | 17                         | 1.43%                          |
+| `deepseek-ai/DeepSeek-V4.1-Flash-ultra` | 193   | 2                          | 1.04%                          |
+| `gpt-5.6-sol`                           | 3,089 | 25                         | 0.81%                          |
+| `gpt-5.6-terra`                         | 2,945 | 14                         | 0.48%                          |
+| `gpt-5.6-luna`                          | 4,005 | 15                         | 0.38%                          |
+| `deepseek-flash`                        | 2,632 | 9                          | 0.34%                          |
+| `deepseek/deepseek-v4-pro`              | 162   | 0                          | 0.00%                          |
 
-The weakest GPT tiers (`codx-spark`, `astra`) are the worst offenders, and the best DeepSeek tier is in the middle of
-the GPT range rather than at the bottom. This matches the owner's own reading that the GPT family stops more, and that
-its weakest models stop most.
+The table orders these models by recorded continuation-message frequency, not by premature-stop incidence, capability or
+quality. Authorization replies and other legitimate continuations remain possible in every row; external outcome labels
+are required before making a defect ranking.
 
-A residual caution: the interruptions are not evenly distributed across models, so a metric that failed to remove them
-would attribute GPT's accidental stops to whichever family the owner interrupted most. That is exactly what happened in
-the earlier rounds.
+A residual caution: interruptions are not evenly distributed across models. Removing interrupted predecessors changes
+the reply-frequency population but does not resolve the remaining authorization-versus-unfinished-work ambiguity.
 
 ## Root cause
 
