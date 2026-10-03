@@ -38,9 +38,13 @@ receives an empty task: two `deepseek-ai/DeepSeek-V4.1-Flash-ultra` children of 
 assignment arrived as an unreadable blob, and neither edited a file (`agent_message` items carried the plaintext
 envelope and a sealed `encrypted_content` part that this gateway correctly marks omitted). Delegation payloads survive
 only when both ends are served by the same backend: gateway parent to gateway child (deepseek or qwen) works, Codex
-parent to Codex child works, and a cross-backend assignment needs an out-of-band handoff. The recorded convention is a
-file at `/tmp/codex-agent-tasks/<task_name>.md` written by the parent before the spawn and read by the child first,
-which works because the plaintext envelope still carries the task name and sender.
+parent to Codex child works, and a cross-backend assignment needs an out-of-band handoff. Gateway-side unsealing is not
+available: forwarding the same tool schemas with the `encrypted` annotation removed is rejected by the Codex backend
+("Invalid Value: 'tools'. Function 'collaboration.followup_task' is reserved for use by this model and must match the
+configured schema."), so the annotation is enforced server-side and only a client-side change could carry a
+cross-backend payload another way. The recorded convention is a file at `/tmp/codex-agent-tasks/<task_name>.md` written
+by the parent before the spawn and read by the child first, which works because the plaintext envelope still carries the
+task name and sender.
 
 Limits recorded with the same evidence: a sealed payload from a ChatGPT-backed thread stays opaque to this gateway
 because the opening key lives in that backend and the client implements no such crypto, so it is declared rather than
