@@ -777,6 +777,161 @@ Deno.test({
   },
 });
 
+const absentManifestCases = ["matching", "newer", "raced", "malformed", "stored-null", "mismatched", "manifest-read", "dedupe-read"] as const;
+
+type DedupeCommitObservation = {
+  key: Deno.KvKey;
+  checks: Deno.AtomicCheck[];
+  deletesDedupe: boolean;
+  afterCommit: (checks: readonly Deno.AtomicCheck[], result: Deno.KvCommitResult | Deno.KvCommitError) => void;
+};
+
+const observeDedupeAtomic = (operation: Deno.AtomicOperation, observation: DedupeCommitObservation): Deno.AtomicOperation =>
+  new Proxy(operation, {
+    get(atomic, method) {
+      if (method === "commit") {
+        return async () => {
+          const result = await atomic.commit();
+          if (observation.deletesDedupe) observation.afterCommit(observation.checks, result);
+          return result;
+        };
+      }
+      const value = Reflect.get(atomic, method, atomic);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        if (method === "check") observation.checks.push(...(args as Deno.AtomicCheck[]));
+        if (method === "delete" && Array.isArray(args[0]) && args[0].join("\u0000") === observation.key.join("\u0000")) observation.deletesDedupe = true;
+        return observeDedupeAtomic(Reflect.apply(value, atomic, args) as Deno.AtomicOperation, observation);
+      };
+    },
+  });
+
+for (const scenario of absentManifestCases) {
+  Deno.test({
+    name: `claimed payload cleanup preserves provenance after manifest loss: ${scenario}`,
+    ignore: !kvAvailable,
+    sanitizeResources: false,
+    sanitizeOps: false,
+    async fn() {
+      const kv = await Deno.openKv(":memory:");
+      const now = 1_700_550_000_000;
+      const requestId = `absent-manifest-${scenario}`;
+      try {
+        const stored = await persist(kv, newKey(), requestId, HEADROOM_BUDGET_BYTES, now);
+        assert.equal(stored.status, "stored");
+        const manifestKey = await firstManifestKey(kv);
+        assert.notEqual(manifestKey, null);
+        if (manifestKey === null) throw new Error("stored capture has no manifest");
+        const manifest = stored.manifest;
+        const dedupeKey = [...SENTINEL_REPLAY_DEDUPE_PREFIX, manifest.fingerprint];
+        const accountingKey = sentinelReplayAccountingKey(now, manifest.capture_id);
+        const originalDedupe = await kv.get(dedupeKey);
+        assert.deepEqual(originalDedupe.value, {
+          manifest_key: manifestKey,
+          captured_at_ms: now,
+          expires_at_ms: manifest.expires_at_ms,
+        });
+        assert.equal((await countChunkRows(kv, manifest.capture_id)) > 1, true);
+        const partial = await evictSentinelReplays(kv, {
+          target_bytes: 0,
+          max_chunk_deletes: 1,
+          now_ms: now + 1,
+          budget_bytes: HEADROOM_BUDGET_BYTES,
+        });
+        assert.equal(partial.records, 0);
+        assert.equal((await accountingRowOf(kv, accountingKey))?.state, "evicting");
+        const charged = await ledgerOf(kv, HEADROOM_BUDGET_BYTES);
+        assert.equal(charged.stored_bytes, manifest.stored_bytes);
+        // Model native TTL/manual loss of only the manifest after the durable claim.
+        await kv.delete(manifestKey);
+        assert.equal((await kv.get(manifestKey)).versionstamp, null);
+        const replacement = {
+          manifest_key: [...SENTINEL_REPLAY_MANIFEST_PREFIX, now + 60_000, manifest.fingerprint, "newer-capture"],
+          captured_at_ms: now + 60_000,
+          expires_at_ms: manifest.expires_at_ms + 60_000,
+        };
+        if (scenario === "newer") await kv.set(dedupeKey, replacement);
+        if (scenario === "malformed") await kv.set(manifestKey, { not: "a manifest" });
+        if (scenario === "stored-null") await kv.set(manifestKey, null);
+        if (scenario === "mismatched") await kv.set(manifestKey, { ...manifest, capture_id: "other-capture" });
+        const presentManifest = await kv.get(manifestKey);
+        const nativeChecks: Deno.AtomicCheck[] = [];
+        const nativeOutcomes: boolean[] = [];
+        let interleaved = false;
+        const wrapped = new Proxy(kv, {
+          get(target, property) {
+            if (property === "get") {
+              return async (key: Deno.KvKey, options?: { consistency?: Deno.KvConsistencyLevel }) => {
+                const entry = await target.get(key, options);
+                const isManifest = key.join("\u0000") === manifestKey.join("\u0000");
+                const isDedupe = key.join("\u0000") === dedupeKey.join("\u0000");
+                if ((scenario === "manifest-read" && isManifest) || (scenario === "dedupe-read" && isDedupe)) throw new Error("synthetic cleanup read failure");
+                if (scenario === "raced" && isDedupe && !interleaved) {
+                  interleaved = true;
+                  await kv.set(dedupeKey, replacement);
+                  assert.notEqual((await kv.get(dedupeKey)).versionstamp, entry.versionstamp);
+                }
+                return entry;
+              };
+            }
+            if (property === "atomic") {
+              return () =>
+                observeDedupeAtomic(target.atomic(), {
+                  key: dedupeKey,
+                  checks: [],
+                  deletesDedupe: false,
+                  afterCommit: (checks, result) => {
+                    nativeChecks.push(...checks);
+                    nativeOutcomes.push(result.ok);
+                  },
+                });
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        const maintenance = { now_ms: now + 2, budget_bytes: HEADROOM_BUDGET_BYTES };
+        if (scenario === "manifest-read" || scenario === "dedupe-read") {
+          await assert.rejects(() => runSentinelReplayRetentionMaintenance(wrapped, maintenance), /synthetic cleanup read failure/);
+          assert.deepEqual(await ledgerOf(kv, HEADROOM_BUDGET_BYTES), charged, "failed reads must retain the entire charge");
+          assert.equal((await accountingRowOf(kv, accountingKey))?.state, "evicting");
+          assert.deepEqual(await kv.get(dedupeKey), originalDedupe);
+          await runSentinelReplayRetentionMaintenance(kv, maintenance);
+        } else {
+          await runSentinelReplayRetentionMaintenance(wrapped, maintenance);
+        }
+        const newer = scenario === "newer" || scenario === "raced";
+        const present = scenario === "malformed" || scenario === "stored-null" || scenario === "mismatched";
+        const afterDedupe = await kv.get(dedupeKey);
+        const existingDedupe = present ? originalDedupe.value : null;
+        assert.deepEqual(afterDedupe.value, newer ? replacement : existingDedupe);
+        assert.deepEqual(await kv.get(manifestKey), presentManifest, "present malformed or mismatched manifests must survive unchanged");
+        if (scenario === "matching" || scenario === "raced") {
+          assert.deepEqual(nativeChecks, [{ key: dedupeKey, versionstamp: originalDedupe.versionstamp }]);
+          assert.deepEqual(nativeOutcomes, [scenario === "matching"], "native CAS rejects a dedupe overwrite after its read");
+          assert.equal(interleaved, scenario === "raced");
+        } else {
+          assert.deepEqual(nativeOutcomes, []);
+        }
+        assert.equal(await countChunkRows(kv, manifest.capture_id), 0);
+        assert.equal(await accountingRowOf(kv, accountingKey), null);
+        const released = await ledgerOf(kv, HEADROOM_BUDGET_BYTES);
+        assert.equal(released.stored_bytes, 0);
+        assert.equal(released.records, 0);
+        assert.equal(released.evicted_bytes, manifest.stored_bytes);
+        assert.equal(released.evicted_records, 1);
+        if (!present) {
+          await runSentinelReplayRetentionMaintenance(kv, maintenance);
+          assert.deepEqual(await ledgerOf(kv, HEADROOM_BUDGET_BYTES), released, "continuation must release and count the victim only once");
+          assert.deepEqual(await kv.get(dedupeKey), afterDedupe);
+        }
+      } finally {
+        kv.close();
+      }
+    },
+  });
+}
+
 Deno.test({
   name: "status and tombstone pressure is pruned at the metadata reserve and reports not-retained",
   ignore: !kvAvailable,
