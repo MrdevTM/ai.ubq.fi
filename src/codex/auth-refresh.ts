@@ -5,6 +5,7 @@ import { recordCodexProviderHealth } from "../provider/health.ts";
 import { getString, isRecord, sha256Hex } from "../utils.ts";
 import type { CodexAuthPoolState, CodexAuthState } from "../types.ts";
 import type { CodexAuthAccountEntry, CodexErrorCode, CodexRefreshLease } from "./auth.ts";
+import { refreshNativeCodexAuthIfOwned } from "./native-auth.ts";
 import {
   CODEX_AUTH_POOL_KV_KEY,
   CODEX_AUTH_REAUTH_MESSAGE,
@@ -341,6 +342,8 @@ const acquireCodexRefreshLease = async (kv: Deno.Kv, key: Deno.KvKey, initial: C
  * contains only a hash-derived slot key and an opaque owner token.
  */
 const refreshAuthCoordinated = async (input: CodexAuthAccountEntry): Promise<CodexAuthState> => {
+  const native = await refreshNativeCodexAuthIfOwned(input.auth);
+  if (native) return native;
   let current = input;
   try {
     const newest = await getCurrentAccountEntry(input.auth.account_id, true);
@@ -406,6 +409,8 @@ const awaitWithoutCancellingSharedWork = async <T>(promise: Promise<T>, signal?:
 };
 
 const refreshAuthStateless = async (auth: CodexAuthState): Promise<CodexAuthState> => {
+  const native = await refreshNativeCodexAuthIfOwned(auth, true);
+  if (native) return native;
   let response: Response;
   try {
     response = await fetch(CODEX_REFRESH_TOKEN_URL, {
