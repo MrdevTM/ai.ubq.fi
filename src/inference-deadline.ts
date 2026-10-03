@@ -3,12 +3,12 @@ export const OPENAI_DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60_000;
 export const OPENAI_FLEX_REQUEST_TIMEOUT_MS = 15 * 60_000;
 
 /**
- * Wall-clock budget for one inference attempt: provider dispatch, response
+ * Origin wall-clock budget for one inference attempt: provider dispatch, response
  * headers and the first SSE event must all arrive inside it. Once semantic
  * output starts, STREAM_INACTIVITY_DEADLINE_MS bounds the gaps between later
- * events instead. Both were raised from the original 125-second Cloudflare
- * proxy-read bound to 30 minutes so a long agent turn is not cut off at that
- * edge limit.
+ * events instead. These 30-minute origin budgets do not override a proxy's
+ * silent-read timeout. A proxied request can still receive Cloudflare 524 while
+ * the origin attempt remains within its budget.
  */
 export const STREAM_FIRST_EVENT_DEADLINE_MS = 1_800_000;
 export const STREAM_FAILOVER_RESERVE_MS = 15_000;
@@ -30,9 +30,10 @@ export const STREAM_INACTIVITY_DEADLINE_MS = 1_800_000;
 export const PAID_PROVIDER_FIRST_HEADERS_DEADLINE_MS = 120_000;
 
 /**
- * Buffered inference shares the stream first-event budget. It is not bounded by
- * the original 125-second Cloudflare read limit; the caller's own request
- * signal still caps the whole request.
+ * Buffered inference shares the origin stream first-event budget. A silent
+ * buffered response remains subject to Cloudflare's proxy read timeout, which
+ * this origin deadline does not extend. The caller's request signal still caps
+ * the whole request.
  */
 export const INFERENCE_DEADLINE_MS = STREAM_FIRST_EVENT_DEADLINE_MS;
 export const BUFFERED_INFERENCE_DEADLINE_MS = INFERENCE_DEADLINE_MS;
