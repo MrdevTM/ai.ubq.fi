@@ -435,8 +435,8 @@ type PaidProviderAttemptResult = Readonly<{
  * classifies the outcome. The deadline fails a stalled tier closed at a bounded
  * first-headers budget instead of holding the shared 30-minute stream deadline;
  * it never turns a stall into a signal that advances the waterfall. Its timer is
- * cleared as soon as the attempt settles so a delivered response body is never
- * tied to it.
+ * cleared as soon as transport returns headers, before awaited bookkeeping, so
+ * a delivered response body is never tied to it.
  */
 const runSinglePaidProviderAttempt = async (
   body: Record<string, unknown>,
@@ -449,6 +449,7 @@ const runSinglePaidProviderAttempt = async (
   const attemptDeadline = createPaidProviderAttemptDeadline(fallbackSignal);
   try {
     const candidate = await fetchPaidProviderResponses(body, options, attemptDeadline.signal, provider, surplusCatalog, dispatchState);
+    attemptDeadline.clear();
     recordFirstProviderHeaders(options.usageContext);
     const meteredQuotaExhausted = provider === "metered" ? await meteredForbiddenIndicatesQuotaExhaustion(candidate.response, fallbackSignal) : false;
     const classification = paidProviderHealthClassification(provider, candidate.response.status, meteredQuotaExhausted);
