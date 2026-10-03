@@ -261,6 +261,32 @@ const appendMessageItem = (
  * the only shape the Chat contract accepts. A `reasoning` item is carried onto
  * the assistant turn that follows it as `reasoning_content`.
  */
+/**
+ * A sub-agent message envelope. Chat Completions has no agent addressing, so
+ * the envelope becomes a user turn that names its author and recipient; the
+ * client's own multi-agent layer does the routing. An unreadable encrypted
+ * part is declared rather than silently dropped, because the model must not
+ * treat the forwarded text as the whole message.
+ */
+const chatAgentMessageItem = (item: Record<string, unknown>): DeepSeekResponsesResult<Record<string, unknown>> => {
+  const author = getString(item.author) ?? "agent";
+  const recipient = getString(item.recipient) ?? "root";
+  const parts = Array.isArray(item.content) ? item.content : [];
+  const texts: string[] = [];
+  let unreadable = 0;
+  for (const part of parts) {
+    if (!isRecord(part) || Array.isArray(part)) continue;
+    const text = getString(part.text);
+    if (text !== null) {
+      texts.push(text);
+      continue;
+    }
+    if (typeof part.encrypted_content === "string") unreadable += 1;
+  }
+  const notice = unreadable ? `\n[gateway: ${unreadable} encrypted agent-message part(s) were unreadable and omitted]` : "";
+  return { ok: true, value: { role: "user", content: `[agent message] ${author} -> ${recipient}:\n${texts.join("\n")}${notice}` } };
+};
+
 const appendInputItem = (
   messages: Record<string, unknown>[],
   rawItem: unknown,
@@ -292,6 +318,12 @@ const appendInputItem = (
     const result = chatToolResultItem(rawItem, reduction, `${path}.output`, elisions);
     if (!result.ok) return result;
     messages.push(result.value);
+    return { ok: true, value: undefined };
+  }
+  if (type === "agent_message") {
+    const agentMessage = chatAgentMessageItem(rawItem);
+    if (!agentMessage.ok) return agentMessage;
+    messages.push(agentMessage.value);
     return { ok: true, value: undefined };
   }
   if (type !== "message") return failure("input.type", `input item type '${type}' is not supported`);

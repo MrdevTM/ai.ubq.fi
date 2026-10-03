@@ -583,6 +583,32 @@ Deno.test("deepseek responses: a streamed freeform call emits custom tool events
   ]);
 });
 
+Deno.test("deepseek responses: projects a sub-agent message envelope onto a user turn", () => {
+  const result = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "delegate this" }] },
+      {
+        type: "agent_message",
+        author: "/root/probe_qwen2",
+        recipient: "/root",
+        content: [
+          { type: "input_text", text: "ok" },
+          { type: "encrypted_content", encrypted_content: "AAAA" },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, [
+    { role: "user", content: "delegate this" },
+    {
+      role: "user",
+      content: "[agent message] /root/probe_qwen2 -> /root:\nok\n[gateway: 1 encrypted agent-message part(s) were unreadable and omitted]",
+    },
+  ]);
+});
+
 Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
   const schema = toDeepSeekResponsesChatBody({ input: "hi", text: { format: { type: "json_schema", name: "x" } } }, "deepseek-flash", false);
   assert.equal(schema.ok, false);
