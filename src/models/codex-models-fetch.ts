@@ -381,8 +381,9 @@ export const preserveCodexDefaultModel = (snapshot: CodexModelsSnapshot, candida
 export const loadFullCodexModelsSnapshot = async (kvOverride?: Deno.Kv | null): Promise<CodexModelsSnapshot | null> => {
   const kv = kvOverride === undefined ? await getKv() : kvOverride;
   if (!kv) return null;
-  const entry = await kv.get<CodexModelsSnapshot>(CODEX_MODELS_KV_KEY, { consistency: "strong" });
-  const snapshot = entry.value;
+  // This optional snapshot may be unavailable while the runtime catalog still serves.
+  const entry = await kv.get<CodexModelsSnapshot>(CODEX_MODELS_KV_KEY, { consistency: "strong" }).catch(() => null);
+  const snapshot = entry?.value;
   if (!snapshot || !Array.isArray(snapshot.models) || snapshot.models.length === 0) return null;
   if (snapshot.models.some((model) => !isRecord(model))) return null;
   if (!getString(snapshot.source)?.trim()) return null;
