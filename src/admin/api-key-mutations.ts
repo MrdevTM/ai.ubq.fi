@@ -19,6 +19,7 @@ import { hasStrictPaidFallbackKeyPolicy, initializePaidFallbackPolicy, paidFallb
 import { deletePaidFallbackStateV3 } from "../paid-fallback/ledger-admission.ts";
 import { paidFallbackDeletionGuardV3Key } from "../paid-fallback/ledger-state.ts";
 import { getKv } from "../kv.ts";
+import { LOCAL_DEVELOPMENT_KEY_ID, type LocalDevelopmentDeletionGuard } from "../auth/local-development-key.ts";
 import { readJsonBody } from "../request.ts";
 import { getString, isRecord } from "../utils.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, ApiKeyUsageWindowV3 } from "../types.ts";
@@ -628,6 +629,77 @@ export const handleAdminApiKeysUnrevoke = async (req: Request): Promise<Response
   );
 };
 
+type LocalApiKeyDeletionClaim = Readonly<{
+  guard: LocalDevelopmentDeletionGuard;
+  check: Readonly<{ key: Deno.KvKey; versionstamp: string }>;
+}>;
+
+const retryableLocalDeletionGuard = (value: unknown): LocalDevelopmentDeletionGuard | null => {
+  if (!isRecord(value) || !isRecord(value.local_deletion)) return null;
+  if (typeof value.created_at_ms !== "number" || !Number.isSafeInteger(value.created_at_ms) || value.created_at_ms <= 0) return null;
+  if (value.local_deletion.owner !== null || value.local_deletion.completed_at_ms !== null) return null;
+  return { created_at_ms: value.created_at_ms, local_deletion: { owner: null, completed_at_ms: null } };
+};
+
+const claimLocalDeletion = async (
+  kv: Deno.Kv,
+  entry: Deno.KvEntryMaybe<ApiKeyRecord>,
+  deletionGuard: Deno.KvEntryMaybe<unknown>
+): Promise<LocalApiKeyDeletionClaim | Response> => {
+  const retryable = retryableLocalDeletionGuard(deletionGuard.value);
+  if (deletionGuard.value && !retryable) return openaiError(409, "Local API key deletion already has an owner", "paid_fallback_deletion_in_progress");
+  const guard: LocalDevelopmentDeletionGuard = {
+    created_at_ms: retryable?.created_at_ms ?? Date.now(),
+    local_deletion: { owner: crypto.randomUUID(), completed_at_ms: null },
+  };
+  const claim = await kv.atomic().check(entry).check(deletionGuard).set(deletionGuard.key, guard).commit();
+  return claim.ok
+    ? { guard, check: { key: deletionGuard.key, versionstamp: claim.versionstamp } }
+    : openaiError(409, "Local API key deletion was claimed concurrently", "paid_fallback_deletion_in_progress");
+};
+
+const prepareDeletionGuard = async (
+  kv: Deno.Kv,
+  id: string,
+  entry: Deno.KvEntryMaybe<ApiKeyRecord>,
+  deletionGuard: Deno.KvEntryMaybe<unknown>
+): Promise<LocalApiKeyDeletionClaim | Response | null> => {
+  if (id === LOCAL_DEVELOPMENT_KEY_ID) return await claimLocalDeletion(kv, entry, deletionGuard);
+  if (deletionGuard.value) return null;
+  const commit = await kv.atomic().check(entry).check(deletionGuard).set(deletionGuard.key, { created_at_ms: Date.now() }).commit();
+  return commit.ok ? null : openaiError(409, "API key was modified concurrently; retry", "invalid_request_error");
+};
+
+/** Only a known refusal before ID deletion releases ownership for explicit retry. */
+const releaseLocalDeletionClaim = async (kv: Deno.Kv, entry: Deno.KvEntryMaybe<ApiKeyRecord>, claim: LocalApiKeyDeletionClaim | null): Promise<void> => {
+  if (!claim) return;
+  await kv
+    .atomic()
+    .check(entry)
+    .check(claim.check)
+    .set(claim.check.key, {
+      ...claim.guard,
+      local_deletion: { owner: null, completed_at_ms: null },
+    })
+    .commit();
+};
+
+const completeLocalDeletion = async (kv: Deno.Kv, idKey: Deno.KvKey, claim: LocalApiKeyDeletionClaim | null): Promise<Response | null> => {
+  if (!claim) return null;
+  const absentId = await kv.get(idKey, { consistency: "strong" });
+  if (absentId.value) return openaiError(409, "Local API key deletion ownership changed", "paid_fallback_deletion_in_progress");
+  const completion = await kv
+    .atomic()
+    .check(absentId)
+    .check(claim.check)
+    .set(claim.check.key, {
+      ...claim.guard,
+      local_deletion: { ...claim.guard.local_deletion, completed_at_ms: Date.now() },
+    })
+    .commit();
+  return completion.ok ? null : openaiError(409, "Local API key deletion ownership changed", "paid_fallback_deletion_in_progress");
+};
+
 export const handleAdminApiKeysDelete = async (req: Request): Promise<Response> => {
   const kv = await getKv();
   if (!kv) {
@@ -649,12 +721,8 @@ export const handleAdminApiKeysDelete = async (req: Request): Promise<Response> 
 
   const deletionGuardKey = paidFallbackDeletionGuardV3Key(id);
   const deletionGuard = await kv.get(deletionGuardKey, { consistency: "strong" });
-  if (!deletionGuard.value) {
-    const guardCommit = await kv.atomic().check(entry).check(deletionGuard).set(deletionGuardKey, { created_at_ms: Date.now() }).commit();
-    if (!guardCommit.ok) {
-      return openaiError(409, "API key was modified concurrently; retry", "invalid_request_error");
-    }
-  }
+  const localDeletionClaim = await prepareDeletionGuard(kv, id, entry, deletionGuard);
+  if (localDeletionClaim instanceof Response) return localDeletionClaim;
 
   let paidFallbackDeletion: Awaited<ReturnType<typeof deletePaidFallbackStateV3>>;
   try {
@@ -663,12 +731,15 @@ export const handleAdminApiKeysDelete = async (req: Request): Promise<Response> 
     console.error("[ai.ubq.fi] Failed to clean V3 paid fallback state before API key deletion:", {
       error,
     });
+    await releaseLocalDeletionClaim(kv, entry, localDeletionClaim);
     return openaiError(500, "Failed to prepare paid fallback state for API key deletion", "server_error");
   }
   if (paidFallbackDeletion.kind === "unavailable") {
+    await releaseLocalDeletionClaim(kv, entry, localDeletionClaim);
     return openaiError(500, "Deno KV is not available; cannot inspect paid fallback billing", "server_error");
   }
   if (paidFallbackDeletion.kind === "blocked") {
+    await releaseLocalDeletionClaim(kv, entry, localDeletionClaim);
     const outstandingPaidFallback = paidFallbackDeletion.outstanding;
     return openaiError(
       409,
@@ -681,6 +752,7 @@ export const handleAdminApiKeysDelete = async (req: Request): Promise<Response> 
   }
 
   const atomic = kv.atomic().check(entry).delete(idKey).delete(apiKeyHashKey(entry.value.hash)).delete(apiKeyUsageKey(id)).delete(apiKeyUsageDailyKey(id));
+  if (localDeletionClaim) atomic.check(localDeletionClaim.check);
 
   const commit = await atomic.commit();
   if (!commit.ok) {
@@ -698,6 +770,9 @@ export const handleAdminApiKeysDelete = async (req: Request): Promise<Response> 
     await kv.delete(counterEntry.key);
   }
   await deleteApiKeyUsageV3(kv, id);
+
+  const completionError = await completeLocalDeletion(kv, idKey, localDeletionClaim);
+  if (completionError) return completionError;
 
   return json(200, { id }, { "x-uos-upstream": "chatgpt_codex" });
 };
