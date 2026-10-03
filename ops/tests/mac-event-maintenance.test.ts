@@ -32,7 +32,8 @@ const isolatedBefore = await isolated.get(["isolation"]);
 const logRows = [];
 const state = { intervalArms: 0, intervalCallbacks: [], startupReconciles: 0, startupPrunes: 0,
   startupSettled: 0, stopCalls: 0, stopSettled: 0, closeCalls: 0, providerReads: 0,
-  sameKv: false, nativeOpenCalls: 0, shutdownTelemetry: 0, serveCalls: 0 };
+  sameKv: false, nativeOpenCalls: 0, shutdownTelemetry: 0, serveCalls: 0,
+  actualHostOs: Deno.build.os, targetEntryOs: "darwin" };
 globalThis.maintenanceFixture = state;
 globalThis.setInterval = (callback) => { state.intervalArms += 1; state.intervalCallbacks.push(callback); return 1; };
 globalThis.clearInterval = () => {};
@@ -113,6 +114,11 @@ mac.close = () => {
   console.log(JSON.stringify({ fixture: "mac-event-maintenance", ...state, intervalCallbacks: undefined }));
   close();
 };
+// Only this disposable child presents the Mac capability to the unchanged entry.
+// A facade can shadow readonly build metadata without redefining it or violating Proxy invariants.
+const entryDeno = Object.create(Deno, { build: { value: Object.freeze({ ...Deno.build, os: state.targetEntryOs }) } });
+Object.defineProperty(globalThis, "Deno", { value: entryDeno });
+assert.equal(Deno.build.os, state.targetEntryOs);
 const entry = import(${JSON.stringify(`${fixture}/.data/releases/${revision}/scripts/serve-mac.ts`)});
 await waitFor(() => state.serveCalls === 1 && state.startupSettled === 2, "startup maintenance did not settle");
 assert.equal(await getKv(), mac);
@@ -268,7 +274,9 @@ Deno.test("Mac entry preserves startup and same-KV event maintenance without per
     assert.equal(probe.nativeOpenCalls, 1);
     assert.equal(probe.serveCalls, 1);
     assert.equal(probe.shutdownTelemetry, 1);
-    console.info(JSON.stringify({ fixtureManifest: hashes, probe }));
+    assert.equal(probe.actualHostOs, Deno.build.os);
+    assert.equal(probe.targetEntryOs, "darwin");
+    console.info(JSON.stringify({ fixtureManifest: { ...hashes, actualHostOs: Deno.build.os, targetEntryOs: "darwin" }, probe }));
   } finally {
     await Deno.remove(fixture, { recursive: true });
   }
