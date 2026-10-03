@@ -1260,3 +1260,16 @@ Client catalog ETags are hashes of the final bytes served to that client, in bot
 Raw upstream ETags remain source metadata used only for upstream conditional fetches. Enrichment that changes the served
 body changes its client validator even when upstream metadata is unchanged; only a validator for the current served body
 permits a client 304 response.
+
+## Supported VPS activation recovery - 2026-10-03
+
+For supported VPS releases, same-SHA retry uses a private atomic deployment-owned recovery receipt under the existing
+deploy lock, binding the candidate and previous full SHA, source archive and complete immutable tree digests, exact
+selectors, verified fixed listener port and known launcher/unit profile. Before ingress changes, a failed candidate
+restores the supported previous selector and actual listener/public identity; daemon-reload refusal restores only the
+selector and issues no gateway restart. After successful ingress reload, a public verification failure retains the ready
+candidate and ingress-applied intent for nondestructive same-SHA verification retry. Candidate bytes remain immutable,
+and pruning occurs only after exact loopback and public identity acceptance. Unsupported or historical root-relative
+launchers are refused before destructive activation; successful historical restoration and first-deployment rollback
+remain separate unresolved scopes. The normal deployment command must permit the verified prior loopback port, and
+verify/CI must provide the scoped shell and loopback capabilities required by every actual launcher fixture.
