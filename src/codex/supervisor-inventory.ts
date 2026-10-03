@@ -210,6 +210,23 @@ type ThreadProbe = {
   sampled: boolean;
 };
 
+const resolvedLiveThreadOf = (listed: ListedThread | null, probed: ListedThread | null): ListedThread | null => {
+  if (!listed) return probed;
+  if (!probed) return listed;
+  return {
+    id: listed.id,
+    name: listed.name ?? probed.name,
+    preview: listed.preview ?? probed.preview,
+    cwd: listed.cwd ?? probed.cwd,
+    model: listed.model ?? probed.model,
+    effort: listed.effort ?? probed.effort,
+    sourceKind: listed.sourceKind ?? probed.sourceKind,
+    parentThreadId: listed.parentThreadId ?? probed.parentThreadId,
+    updatedAtMs: listed.updatedAtMs ?? probed.updatedAtMs,
+    modelProvider: listed.modelProvider ?? probed.modelProvider,
+  };
+};
+
 const listedThreadOf = (value: unknown): ListedThread | null => {
   if (!isRecord(value)) return null;
   const id = textOrNull(value.id);
@@ -429,7 +446,7 @@ export const sessionFromParts = (input: {
   unavailable: string[];
 }): SupervisorSession => {
   const { metadata, listed, probe } = input;
-  const live = listed ?? (probe ? probe.thread : null);
+  const live = resolvedLiveThreadOf(listed, probe?.thread ?? null);
   const title = supervisorTitleOf(live, metadata);
   const fields = supervisorLiveFieldsOf(live, metadata);
   const activeFlags = probe ? probe.activeFlags : [];
@@ -547,7 +564,8 @@ const sampleSource = async (source: SupervisorSource, signal: AbortSignal): Prom
 
     const listedById = new Map<string, ListedThread>(listing.threads.map((thread) => [thread.id, thread]));
     const rowIds = uniqueStrings([...listedIds, ...probeIds]);
-    const liveThreadOf = (threadId: string): ListedThread | null => listedById.get(threadId) ?? probeById.get(threadId)?.thread ?? null;
+    const liveThreadOf = (threadId: string): ListedThread | null =>
+      resolvedLiveThreadOf(listedById.get(threadId) ?? null, probeById.get(threadId)?.thread ?? null);
     const childrenOf = childrenByParent(rowIds, liveThreadOf, metadata.rows);
     const lineageAvailable =
       listing.threads.length > 0 || probes.some((probe) => probe.thread !== null) || (source.codexHome !== null && metadata.reason === null);
