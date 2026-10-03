@@ -108,7 +108,6 @@ const withDefaultLevel = (
   advertised: readonly ReasoningEffort[],
   defaultLevel: ReasoningEffort | null
 ): { levels: readonly ReasoningEffort[]; defaultLevel: ReasoningEffort | null } => {
-  if (!advertised.length) return { levels: [], defaultLevel };
   const levels = [...advertised];
   return { levels: defaultLevel && !levels.includes(defaultLevel) ? [...levels, defaultLevel] : levels, defaultLevel };
 };
