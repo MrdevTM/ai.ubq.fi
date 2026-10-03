@@ -116,7 +116,7 @@ export const recordSystemOneResponseHealth = (status: number): void => {
     void recordOpenRouterProviderHealth("auth_invalid", status, Date.now);
     return;
   }
-  if (status === 429) {
+  if (status === 402 || status === 429) {
     void recordOpenRouterProviderHealth("quota_exhausted", status, Date.now);
     return;
   }
