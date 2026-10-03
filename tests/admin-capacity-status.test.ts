@@ -85,3 +85,71 @@ Deno.test("unavailable, stale and expired access retain warnings, while inferenc
     assert.equal(refresh?.children[1].textContent, `Failed · ${provider.health.last_refresh_at_ms}`);
   }
 });
+
+const retentionContext = { errorsRetention: new TestElement() };
+runInNewContext(
+  [
+    ["const numberFormatter", "const compactNumberFormatter"],
+    ["const toNumber", "const formatCompactNumber"],
+    ["const formatRetentionBytes", "const invalidateAdminErrors"],
+  ]
+    .map(([start, end]) => {
+      const from = sourceText.indexOf(start);
+      const to = sourceText.indexOf(end, from);
+      assert.ok(from >= 0 && to > from, `shipped retention fixture boundary ${start}`);
+      return sourceText.slice(from, to);
+    })
+    .concat("globalThis.render = renderErrorsRetention;")
+    .join("\n"),
+  retentionContext,
+  { timeout: 1000 }
+);
+const retentionPresenter = retentionContext as typeof retentionContext & { render: (payload: unknown) => void };
+const validRetention: Record<string, unknown> = {
+  state: "ok",
+  stored_bytes: 2 * 1024 ** 2,
+  reserved_bytes: 1024 ** 2,
+  budget_bytes: 1024 ** 3,
+  records: 12,
+};
+
+Deno.test("shipped retention renderer preserves measured zero, normal accounting and storage warnings", () => {
+  retentionPresenter.render({ retention: validRetention });
+  assert.equal(retentionContext.errorsRetention.textContent, "Capture storage 3 MiB of 1 GiB · 12 recordings.");
+  retentionPresenter.render({ retention: { ...validRetention, stored_bytes: 0, reserved_bytes: 0, records: 0 } });
+  assert.equal(retentionContext.errorsRetention.textContent, "Capture storage 0 KiB of 1 GiB · 0 recordings.");
+  retentionPresenter.render({
+    retention: { ...validRetention, evicted_records: 2, skipped_reason: "storage_full" },
+    log_files: { total_bytes: 2 * 1024 ** 3, warning: true },
+  });
+  assert.match(retentionContext.errorsRetention.textContent, /Oldest recordings were removed/);
+  assert.match(retentionContext.errorsRetention.textContent, /Newest recording skipped: not enough space/);
+  assert.match(retentionContext.errorsRetention.textContent, /Gateway text logs 2 GiB/);
+  assert.match(retentionContext.errorsRetention.textContent, /Text logs reached 1 GiB; rotation is separate/);
+  retentionPresenter.render({ retention: { ...validRetention, near_capacity: true } });
+  assert.match(retentionContext.errorsRetention.textContent, /Approaching the storage limit/);
+});
+
+Deno.test("shipped retention renderer refuses unavailable or corrupt accounting without hiding log warnings", () => {
+  const invalid: unknown[] = [
+    undefined,
+    null,
+    { ...validRetention, state: "unavailable" },
+    { ...validRetention, state: "corrupt" },
+    { ...validRetention, stored_bytes: null, reserved_bytes: null, records: null, accounting_error: "ledger_corrupt" },
+    { ...validRetention, stored_bytes: Number.MAX_VALUE, reserved_bytes: Number.MAX_VALUE },
+  ];
+  for (const field of ["stored_bytes", "reserved_bytes", "budget_bytes", "records"]) {
+    const missing = { ...validRetention };
+    Reflect.deleteProperty(missing, field);
+    invalid.push(missing);
+    for (const value of [null, undefined, NaN, Infinity, -Infinity, -1, "0"]) invalid.push({ ...validRetention, [field]: value });
+  }
+  for (const retention of invalid) {
+    retentionPresenter.render({ retention, log_files: { total_bytes: 2 * 1024 ** 3, warning: true } });
+    assert.equal(
+      retentionContext.errorsRetention.textContent,
+      "Capture storage usage unavailable · Gateway text logs 2 GiB · Text logs reached 1 GiB; rotation is separate."
+    );
+  }
+});
