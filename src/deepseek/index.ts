@@ -215,6 +215,8 @@ export type DeepSeekChatCompletionsOptions = Readonly<{
   beforeDispatch?: (() => Promise<ApiKeyProviderDispatch>) | (() => void);
   onDispatch?: () => void;
   onHeaders?: () => void;
+  /** Observes the exact projected body serialized for this dispatch, before any admission await. */
+  onProjectedBody?: (body: Record<string, unknown>) => void;
   /** Request-owned passive recorder; best effort, never required. */
   sentinelUpstreamRecorder?: SentinelUpstreamRecorder;
 }>;
@@ -389,8 +391,10 @@ export const fetchDeepSeekChatCompletions = async (
   options: DeepSeekChatCompletionsOptions = {}
 ): Promise<Response> => {
   let encodedBody: string;
+  let projectedBody: Record<string, unknown>;
   try {
-    encodedBody = JSON.stringify(projectDeepSeekRequest(body, requestedModel));
+    projectedBody = projectDeepSeekRequest(body, requestedModel);
+    encodedBody = JSON.stringify(projectedBody);
   } catch (error) {
     if (error instanceof DeepSeekError) throw error;
     throw new DeepSeekError("Chat Completions requests must use a JSON-serializable body.", "deepseek_request_invalid", 400);
@@ -398,6 +402,8 @@ export const fetchDeepSeekChatCompletions = async (
   if (typeof encodedBody !== "string") {
     throw new DeepSeekError("Chat Completions requests must use a JSON-serializable body.", "deepseek_request_invalid", 400);
   }
+
+  options.onProjectedBody?.(projectedBody);
 
   const apiKey = requireDeepSeekApiKey(options.apiKey);
   const headers = new Headers({
