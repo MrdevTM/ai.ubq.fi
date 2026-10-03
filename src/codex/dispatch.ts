@@ -140,7 +140,11 @@ const recordCodexResponseHealth = async (
 const recordCodexThrownHealth = async (accountId: string, error: unknown): Promise<void> => {
   if (
     error instanceof CodexError &&
-    (error.code === "codex_auth_refresh_failed" || error.code === "refresh_token_reused" || error.code === "codex_auth_refresh_unreachable")
+    (error.code === "codex_auth_refresh_failed" ||
+      error.code === "refresh_token_reused" ||
+      error.code === "codex_auth_refresh_unreachable" ||
+      error.code === "codex_auth_owner_unavailable" ||
+      error.code === "codex_auth_owner_conflict")
   ) {
     return;
   }

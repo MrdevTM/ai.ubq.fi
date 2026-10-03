@@ -26,6 +26,28 @@ poll cadence only repeats upstream probes, and making the read await an unbounde
 the persisted-only boundary avoided. The probe itself stays read-only: usage reads with existing credentials, no OAuth
 refresh, inference, account, provider-selection, or quota-accounting change.
 
+## The Mac gateway delegates a shared CLI credential lineage to native Codex - 2026-10-02
+
+Only exact account and credential equality binds the local CLI file account to a durable `native_owner` in its KV pool
+entry. The gateway then requests refresh from the existing native daemon, verifies its `initialize.codexHome` and
+ChatGPT identity, and adopts the same-account persisted generation with pool CAS; it never writes `auth.json` or
+performs its own OAuth for that owner. Uploaded sibling accounts retain their existing refresh path. Upload and repair
+cannot erase the binding or replace it with stale credentials.
+
+A changed generation requires a usable access token and nonregressing access expiry. When two native rotations share a
+JWT expiry, the native owner's persisted `last_refresh` orders them, including its submillisecond precision. This
+metadata never bootstraps ownership, and filesystem mtime never selects a credential source. Missing or mismatched
+files, daemon failures and inconclusive replies refuse gateway refresh with local owner errors; they do not establish
+current-credential invalidity or quota exhaustion.
+
+The observed CLI sessions share one native daemon, whose in-process semaphore serializes refreshes. Independent native
+processes have no cross-process mutex; guarded reload and reuse recovery remain necessary. This change preserves CLI
+sign-in and sync and does not repair an external stale sync writer or change VPS credentials, service permissions or
+configuration.
+
+Status: focused synthetic ownership, existing auth regressions and concurrent native CLI/gateway loopback acceptance
+passed. The native proof used strict HTTPS and a task-owned test CA; no real credentials were refreshed by this work.
+
 ## `/v1/live` calls are bound to the authenticated gateway principal that created them - 2026-10-02
 
 Call creation resolves the authenticated principal (`resolveIdempotencyPrincipal`, e.g. `api-key:<key_id>`) and persists
