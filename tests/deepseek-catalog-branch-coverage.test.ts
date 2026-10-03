@@ -513,16 +513,51 @@ Deno.test("chat projection: the caller's own reasoning survives the trailing fil
 import {
   DEEPSEEK_CHAT_COMPLETIONS_URL,
   DEEPSEEK_PRO_MODEL,
+  DEEPSEEK_V4_FLASH_MODEL,
   DeepSeekError,
   deepSeekFinishDisposition,
   deepSeekThinkingModeForbiddenToolChoice,
   deepSeekThinkingToolChoiceConflict,
   deepSeekToolChoiceThinkingConflictMessage,
+  deepSeekUpstreamModelFor,
   fetchDeepSeekChatCompletions,
   normalizeDeepSeekChatCompletion,
   normalizeDeepSeekChatCompletionChunk,
   normalizeDeepSeekProviderRequestId,
+  projectDeepSeekRequest,
 } from "../src/deepseek/index.ts";
+
+Deno.test("DeepSeek model lookup preserves canonical models, the legacy alias and normalized ids", () => {
+  for (const [requested, upstream] of [
+    [MODEL, MODEL],
+    [DEEPSEEK_PRO_MODEL, DEEPSEEK_PRO_MODEL],
+    [DEEPSEEK_V4_FLASH_MODEL, MODEL],
+    [" DEEPSEEK-FLASH ", MODEL],
+    [" DEEPSEEK-V4-PRO ", DEEPSEEK_PRO_MODEL],
+    [" DEEPSEEK-V4-FLASH ", MODEL],
+  ]) {
+    assert.equal(deepSeekUpstreamModelFor(requested), upstream);
+    assert.equal(projectDeepSeekRequest({ messages: [{ role: "user", content: "hi" }] }, requested).model, upstream);
+    const responses = toDeepSeekResponsesChatBody({ input: "hi" }, requested, false);
+    assert.ok(responses.ok);
+    assert.equal(responses.value.body.model, upstream);
+  }
+});
+
+for (const model of ["constructor", "__proto__", "toString"]) {
+  Deno.test(`DeepSeek model lookup rejects prototype name ${model} in both request projections`, () => {
+    assert.equal(deepSeekUpstreamModelFor(model), null);
+    assert.throws(
+      () => projectDeepSeekRequest({ messages: [{ role: "user", content: "hi" }] }, model),
+      (error: unknown) => error instanceof DeepSeekError && error.code === "deepseek_request_invalid" && error.status === 400
+    );
+    assert.deepEqual(toDeepSeekResponsesChatBody({ input: "hi" }, model, false), {
+      ok: false,
+      param: "model",
+      message: `model '${model}' is not a DeepSeek official model`,
+    });
+  });
+}
 
 const completionPayload = (message: Record<string, unknown>, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
   id: "chatcmpl-deepseek",

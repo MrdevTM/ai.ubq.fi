@@ -503,6 +503,31 @@ Deno.test("upstream wire: the redacted diagnostic keeps only gateway-owned codes
   ]);
 });
 
+Deno.test("upstream wire: redacted Codex ownership diagnostics preserve codes without leaking private errors", () => {
+  const logged: unknown[][] = [];
+  const original = console.error;
+  const messageMarker = "SECRET_MESSAGE_793";
+  const causeMarker = "SECRET_CAUSE_793";
+  const unknownCodeMarker = "unknown_SECRET_CODE_793";
+  const cause = new Error(causeMarker);
+  console.error = (...args: unknown[]) => logged.push(args);
+  try {
+    logRedactedUpstreamError("label", new CodexError(messageMarker, "codex_auth_owner_conflict", 409, cause));
+    logRedactedUpstreamError("label", new CodexError(messageMarker, "codex_auth_owner_unavailable", 503, cause));
+    logRedactedUpstreamError("label", new CodexError(messageMarker, unknownCodeMarker as never, 503, cause));
+  } finally {
+    console.error = original;
+  }
+
+  assert.deepEqual(logged, [
+    ["label", { error_class: "CodexError", status: 409, code: "codex_auth_owner_conflict" }],
+    ["label", { error_class: "CodexError", status: 503, code: "codex_auth_owner_unavailable" }],
+    ["label", { error_class: "CodexError", status: 503, code: null }],
+  ]);
+  const output = JSON.stringify(logged);
+  for (const marker of [messageMarker, causeMarker, unknownCodeMarker]) assert.equal(output.includes(marker), false);
+});
+
 Deno.test("upstream wire: provider request ids are bounded, printable and trimmed", () => {
   assert.equal(normalizeProviderRequestId("  req-1  "), "req-1");
   assert.equal(normalizeProviderRequestId(undefined), null);

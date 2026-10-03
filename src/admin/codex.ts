@@ -358,7 +358,13 @@ const persistCodexAuthState = async (
   | { ok: false; response: Response }
 > => {
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const attemptResult = await persistCodexAuthStateAttempt(kv, input);
+    let attemptResult: CodexAuthPersistAttempt;
+    try {
+      attemptResult = await persistCodexAuthStateAttempt(kv, input);
+    } catch (error) {
+      if (!(error instanceof CodexError)) throw error;
+      return { ok: false, response: openaiError(error.status, error.message, error.code) };
+    }
     if (attemptResult.kind === "retry") continue;
     if (attemptResult.kind === "response") return { ok: false, response: attemptResult.response };
     return { ok: true, pool: attemptResult.pool, snapshot: attemptResult.snapshot, runtimeConfig: attemptResult.runtimeConfig };

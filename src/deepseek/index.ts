@@ -288,7 +288,7 @@ const requireDeepSeekApiKey = (supplied: string | null | undefined): string => {
  */
 export const deepSeekUpstreamModelFor = (model: string): string | null => {
   const normalized = model.trim().toLowerCase();
-  return DEEPSEEK_UPSTREAM_MODEL_BY_ID[normalized] ?? null;
+  return Object.hasOwn(DEEPSEEK_UPSTREAM_MODEL_BY_ID, normalized) ? DEEPSEEK_UPSTREAM_MODEL_BY_ID[normalized] : null;
 };
 
 /** Maps a requested reasoning tier onto the documented DeepSeek wire tier. */

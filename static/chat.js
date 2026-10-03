@@ -906,6 +906,7 @@ const sendPrompt = async () => {
     let pendingStreamFlush = null;
     const flushAssistantText = () => {
       pendingStreamFlush = null;
+      if (assistantEl.dataset.streaming === undefined) return;
       setChatMessageContent(assistantEl, assistantText);
       messagesEl.scrollTop = messagesEl.scrollHeight;
     };

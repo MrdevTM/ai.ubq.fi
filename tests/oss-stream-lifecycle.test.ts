@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { DEEPSEEK_RESPONSES_PROFILE } from "../src/deepseek/responses.ts";
+import { iterateDeepSeekChatCompletionStream } from "../src/deepseek/stream.ts";
+import { createResponseTelemetryState, type UsageTokens } from "../src/openai-telemetry.ts";
+import { relayChatCompletionStream, relayResponsesStream, type ProviderStreamAdapter, type ProviderStreamFrame } from "../src/provider/stream-relay.ts";
 import {
   appendResponsesPrecommitEvent,
   createOwnedResponsesStream,
@@ -138,6 +142,183 @@ const probeUpstream = (produce?: (pullIndex: number) => Uint8Array | null): Upst
 const releaseProbe = async (probe: UpstreamProbe): Promise<void> => {
   if (!probe.stream.locked) await probe.stream.cancel("test cleanup").catch(() => {});
 };
+
+/** The real DeepSeek parser owns the body; a gated generator finally exposes settlement ordering. */
+const providerRelayFixture = (wire: "chat" | "responses") => {
+  const chunk = {
+    id: "chatcmpl_lifecycle",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "deepseek-flash",
+    choices: [{ index: 0, delta: { content: "answer" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+  };
+  const probe = probeUpstream((index) => (index === 1 ? bytes(`${sseFrame(chunk)}data: [DONE]\n\n${sseFrame(chunk)}`) : null));
+  const counts = { next: 0, returned: 0, finalized: 0, postDone: 0, health: 0, cancelled: 0, errors: 0 };
+  let releaseCleanup = (): void => {};
+  const cleanupGate = new Promise<void>((resolve) => {
+    releaseCleanup = resolve;
+  });
+  let enterCleanup = (): void => {};
+  const cleanupEntered = new Promise<void>((resolve) => {
+    enterCleanup = resolve;
+  });
+  let iterator: AsyncGenerator<ProviderStreamFrame, void, unknown> | null = null;
+  const adapter: ProviderStreamAdapter = {
+    responseHeaders: () => ({}),
+    frames: (upstream, model, options) => {
+      const frames = (async function* () {
+        try {
+          for await (const frame of iterateDeepSeekChatCompletionStream(upstream, model, options)) {
+            yield frame;
+            if (frame.kind === "done") counts.postDone += 1;
+          }
+        } finally {
+          counts.finalized += 1;
+          enterCleanup();
+          await cleanupGate;
+        }
+      })();
+      const next = frames.next.bind(frames);
+      frames.next = (...args) => {
+        counts.next += 1;
+        return next(...args);
+      };
+      const finish = frames.return.bind(frames);
+      frames.return = (value) => {
+        counts.returned += 1;
+        return finish(value);
+      };
+      iterator = frames;
+      return frames;
+    },
+    recordResponseHealth: () => {
+      counts.health += 1;
+    },
+    recordProviderError: () => {
+      counts.errors += 1;
+    },
+    recordCancellation: () => {
+      counts.cancelled += 1;
+    },
+    recordIncompleteResponse: () => {},
+    recordFinishFailureKind: () => {},
+    recordTransportFailure: () => {},
+    terminalTypeForError: () => "response.failed",
+    streamErrorCode: "deepseek_upstream_error",
+    responsesProfile: DEEPSEEK_RESPONSES_PROFILE,
+  };
+  const telemetry = createResponseTelemetryState();
+  const observedUsage: { usage: UsageTokens | null; completed: boolean }[] = [];
+  const usageContext = {
+    keyId: null,
+    kernelRepo: null,
+    kernelOrg: null,
+    responseTelemetry: telemetry,
+    onTerminalUsage: (usage: UsageTokens | null, completed: boolean) => {
+      observedUsage.push({ usage, completed });
+    },
+  };
+  const upstream = new Response(probe.stream);
+  const signal = new AbortController().signal;
+  const response =
+    wire === "chat"
+      ? relayChatCompletionStream(adapter, upstream, null, usageContext, signal, signal, "deepseek-flash")
+      : relayResponsesStream(adapter, {
+          upstream,
+          requestedModel: "deepseek-flash",
+          responseId: "resp_lifecycle",
+          createdAtSeconds: 1,
+          echo: { tools: [], tool_choice: "auto", parallel_tool_calls: true, instructions: null },
+          toolNames: new Map(),
+          customToolNames: new Set(),
+          providerRequestId: null,
+          usageContext,
+          downstreamSignal: signal,
+          requestSignal: signal,
+          upstreamModel: "deepseek-flash",
+        });
+  const cleanup = async (): Promise<void> => {
+    releaseCleanup();
+    if (iterator !== null && counts.finalized === 0) await iterator.return();
+    await releaseProbe(probe);
+  };
+  return { response, probe, counts, telemetry, observedUsage, cleanupEntered, releaseCleanup, cleanup };
+};
+
+for (const wire of ["chat", "responses"] as const) {
+  Deno.test(`Provider ${wire} relay disposes DONE before terminal and usage settlement`, async () => {
+    const fixture = providerRelayFixture(wire);
+    const output = fixture.response.text();
+    try {
+      assert.equal(await settlesWithin(fixture.cleanupEntered, 500), true, "DONE must enter the generator finally");
+      assert.equal(fixture.counts.returned, 1);
+      assert.equal(fixture.counts.finalized, 1);
+      assert.equal(fixture.counts.next, 2, "the relay must not read after the DONE frame");
+      assert.equal(fixture.counts.postDone, 0);
+      assert.equal(fixture.probe.cancelCount(), 1, "the parser must dispose the physical body");
+      assert.equal(fixture.probe.stream.locked, false);
+      assert.ok(fixture.probe.started() <= 2, "only the initial body read and bounded read-ahead are allowed");
+      assert.equal(fixture.telemetry.streamTerminalType, null);
+      assert.equal(fixture.observedUsage.length, 0);
+      assert.equal(fixture.counts.health, 0);
+      assert.equal(await settlesWithin(output, 25), false, "completion must await generator cleanup");
+
+      fixture.releaseCleanup();
+      const text = await output;
+      assert.ok(text.includes("answer"));
+      if (wire === "chat") assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+      else assert.equal(text.match(/event: response.completed/g)?.length, 1);
+      assert.equal(fixture.telemetry.streamTerminalType, "response.completed");
+      assert.equal(fixture.observedUsage.length, 1);
+      assert.equal(fixture.observedUsage[0].completed, true);
+      assert.equal(fixture.observedUsage[0].usage?.totalTokens, 5);
+      assert.equal(fixture.counts.health, 1);
+      assert.equal(fixture.counts.errors, 0);
+      assert.equal(fixture.counts.returned, 1);
+      assert.equal(fixture.probe.cancelCount(), 1);
+    } finally {
+      await fixture.cleanup();
+      await output.catch(() => {});
+    }
+  });
+
+  Deno.test(`Provider ${wire} cancellation during DONE disposal returns the iterator only once`, async () => {
+    const fixture = providerRelayFixture(wire);
+    const body = fixture.response.body;
+    assert.ok(body);
+    const reader = body.getReader();
+    const output = (async () => {
+      for (;;) {
+        if ((await reader.read()).done) return;
+      }
+    })();
+    try {
+      assert.equal(await settlesWithin(fixture.cleanupEntered, 500), true);
+      assert.equal(fixture.counts.returned, 1);
+      await reader.cancel("client disconnected during DONE disposal");
+      assert.equal(fixture.counts.returned, 1, "cancellation must not return an iterator already being disposed");
+      fixture.releaseCleanup();
+      await output;
+      assert.equal(fixture.telemetry.streamTerminalType, "cancelled");
+      assert.equal(fixture.counts.cancelled, 1);
+      assert.equal(fixture.counts.finalized, 1);
+      assert.equal(fixture.counts.next, 2);
+      assert.equal(fixture.counts.postDone, 0);
+      assert.equal(fixture.counts.health, 0);
+      assert.equal(fixture.counts.errors, 0);
+      assert.equal(fixture.observedUsage.length, 1);
+      assert.equal(fixture.observedUsage[0].completed, false);
+      assert.equal(fixture.probe.cancelCount(), 1);
+      assert.equal(fixture.probe.stream.locked, false);
+    } finally {
+      fixture.releaseCleanup();
+      await reader.cancel("test cleanup").catch(() => {});
+      await fixture.cleanup();
+      await output.catch(() => {});
+    }
+  });
+}
 
 Deno.test("Responses proxy releases an in-flight upstream read when its reader cancels", async () => {
   const probe = probeUpstream();

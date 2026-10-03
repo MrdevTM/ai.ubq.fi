@@ -58,8 +58,9 @@ export const lithosFailoverTargetAt = (modelRaw: string, nowMs: number): string 
 
 /** Opens (or extends) that window: the refusal's own reset instant plus the tier it points at. */
 export const lithosOpenFailoverWindow = (modelRaw: string, nowMs: number, waitMs: number, target: string): void => {
-  if (!lithosIsLadderTarget(modelRaw, target)) return;
-  lithosFailoverWindows.set(modelRaw, { deadlineMs: nowMs + waitMs, target });
+  const deadlineMs = nowMs + waitMs;
+  if (!lithosIsLadderTarget(modelRaw, target) || !Number.isFinite(deadlineMs)) return;
+  lithosFailoverWindows.set(modelRaw, { deadlineMs, target });
 };
 
 /** Test seam: drop every window so fixtures cannot leak into each other. */
@@ -215,7 +216,9 @@ export type LithosRateLimitWait = Readonly<{ waitMs: number; source: string }>;
 const lithosIntegerHeader = (raw: string | null): number | null => {
   if (raw === null) return null;
   const value = raw.trim();
-  return /^\d+$/.test(value) ? Number(value) : null;
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 };
 
 /** The duration units the vendor's reset headers use, in milliseconds. */
@@ -258,10 +261,14 @@ const lithosDurationMs = (raw: string | null): number | null => {
 /** `retry-after` is either an integer number of seconds or an HTTP date. */
 const lithosRetryAfterMs = (raw: string | null, nowMs: number): number | null => {
   const seconds = lithosIntegerHeader(raw);
-  if (seconds !== null) return seconds * 1_000;
+  if (seconds !== null) {
+    const waitMs = seconds * 1_000;
+    return Number.isFinite(waitMs) ? waitMs : null;
+  }
   if (raw === null) return null;
   const parsed = Date.parse(raw.trim());
-  return Number.isFinite(parsed) && parsed > nowMs ? parsed - nowMs : null;
+  const waitMs = parsed - nowMs;
+  return Number.isFinite(waitMs) && waitMs > 0 ? waitMs : null;
 };
 
 /**

@@ -101,13 +101,13 @@ const liveMetadata = async (kv: Deno.Kv): Promise<Readonly<{ records: number; by
   return { records, bytes };
 };
 
-const seedOverCapMetadata = async (kv: Deno.Kv, budgetBytes: number): Promise<number> => {
+const seedOverCapMetadata = async (kv: Deno.Kv, budgetBytes: number, requestRecords = SENTINEL_REPLAY_MAX_STATUS_RECORDS): Promise<number> => {
   await runSentinelReplayRetentionMaintenance(kv, { now_ms: NOW, budget_bytes: budgetBytes });
   const initial = await ledgerOf(kv, budgetBytes);
   let bytes = 0;
-  for (let start = 0; start < SENTINEL_REPLAY_MAX_STATUS_RECORDS; start += 128) {
+  for (let start = 0; start < requestRecords; start += 128) {
     const operation = kv.atomic();
-    for (let index = start; index < Math.min(start + 128, SENTINEL_REPLAY_MAX_STATUS_RECORDS); index += 1) {
+    for (let index = start; index < Math.min(start + 128, requestRecords); index += 1) {
       const row = statusRow(`legacy-status-${index.toString().padStart(5, "0")}`);
       operation.set(sentinelReplayRequestStatusKey(row.request_id), row);
       bytes += sentinelReplayStatusMetadataBytes(row);
@@ -121,9 +121,51 @@ const seedOverCapMetadata = async (kv: Deno.Kv, budgetBytes: number): Promise<nu
     bytes += sentinelReplayStatusMetadataBytes(row);
   }
   assert.equal((await tombstones.commit()).ok, true);
-  await kv.set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, { ...initial.ledger, status_records: SENTINEL_REPLAY_MAX_STATUS_RECORDS + 32, metadata_bytes: bytes });
+  await kv.set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, { ...initial.ledger, status_records: requestRecords + 32, metadata_bytes: bytes });
   return bytes;
 };
+
+Deno.test({
+  name: "native over-cap request rows cannot hide corrupt tombstone pruning candidates",
+  ignore: !kvAvailable,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const kv = await Deno.openKv(":memory:");
+    const budgetBytes = 1_024 * 1_024 * 1_024;
+    try {
+      await seedOverCapMetadata(kv, budgetBytes, SENTINEL_REPLAY_MAX_STATUS_RECORDS + 1);
+      const valid = tombstoneRow(33);
+      const cases = [
+        { key: [...SENTINEL_REPLAY_EVICTION_PREFIX, valid.fingerprint], row: { evicted_at_ms: NOW + 1 } },
+        { key: [...SENTINEL_REPLAY_EVICTION_PREFIX, valid.fingerprint], row: { ...valid, fingerprint: tombstoneRow(34).fingerprint } },
+        { key: [...SENTINEL_REPLAY_EVICTION_PREFIX, valid.fingerprint, "extra"], row: valid },
+      ];
+      for (const fixture of cases) {
+        await kv.set(fixture.key, fixture.row);
+        const current = await ledgerOf(kv, budgetBytes);
+        await kv.set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, {
+          ...current.ledger,
+          status_records: current.ledger.status_records + 1,
+          metadata_bytes: current.ledger.metadata_bytes + sentinelReplayStatusMetadataBytes(fixture.row),
+        });
+        const before = await ledgerOf(kv, budgetBytes);
+        const rowsBefore = await liveMetadata(kv);
+        assert.equal(rowsBefore.records, SENTINEL_REPLAY_MAX_STATUS_RECORDS + 34);
+        const corruptBefore = await kv.get(fixture.key);
+        assert.equal(await reconcileSentinelReplayStatusMetadata(kv, budgetBytes), "over_limit");
+        assert.deepEqual(await ledgerOf(kv, budgetBytes), before, "the over-cap witness never writes partial totals");
+        assert.equal(await pruneCaptureOwnedStatusMetadata(kv, NOW, 0, 0, 16, budgetBytes), 0);
+        assert.deepEqual(await ledgerOf(kv, budgetBytes), before, "a corrupt candidate preserves the exact ledger and version");
+        assert.deepEqual(await liveMetadata(kv), rowsBefore, "all native status and tombstone rows survive");
+        assert.deepEqual(await kv.get(fixture.key), corruptBefore);
+        await kv.atomic().delete(fixture.key).set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, current.ledger).commit();
+      }
+    } finally {
+      kv.close();
+    }
+  },
+});
 
 Deno.test({
   name: "native over-cap metadata makes bounded pruning progress without relaxing admission limits",

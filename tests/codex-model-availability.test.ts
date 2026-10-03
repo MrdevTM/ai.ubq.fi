@@ -203,6 +203,51 @@ Deno.test("codex models: the pool catalog unions every account in pool order and
   }
 });
 
+Deno.test("codex models: unusable account rows are dropped while valid rows and sibling eligibility survive", async () => {
+  seedPool([codexAccount("rows-a"), codexAccount("rows-b")]);
+  clearAvailabilityKv();
+  const firstRow = {
+    slug: "first-account-model",
+    context_window: 128_000,
+    supported_reasoning_levels: [{ effort: "ultra", description: "Source tier" }],
+    source_metadata: { retained: true },
+  };
+  const siblingRow = {
+    slug: MODEL,
+    context_window: 256_000,
+    supported_reasoning_levels: [{ effort: "low", description: "Sibling tier" }],
+  };
+  const originalFetch = globalThis.fetch;
+  const seen: { ifNoneMatch: string | null; calls: number } = { ifNoneMatch: "unset", calls: 0 };
+  globalThis.fetch = catalogFetch(
+    {
+      "rows-a": { models: [null, {}, { slug: " " }, { slug: 7 }, "invalid", false, 42, [], firstRow], has_more: true },
+      "rows-b": { models: [{ ...firstRow, context_window: 1 }, siblingRow], has_more: false },
+    },
+    seen
+  );
+  try {
+    const response = await fetchCodexModels({ clientVersion: "0.160.0", ifNoneMatch: '"cached"' });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { models: [firstRow, siblingRow], has_more: true }, "valid native rows and their source tiers remain verbatim");
+    assert.equal(seen.calls, 2, "both account catalogs are fetched");
+    assert.equal(seen.ifNoneMatch, null, "the multi-account union remains unconditional");
+    const store = getCodexAccountModelsCacheForTest().store;
+    assert.ok(store, "each account's usable catalog identifiers are recorded");
+    assert.deepEqual(store.accounts["rows-a"].slugs, [firstRow.slug]);
+    assert.deepEqual(store.accounts["rows-b"].slugs, [firstRow.slug, MODEL]);
+    assert.equal(codexModelUnavailableAccounts(MODEL, ["rows-a", "rows-b"]).has("rows-a"), true, "only the sibling advertises its model");
+    assert.equal(codexModelUnavailableAccounts(MODEL, ["rows-a", "rows-b"]).has("rows-b"), false);
+    assert.equal(
+      codexModelUnavailableAccounts("unknown-model", ["rows-a", "rows-b"]).size,
+      0,
+      "unusable rows create no eligibility evidence for unknown models"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test("codex models: one configured account keeps the upstream response and its conditional request", async () => {
   seedPool([codexAccount("single-account")]);
   clearAvailabilityKv();
