@@ -2,6 +2,7 @@
 
 import { type CodexModelsSnapshot, mergeCodexModelPromptCacheCapabilities, parseCodexClientVersion } from "./codex-models.ts";
 import { getKv } from "../kv.ts";
+import { readBoundedResponseBody } from "../bounded-response-body.ts";
 import { buildRuntimeConfig, cacheRuntimeConfig, loadRuntimeConfig, normalizeRuntimeConfig, RUNTIME_CONFIG_V2_KEY } from "../runtime-config.ts";
 import { getString, isRecord } from "../utils.ts";
 import type { CodexAuthState, ResponseInputItem } from "../types.ts";
@@ -17,6 +18,9 @@ import {
   recordCodexThrownHealth,
 } from "../codex/dispatch.ts";
 import { recordCodexAccountCatalogs } from "./codex-models-availability.ts";
+
+const SINGLE_ACCOUNT_CATALOG_MAX_BYTES = 4 * 1024 * 1024;
+const SINGLE_ACCOUNT_CATALOG_TIMEOUT_MS = 1_000;
 
 const fetchCodexModelsForAccount = async (
   accountEntry: CodexAuthAccountEntry,
@@ -234,8 +238,18 @@ const readCodexModelsJsonBody = async (res: Response): Promise<Record<string, un
 /** Record fresh single-account evidence without consuming or rewriting its upstream response. */
 const recordSingleAccountCodexCatalog = async (res: Response, accountId: string, clientVersion: string): Promise<void> => {
   if (!res.ok) return;
-  const body = await readCodexModelsJsonBody(res.clone());
-  if (!body) return;
+  const observation = await readBoundedResponseBody(res.clone(), {
+    maxBytes: SINGLE_ACCOUNT_CATALOG_MAX_BYTES,
+    timeoutMs: SINGLE_ACCOUNT_CATALOG_TIMEOUT_MS,
+  });
+  if (!observation.complete) return;
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder().decode(observation.bytes)) as unknown;
+  } catch {
+    return;
+  }
+  if (!isRecord(body) || !Array.isArray(body.models)) return;
   const contribution = contributionFromBody(accountId, body);
   await recordCodexAccountCatalogs([{ accountId, clientVersion, slugs: contribution.slugs }]);
 };
