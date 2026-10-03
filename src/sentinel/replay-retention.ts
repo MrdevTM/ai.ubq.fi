@@ -47,6 +47,7 @@ import { SENTINEL_REPLAY_MAX_RECORDS, SENTINEL_REPLAY_MAX_STATUS_RECORDS, sentin
 import { isSentinelReplayCaptureStatusRow } from "./replay-observation.ts";
 import { isSentinelReplayManifest } from "./replay-read.ts";
 import { bootstrapBeforeMutation, releaseLegacyReservation, runBootstrapBatch } from "./replay-retention-bootstrap.ts";
+import { reconcileSentinelReplayStatusMetadata } from "./replay-retention-metadata.ts";
 import {
   accountingKeyMatches,
   CAS_ATTEMPTS,
@@ -175,6 +176,7 @@ export const pruneCaptureOwnedStatusMetadata = async (
   if (initial.kind === "corrupt") return 0;
   const ledger = withBudget(initial.ledger, budgetBytes);
   if (ledger.status_records + extraRecords <= SENTINEL_REPLAY_MAX_STATUS_RECORDS && ledger.metadata_bytes + extraBytes <= reserve) return 0;
+  if (!(await reconcileSentinelReplayStatusMetadata(kv, budgetBytes))) return 0;
   let deleted = 0;
   for (const candidate of await statusCandidates(kv)) {
     if (deleted >= maxDeletes) break;
@@ -205,7 +207,7 @@ export const pruneCaptureOwnedStatusMetadata = async (
 export const advanceSentinelReplayStagingFence = async (
   kv: Deno.Kv,
   input: Readonly<{ accounting_key: Deno.KvKey; fence: number; now_ms: number; budget_bytes?: number }>
-): Promise<Readonly<{ ok: true; stage: number }> | Readonly<{ ok: false; reason: "revoked" | "expired" | "missing" }>> => {
+): Promise<Readonly<{ ok: true; stage: number; versionstamp: string }> | Readonly<{ ok: false; reason: "revoked" | "expired" | "missing" }>> => {
   const budgetBytes = Math.max(64 * 1_024, Math.trunc(input.budget_bytes ?? sentinelReplayBudgetBytes()));
   for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt += 1) {
     const entry = await kv.get<SentinelReplayAccountingRow>(input.accounting_key);
@@ -226,7 +228,7 @@ export const advanceSentinelReplayStagingFence = async (
       .check({ key: input.accounting_key, versionstamp: entry.versionstamp })
       .set(input.accounting_key, next)
       .commit();
-    if (committed.ok) return { ok: true, stage: next.stage };
+    if (committed.ok) return { ok: true, stage: next.stage, versionstamp: committed.versionstamp };
   }
   return { ok: false, reason: "missing" };
 };
@@ -543,6 +545,24 @@ const finalizedLedger = (
   };
 };
 
+/** Ownerless legacy victims retain a tombstone without inventing a request-status row. */
+const applyClaimedVictimMetadata = (
+  operation: Deno.AtomicOperation,
+  existingStatus: Deno.KvEntryMaybe<unknown> | null,
+  statusRow: SentinelReplayCaptureStatusRow,
+  tombstoneKey: Deno.KvKey,
+  tombstone: Readonly<Record<string, unknown>>,
+  statusFits: boolean
+): Deno.AtomicOperation => {
+  let applied = operation;
+  if (existingStatus !== null) {
+    applied = applied.check({ key: existingStatus.key, versionstamp: existingStatus.versionstamp }).delete(existingStatus.key);
+  }
+  if (!statusFits) return applied;
+  applied = applied.set(tombstoneKey, tombstone, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS });
+  return existingStatus === null ? applied : applied.set(existingStatus.key, statusRow, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS });
+};
+
 /**
  * Delete one already-claimed victim's payload and release its charge in a single
  * atomic commit. The charge is released only after a fresh listing proves the
@@ -554,9 +574,10 @@ const finalizeClaimedVictim = async (
   row: SentinelReplayAccountingRow,
   kind: "evicted" | "expired",
   nowMs: number,
-  budgetBytes: number
+  budgetBytes: number,
+  maxChunkDeletes = EVICTION_MAX_CHUNK_DELETES
 ): Promise<Readonly<{ finalized: boolean; chunks: number }>> => {
-  const cleanup = await deleteChunkBatch(kv, row.capture_id, EVICTION_MAX_CHUNK_DELETES);
+  const cleanup = await deleteChunkBatch(kv, row.capture_id, maxChunkDeletes);
   const remaining = cleanup.remaining > 0 ? cleanup.remaining : await countChunks(kv, row.capture_id);
   if (remaining > 0) return { finalized: false, chunks: cleanup.deleted };
   const manifestKey = sentinelReplayManifestKey({
@@ -591,19 +612,25 @@ const finalizeClaimedVictim = async (
     reason: kind === "evicted" ? SENTINEL_REPLAY_EVICTION_REASON : SENTINEL_REPLAY_EXPIRED_REASON,
   };
   const statusKey = sentinelReplayRequestStatusKey(row.request_id);
+  const hasOwner = row.request_id !== "";
+  const statusRows = hasOwner ? 2 : 1;
   const tombstoneKey = sentinelReplayEvictionKey(row.fingerprint);
-  const statusBytes = sentinelReplayStatusMetadataBytes(statusRow) + sentinelReplayStatusMetadataBytes(tombstone);
-  await pruneCaptureOwnedStatusMetadata(kv, nowMs, 2, statusBytes, STATUS_PRUNE_BATCH, budgetBytes);
+  const statusBytes = (hasOwner ? sentinelReplayStatusMetadataBytes(statusRow) : 0) + sentinelReplayStatusMetadataBytes(tombstone);
+  await pruneCaptureOwnedStatusMetadata(kv, nowMs, statusRows, statusBytes, STATUS_PRUNE_BATCH, budgetBytes);
   // Read the rows this commit really replaces or deletes. The bound tracks the
   // live row set, so re-creating the victim status row and adding its tombstone
   // may move it only by the difference; the versionstamps checked below keep that
   // delta true while another writer touches those keys.
-  const [ledgerState, existingStatus, existingTombstone] = await Promise.all([readLedger(kv, budgetBytes), kv.get(statusKey), kv.get(tombstoneKey)]);
+  const [ledgerState, existingStatus, existingTombstone] = await Promise.all([
+    readLedger(kv, budgetBytes),
+    hasOwner ? kv.get(statusKey) : Promise.resolve(null),
+    kv.get(tombstoneKey),
+  ]);
   if (ledgerState.kind === "corrupt") return { finalized: false, chunks: cleanup.deleted };
   const ledger = withBudget(ledgerState.ledger, budgetBytes);
-  const existingStatusBytes = storedStatusMetadataBytes(existingStatus.value);
+  const existingStatusBytes = storedStatusMetadataBytes(existingStatus?.value);
   const existingTombstoneBytes = storedStatusMetadataBytes(existingTombstone.value);
-  const statusPresent = existingStatus.value === null ? 0 : 1;
+  const statusPresent = existingStatus === null || existingStatus.value === null ? 0 : 1;
   const tombstonePresent = existingTombstone.value === null ? 0 : 1;
   // The metadata bound is hard even during cleanup: when the reserve cannot take
   // the tombstone, the victim's bytes are still released below, but the bounded
@@ -612,9 +639,9 @@ const finalizeClaimedVictim = async (
   // Room for both rows means both are written; otherwise the status row is
   // deleted and any existing tombstone survives exactly as it was.
   const statusFits =
-    ledger.status_records + 2 - statusPresent - tombstonePresent <= SENTINEL_REPLAY_MAX_STATUS_RECORDS &&
+    ledger.status_records + statusRows - statusPresent - tombstonePresent <= SENTINEL_REPLAY_MAX_STATUS_RECORDS &&
     ledger.metadata_bytes + statusBytes - existingStatusBytes - existingTombstoneBytes <= metadataReserve;
-  const afterRecords = statusFits ? 2 : tombstonePresent;
+  const afterRecords = statusFits ? statusRows : tombstonePresent;
   const afterBytes = statusFits ? statusBytes : existingTombstoneBytes;
   const statusRecordsDelta = afterRecords - statusPresent - tombstonePresent;
   const metadataBytesDelta = afterBytes - existingStatusBytes - existingTombstoneBytes;
@@ -622,21 +649,14 @@ const finalizeClaimedVictim = async (
   const entry = await kv.get<SentinelReplayAccountingRow>(key);
   if (!isAccountingRow(entry.value) || entry.value.state !== "evicting") return { finalized: false, chunks: cleanup.deleted };
   fault("commit");
-  let operation = kv
+  const operation = kv
     .atomic()
     .check({ key: SENTINEL_REPLAY_BUDGET_LEDGER_KEY, versionstamp: ledgerState.versionstamp })
     .check({ key, versionstamp: entry.versionstamp })
-    .check({ key: statusKey, versionstamp: existingStatus.versionstamp })
     .check({ key: tombstoneKey, versionstamp: existingTombstone.versionstamp })
     .set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, nextLedger)
-    .delete(key)
-    .delete(statusKey);
-  if (statusFits) {
-    operation = operation
-      .set(statusKey, statusRow, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS })
-      .set(tombstoneKey, tombstone, { expireIn: SENTINEL_REPLAY_STATUS_TTL_MS });
-  }
-  const committed = await operation.commit();
+    .delete(key);
+  const committed = await applyClaimedVictimMetadata(operation, existingStatus, statusRow, tombstoneKey, tombstone, statusFits).commit();
   // A commit failure leaves the victim in `evicting` with its charge held for a
   // later pass; its bytes were fully removed, so nothing is double-charged.
   return { finalized: committed.ok, chunks: cleanup.deleted };
@@ -728,18 +748,16 @@ export const evictSentinelReplays = async (
   let bytes = 0;
   let chunks = 0;
   for (const victim of victims) {
+    const remainingDeletes = Math.max(0, (options.max_chunk_deletes ?? EVICTION_MAX_CHUNK_DELETES) - chunks);
+    if (remainingDeletes <= 0) break;
     const state = await readLedger(kv, budgetBytes);
     if (state.kind === "corrupt") break;
     const ledger = withBudget(state.ledger, budgetBytes);
     if (ledger.stored_bytes <= options.target_bytes) break;
-    const remainingDeletes = Math.max(1, (options.max_chunk_deletes ?? EVICTION_MAX_CHUNK_DELETES) - chunks);
     if (!(await claimVictim(kv, victim.key, victim.row, budgetBytes))) continue;
-    const result = await finalizeClaimedVictim(kv, victim.key, victim.row, "evicted", options.now_ms, budgetBytes);
+    const result = await finalizeClaimedVictim(kv, victim.key, victim.row, "evicted", options.now_ms, budgetBytes, remainingDeletes);
     chunks += result.chunks;
-    if (!result.finalized) {
-      if (remainingDeletes <= 0) break;
-      continue;
-    }
+    if (!result.finalized) continue;
     records += 1;
     bytes += victim.row.bytes;
   }
@@ -861,7 +879,7 @@ export const reserveSentinelReplayCapacity = async (
   return { ok: false, reason: SENTINEL_REPLAY_STORAGE_FULL_REASON };
 };
 
-/** Bounded maintenance: reap, resume bootstrap, reclaim expired payloads, evict if needed. */
+/** Bounded maintenance: reap, bootstrap, reclaim expired payloads and metadata charges, evict if needed. */
 export const runSentinelReplayRetentionMaintenance = async (
   kv: Deno.Kv,
   options: Readonly<{ now_ms: number; budget_bytes?: number }>
@@ -884,6 +902,7 @@ export const runSentinelReplayRetentionMaintenance = async (
       budget_bytes: budgetBytes,
     });
   }
+  await reconcileSentinelReplayStatusMetadata(kv, budgetBytes);
   return await readSentinelReplayRetentionStatus(kv, budgetBytes);
 };
 

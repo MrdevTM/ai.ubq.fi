@@ -13,6 +13,7 @@ import {
   SENTINEL_REPLAY_DEDUPE_PREFIX,
   SENTINEL_REPLAY_MANIFEST_PREFIX,
   SENTINEL_REPLAY_REQUEST_PREFIX,
+  SENTINEL_REPLAY_STATUS_TTL_MS,
 } from "./replay-model.ts";
 import { isSentinelReplayCaptureStatusRow } from "./replay-observation.ts";
 import { isSentinelReplayManifest } from "./replay-read.ts";
@@ -36,6 +37,7 @@ import {
   sentinelReplayManifestCharge,
   sentinelReplayPayloadBudgetBytes,
   sentinelReplayStatusMetadataBytes,
+  type SentinelReplayAccountingRow,
   type SentinelReplayBudgetLedger,
   type SentinelReplayLegacyReservation,
   withBudget,
@@ -83,6 +85,13 @@ const bootstrapPrefixes = (): readonly Deno.KvKey[] => [
   SENTINEL_REPLAY_RESERVATION_PREFIX,
 ];
 
+type BootstrapMaterialization = Readonly<{
+  accounting_key: Deno.KvKey;
+  manifest_key: Deno.KvKey;
+  manifest_versionstamp: string;
+  row: SentinelReplayAccountingRow;
+}>;
+
 type BootstrapDelta = Readonly<{
   stored_bytes: number;
   reserved_bytes: number;
@@ -91,6 +100,7 @@ type BootstrapDelta = Readonly<{
   metadata_bytes: number;
   invalid: boolean;
   legacy_reaped: number;
+  materializations: readonly BootstrapMaterialization[];
 }>;
 
 const emptyDelta = (): BootstrapDelta => ({
@@ -101,6 +111,7 @@ const emptyDelta = (): BootstrapDelta => ({
   metadata_bytes: 0,
   invalid: false,
   legacy_reaped: 0,
+  materializations: [],
 });
 
 const addDelta = (delta: BootstrapDelta, patch: Partial<BootstrapDelta>): BootstrapDelta => ({
@@ -111,6 +122,7 @@ const addDelta = (delta: BootstrapDelta, patch: Partial<BootstrapDelta>): Bootst
   metadata_bytes: delta.metadata_bytes + (patch.metadata_bytes ?? 0),
   invalid: delta.invalid || Boolean(patch.invalid),
   legacy_reaped: delta.legacy_reaped + (patch.legacy_reaped ?? 0),
+  materializations: [...delta.materializations, ...(patch.materializations ?? [])],
 });
 
 const parseCursor = (cursor: string | null): Readonly<{ index: number; inner: string | null }> => {
@@ -128,12 +140,38 @@ const bootstrapAccountingDelta = (key: Deno.KvKey, value: unknown, delta: Bootst
   return addDelta(delta, { reserved_bytes: value.bytes });
 };
 
-/** A manifest without its own accounting row is a pre-accounting capture, charged conservatively. */
-const bootstrapManifestDelta = async (kv: Deno.Kv, key: Deno.KvKey, value: unknown, delta: BootstrapDelta): Promise<BootstrapDelta> => {
+/** A legacy manifest gains its durable charge owner in the same commit as the bootstrap ledger delta. */
+const bootstrapManifestDelta = async (kv: Deno.Kv, entry: Deno.KvEntry<unknown>, delta: BootstrapDelta): Promise<BootstrapDelta> => {
+  const { key, value } = entry;
   if (!isSentinelReplayManifest(value) || !manifestKeyMatches(key, value)) return addDelta(delta, { invalid: true });
-  const accounting = await kv.get(sentinelReplayAccountingKey(value.captured_at_ms, value.capture_id));
-  if (isAccountingRow(accounting.value)) return delta;
-  return addDelta(delta, { stored_bytes: sentinelReplayManifestCharge(value), records: 1 });
+  const accountingKey = sentinelReplayAccountingKey(value.captured_at_ms, value.capture_id);
+  const accounting = await kv.get(accountingKey);
+  if (accounting.value !== null) {
+    const matches =
+      isAccountingRow(accounting.value) && accountingKeyMatches(accountingKey, accounting.value) && accounting.value.fingerprint === value.fingerprint;
+    return matches ? delta : addDelta(delta, { invalid: true });
+  }
+  const pending = delta.materializations.find((candidate) => candidate.accounting_key.join("\u0000") === accountingKey.join("\u0000"));
+  if (pending) return pending.row.fingerprint === value.fingerprint ? delta : addDelta(delta, { invalid: true });
+  const bytes = sentinelReplayManifestCharge(value);
+  const row: SentinelReplayAccountingRow = {
+    version: 1,
+    capture_id: value.capture_id,
+    request_id: value.request_id ?? "",
+    fingerprint: value.fingerprint,
+    bytes,
+    state: "stored",
+    fence: 1,
+    created_at_ms: value.captured_at_ms,
+    expires_at_ms: value.expires_at_ms,
+    status_expires_at_ms: value.captured_at_ms + SENTINEL_REPLAY_STATUS_TTL_MS,
+    stage: 0,
+  };
+  return addDelta(delta, {
+    stored_bytes: bytes,
+    records: 1,
+    materializations: [{ accounting_key: accountingKey, manifest_key: key, manifest_versionstamp: entry.versionstamp, row }],
+  });
 };
 
 /** Request status rows are capture-owned metadata and consume the metadata reserve. */
@@ -186,7 +224,7 @@ const bootstrapEntryDelta = async (
   budgetBytes: number
 ): Promise<BootstrapDelta> => {
   if (prefix === SENTINEL_REPLAY_ACCOUNTING_PREFIX) return bootstrapAccountingDelta(entry.key, entry.value, delta);
-  if (prefix === SENTINEL_REPLAY_MANIFEST_PREFIX) return await bootstrapManifestDelta(kv, entry.key, entry.value, delta);
+  if (prefix === SENTINEL_REPLAY_MANIFEST_PREFIX) return await bootstrapManifestDelta(kv, entry, delta);
   if (prefix === SENTINEL_REPLAY_REQUEST_PREFIX) return bootstrapStatusDelta(entry.value, delta);
   if (prefix === SENTINEL_REPLAY_EVICTION_PREFIX) return bootstrapTombstoneDelta(entry.value, delta);
   if (prefix === SENTINEL_REPLAY_RESERVATION_PREFIX) return await bootstrapLegacyDelta(kv, entry.key, entry.value, delta, budgetBytes);
@@ -237,6 +275,9 @@ export const runBootstrapBatch = async (
   const prefixes = bootstrapPrefixes();
   // A fresh sweep clears the sticky error so a removed corrupt row can resolve it.
   let error = ledger.bootstrap_cursor === null ? null : ledger.accounting_error;
+  // A failed full sweep retained its deltas. Rebuild live counters on restart;
+  // cursor continuations still accumulate, and cumulative history stays intact.
+  const live = ledger.bootstrap_cursor === null && ledger.accounting_error !== null ? emptyDelta() : ledger;
   let delta = emptyDelta();
   let scanned = 0;
   while (index < prefixes.length && scanned < BOOTSTRAP_BATCH_ENTRIES) {
@@ -256,19 +297,26 @@ export const runBootstrapBatch = async (
   const next: SentinelReplayBudgetLedger = {
     ...ledger,
     budget_bytes: budgetBytes,
-    stored_bytes: ledger.stored_bytes + delta.stored_bytes,
-    reserved_bytes: ledger.reserved_bytes + delta.reserved_bytes,
-    records: ledger.records + delta.records,
-    status_records: ledger.status_records + delta.status_records,
-    metadata_bytes: ledger.metadata_bytes + delta.metadata_bytes,
+    stored_bytes: live.stored_bytes + delta.stored_bytes,
+    reserved_bytes: live.reserved_bytes + delta.reserved_bytes,
+    records: live.records + delta.records,
+    status_records: live.status_records + delta.status_records,
+    metadata_bytes: live.metadata_bytes + delta.metadata_bytes,
     bootstrap_complete: complete && error === null,
     bootstrap_cursor: complete ? null : `${index}|${inner ?? ""}`,
     accounting_error: error,
-    over_budget: ledger.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes),
-    last_warning_at_ms: ledger.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes) ? nowMs : ledger.last_warning_at_ms,
+    over_budget: live.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes),
+    last_warning_at_ms: live.stored_bytes + delta.stored_bytes > sentinelReplayPayloadBudgetBytes(budgetBytes) ? nowMs : ledger.last_warning_at_ms,
   };
   fault("commit");
-  const committed = await kv.atomic().check({ key: SENTINEL_REPLAY_BUDGET_LEDGER_KEY, versionstamp }).set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, next).commit();
+  let operation = kv.atomic().check({ key: SENTINEL_REPLAY_BUDGET_LEDGER_KEY, versionstamp });
+  for (const materialization of delta.materializations) {
+    operation = operation
+      .check({ key: materialization.accounting_key, versionstamp: null })
+      .check({ key: materialization.manifest_key, versionstamp: materialization.manifest_versionstamp })
+      .set(materialization.accounting_key, materialization.row);
+  }
+  const committed = await operation.set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, next).commit();
   if (committed.ok) return next;
   const reread = await readLedger(kv, budgetBytes);
   if (reread.kind === "corrupt") return ledger;

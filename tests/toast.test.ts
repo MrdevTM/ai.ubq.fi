@@ -1,0 +1,95 @@
+import assert from "node:assert/strict";
+import { toast } from "../static/toast.js";
+
+class ToastElement {
+  readonly dataset: Record<string, string> = {};
+  readonly children: ToastElement[] = [];
+  readonly listeners = new Map<string, () => void>();
+  textContent = "";
+  parent: ToastElement | null = null;
+  private _queries = 0;
+
+  constructor(private readonly _root = false) {}
+
+  get isConnected(): boolean {
+    return this.parent?.isConnected ?? this._root;
+  }
+
+  setAttribute(name: string, value: string): void {
+    if (name.startsWith("data-")) this.dataset[name.slice(5)] = value;
+  }
+
+  appendChild(child: ToastElement): void {
+    child.parent = this;
+    this.children.push(child);
+  }
+
+  append(child: ToastElement): void {
+    this.appendChild(child);
+  }
+
+  addEventListener(name: string, callback: () => void): void {
+    this.listeners.set(name, callback);
+  }
+
+  querySelectorAll(selector: string): ToastElement[] {
+    if (++this._queries > 100) throw new Error("Toast eviction did not converge");
+    assert.ok(selector === "[data-toast]" || selector === "[data-toast]:not([data-exiting])");
+    return this.children.filter((child) => "toast" in child.dataset && (selector === "[data-toast]" || !("exiting" in child.dataset)));
+  }
+
+  querySelector(selector: string): ToastElement | null {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+
+  remove(): void {
+    if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = null;
+  }
+}
+
+Deno.test("a synchronous toast burst keeps three active notifications while older nodes exit", () => {
+  const body = new ToastElement(true);
+  const timers: { callback: () => void; delay: number }[] = [];
+  const replacements = {
+    document: {
+      body,
+      createElement: () => new ToastElement(),
+      createElementNS: () => new ToastElement(),
+    },
+    requestAnimationFrame: (callback: () => void) => {
+      callback();
+    },
+    setTimeout: (callback: () => void, delay: number) => {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+  };
+
+  const originals = new Map(Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  try {
+    for (const [name, value] of Object.entries(replacements)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    // The query budget makes a non-converging synchronous loop fail instead of hanging the test runner.
+    for (let i = 1; i <= 6; i++) toast.info(String(i), { duration: 0 });
+
+    const host = body.children[0];
+    assert.equal(host.children.length, 6, "evicted nodes remain during the exit animation");
+    assert.deepEqual(
+      host.querySelectorAll("[data-toast]:not([data-exiting])").map((element) => element.children[0].textContent),
+      ["4", "5", "6"],
+      "the oldest active notifications are evicted first"
+    );
+    assert.deepEqual(
+      timers.map((timer) => timer.delay),
+      [160, 160, 160]
+    );
+    for (const timer of timers) timer.callback();
+    assert.equal(host.children.length, 3, "exit timers remove the evicted nodes");
+    assert.equal(host.querySelectorAll("[data-toast]:not([data-exiting])").length, 3);
+  } finally {
+    for (const [name, original] of originals) {
+      if (original) Object.defineProperty(globalThis, name, original);
+      else Reflect.deleteProperty(globalThis, name);
+    }
+  }
+});

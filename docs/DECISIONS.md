@@ -339,20 +339,26 @@ The owner authorized capturing private request contents and deleting the oldest 
 grows, around a 1 GiB per-host budget. Each host therefore keeps one fixed 1 GiB budget for capture-owned encoded KV
 payload (base64-expanded ciphertext chunks plus metadata/status/dedupe/index row overhead) plus in-flight charges, with
 a hard record-count bound. **Durable per-capture accounting rows are the source of truth** and the ledger is derived
-cached state: every mutation (admit, publish, revoke, release, evict, expire, status admit/prune) is one `kv.atomic()`
-commit that checks both the row's and the ledger's exact versionstamp and writes both, so no ledger delta can be applied
-apart from the row change it describes. Accounting rows are timestamp-first keyed (the oldest-first index), carry no KV
-TTL, and stop existing only through the atomic commit that deletes them and decrements the ledger.
+cached state: admission, publication, release, eviction, payload expiry and status admit/prune change a charge in the
+same `kv.atomic()` commit as its row, checking both exact versionstamps. Accounting rows are timestamp-first keyed (the
+oldest-first index), carry no KV TTL, and stop existing only through the atomic commit that deletes them and decrements
+the ledger. Bootstrap materializes each missing legacy accounting row together with its ledger charge; cleanup of a
+manifest that predates request ownership retains only its fingerprint tombstone rather than inventing an owner status.
 
-Admission reserves in durable KV before any chunk is written; chunks are staged in bounded batches with a fence-advance
-commit before each batch, and publish transitions `reserved -> stored` together with the manifest, dedupe, request
-status, incident evidence and ledger. A revoked or expired row cannot publish, and a refused admission is skipped with a
-visible `storage_full` status instead of storing unaccounted data. Eviction claims a victim by CAS before deleting
-anything, releases the charge only once its chunk prefix is provably empty, and CAS-deletes the dedupe row only when it
-still references that victim's manifest key. TTL expiry is a separate reclamation path reporting `expired`/
-`payload_expired` with no `evicted_*` increment. Capture-owned status and tombstone rows are bounded by a fixed 64 MiB
-reserve inside the 1 GiB (payload admissions may use at most `budget - 64 MiB`) and a 50,000-row bound, pruned
-oldest-first; a pruned lookup reports the distinct `status_not_retained` code rather than inventing a status.
+Admission reserves in durable KV before any chunk is written. A fence-advance commit precedes each batch, and one atomic
+chunk transaction checks its committed accounting-row versionstamp before writing at most twelve 48 KiB chunks (576 KiB
+payload plus bounded keys/check overhead, below the 800 KiB atomic limit). Revoke or release changes that row, so a
+paused transaction cannot append after capacity was reclaimed. Publish transitions `reserved -> stored` together with
+the manifest, dedupe, request status, incident evidence and ledger; a refused admission is skipped with a visible
+`storage_full` status instead of storing unaccounted data. Eviction claims a victim by CAS before deleting anything,
+releases the charge only once its chunk prefix is provably empty, and CAS-deletes the dedupe row only when it still
+references that victim's manifest key. TTL expiry is a separate reclamation path reporting `expired`/`payload_expired`
+with no `evicted_*` increment. Capture-owned status and tombstone rows are bounded by a fixed 64 MiB reserve inside the
+1 GiB (payload admissions may use at most `budget - 64 MiB`) and a 50,000-row bound, pruned oldest-first; a pruned
+lookup reports `status_not_retained`. Native metadata TTL deletion is not an atomic ledger update: maintenance and
+metadata pressure reconstruct those derived counters only after a complete bounded strong scan of both prefixes and a
+CAS on the ledger version captured before scanning. Concurrent accounted mutations invalidate the scan; TTL deletion
+during scanning can leave a conservative overcount until a later pass, without incrementing pruning history.
 Pre-existing captures are counted by a resumable bootstrap that sweeps every capture-owned prefix, counts scanned
 entries and fails closed on a corrupt in-scope row or an unreadable ledger, never assuming zero.
 
