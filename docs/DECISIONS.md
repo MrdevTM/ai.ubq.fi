@@ -1241,3 +1241,15 @@ Decision evidence: DSH session-8d0f4b3a-9ab5-43e1-96e6-fd092c509c26, recovered d
 
 For the recorded cleanup, delete unused p-ai-ubq-fi and ai-ubq-fi-feat-shared-admin-toke. Retain ai-ubq-fi and
 ubiquity-prospector; the Prospector monorepo's own `DECISIONS.md` owns the latter's retention and migration decisions.
+
+## Local-development key deletion ownership - 2026-10-03
+
+For the local-development API key only, the retained paid-deletion guard keeps created_at_ms and adds local_deletion
+with an exclusive owner and completed_at_ms. Admin deletion CAS-claims ownership while the revoked ID exists, checks
+that claim before deleting the ID, and publishes completion only after all awaited paid-state, request-log, counter and
+V3 usage cleanup finishes, using the same owner version and an absent-ID CAS. A known settled pre-ID refusal or failure
+may release only its own claim for explicit admin retry; legacy and crashed active guards remain blocked without owner
+stealing. Startup reprovision requires a completed local marker, no outstanding billing, pending markers, lease or
+remaining cleanup rows, and atomically checks the absent ID, token hash and unchanged guard while publishing the
+replacement and clearing only that local guard. Empty prefixes and an absent ID alone never prove completion; every
+nonlocal guard keeps its existing meaning.
