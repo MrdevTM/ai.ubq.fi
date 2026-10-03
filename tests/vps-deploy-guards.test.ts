@@ -38,10 +38,11 @@ const fixtureHostPath = await (async (): Promise<string | undefined> => {
   }
 })();
 const fixtureIgnored = fixtureHostPath === undefined;
+const ingressFixtureIgnored = fixtureIgnored || (await Deno.permissions.query({ name: "run", command: "/bin/ln" })).state !== "granted";
 
 type FixtureRun = { code: number; stdout: string; stderr: string };
 type Fixture = { root: string; script: string; env: Record<string, string>; dispose: () => Promise<void> };
-type DeployOptions = { write?: string; env?: Record<string, string> };
+type DeployOptions = { write?: string; env?: Record<string, string>; fakeCommands?: string[] };
 
 const decode = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
@@ -157,8 +158,8 @@ const createFixture = async (options: { branch: string; tracking: "match" | "mis
 /**
  * The deploy child gets only `git` execution plus read access to its disposable
  * fixture. The lock-wait case additionally gets write access to that fixture's
- * `.data` directory alone. It can never write outside the fixture, can never run
- * sudo, gh, or tar, and has no network permission even if a guard were bypassed.
+ * `.data` directory alone. Ingress cases may also execute exact task-owned fake
+ * command paths. No child can execute real sudo, gh, or tar or use the network.
  */
 const launchDeployFixture = (fixture: Fixture, options: DeployOptions = {}): Deno.ChildProcess =>
   new Deno.Command(Deno.execPath(), {
@@ -166,7 +167,7 @@ const launchDeployFixture = (fixture: Fixture, options: DeployOptions = {}): Den
       "run",
       "--no-config",
       "--no-prompt",
-      "--allow-run=git",
+      `--allow-run=${["git", ...(options.fakeCommands ?? [])].join(",")}`,
       `--allow-read=${fixture.root}`,
       ...(options.write === undefined ? [] : [`--allow-write=${options.write}`]),
       fixture.script,
@@ -235,6 +236,175 @@ const waitForPath = async (path: string, timeoutMs: number, label: string): Prom
   }
   throw new Error(`timed out waiting for ${label}`);
 };
+
+const PREVIOUS_RELEASE = "b".repeat(40);
+const CADDY_FIXTURE_CONFIG = "fixture proxy configuration\n";
+const INGRESS_COMMANDS = [
+  "sudo -n systemctl show caddy -p MainPID --value",
+  "sudo -n nsenter -t 42 -m -- sudo -u caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile",
+  "sudo -n systemctl reload caddy",
+];
+
+/**
+ * Only these regular fixture files are executable beyond Git. The child PATH
+ * contains this directory alone, so a missing fake cannot fall through to a
+ * host sudo or tar. Git retains the fixture's isolated configuration and uses
+ * the system executable through a task-owned wrapper.
+ */
+const prepareIngressFixture = async (fixture: Fixture): Promise<DeployOptions> => {
+  const root = fixture.root;
+  const bin = `${root}/bin`;
+  await Deno.mkdir(bin);
+  await Deno.mkdir(`${root}/ops`);
+  // This synthetic public config is nonsecret and its containing temp directory
+  // is private. Other-read is required by the actual ingress preflight.
+  await Deno.writeTextFile(`${root}/ops/Caddyfile`, CADDY_FIXTURE_CONFIG, { mode: 0o604 });
+  const shellRoot = "'" + root.replaceAll("'", "'\\''") + "'";
+  const prefix = `#!/bin/sh\nset -eu\nfixture_root=${shellRoot}\n`;
+  const scripts = {
+    git: prefix + 'printf "git %s\\n" "$*" >> "$fixture_root/commands.log"\nexec /usr/bin/git "$@"\n',
+    sudo:
+      prefix +
+      `printf "sudo %s\n" "$*" >> "$fixture_root/commands.log"
+case "$*" in
+  "-n systemctl show caddy -p MainPID --value")
+    if [ -f "$fixture_root/no-caddy" ]; then printf "0\n"; else printf "42\n"; fi ;;
+  "-n nsenter -t 42 -m -- sudo -u caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile")
+    if [ -f "$fixture_root/invalid-caddy" ]; then printf "fixture validation refused\n" >&2; exit 71; fi ;;
+  "-n systemctl reload caddy")
+    if [ -f "$fixture_root/reload-refused" ]; then printf "fixture reload refused\n" >&2; exit 72; fi ;;
+  "-n systemctl daemon-reload") ;;
+  "-n systemctl restart ai-ubq-fi.service")
+    printf "fixture stop after publication\n" >&2; exit 73 ;;
+  *) printf "unexpected fixture sudo arguments\n" >&2; exit 74 ;;
+esac
+`,
+    tar:
+      prefix +
+      `printf "tar %s\n" "$*" >> "$fixture_root/commands.log"
+[ "$#" -eq 4 ] && [ "$1" = "-xf" ] && [ "$3" = "-C" ] && [ "$2" = "$4.tar" ]
+case "$4" in .data/releases/.staging-*) ;; *) exit 75 ;; esac
+/bin/mkdir "$4/src"
+`,
+  };
+  for (const [name, source] of Object.entries(scripts)) {
+    const path = `${bin}/${name}`;
+    await Deno.writeTextFile(path, source);
+    await Deno.chmod(path, 0o700);
+    assert.equal(await Deno.realPath(path), path, "fake executables must be regular files inside the resolved fixture root");
+    assert.equal((await Deno.lstat(path)).isFile, true);
+  }
+  await Deno.mkdir(`${root}/.data/releases/${PREVIOUS_RELEASE}`, { recursive: true });
+  await Deno.writeTextFile(`${root}/.data/releases/${PREVIOUS_RELEASE}/retained.txt`, "previous immutable release\n");
+  const previousRelease = `${root}/.data/releases/${PREVIOUS_RELEASE}`;
+  const current = `${root}/.data/current`;
+  assert.equal(await Deno.realPath(previousRelease), previousRelease, "the previous release must be inside the non-symlink fixture");
+  assert.equal(await Deno.realPath(`${root}/.data`), `${root}/.data`);
+  // Deno.symlink requires unscoped filesystem grants. The dedicated ingress
+  // fixture permits only this exact ln executable to create its initial link.
+  const args = ["-s", previousRelease, current];
+  const link = await new Deno.Command("/bin/ln", { args, cwd: root, env: fixture.env, clearEnv: true, stdout: "piped", stderr: "piped" }).output();
+  console.log(JSON.stringify({ ingress_fixture: "initial_selector", command: ["/bin/ln", ...args], exit_code: link.code }));
+  assert.equal(link.code, 0, decode(link.stderr));
+  return { write: `${root}/.data`, env: { ...fixture.env, PATH: bin }, fakeCommands: [`${bin}/sudo`, `${bin}/tar`] };
+};
+
+const assertPublishedIngressFixture = async (fixture: Fixture, sha: string, run: FixtureRun): Promise<void> => {
+  assert.notStrictEqual(run.code, 0, "scoped filesystem permissions must stop at the actual selector symlink");
+  assert.match(run.stderr, /Deno.symlink\(\) requires unscoped --allow-read and --allow-write permissions/);
+  assert.doesNotMatch(run.stderr, /This release already exists|Requires (run|write|read) access/);
+  assert.equal(await Deno.readLink(`${fixture.root}/.data/current`), `${fixture.root}/.data/releases/${PREVIOUS_RELEASE}`);
+  assert.deepEqual(
+    await readDirNames(`${fixture.root}/.data/releases`),
+    [sha, PREVIOUS_RELEASE].sort((a, b) => a.localeCompare(b))
+  );
+  assert.equal(await Deno.readTextFile(`${fixture.root}/.data/releases/${PREVIOUS_RELEASE}/retained.txt`), "previous immutable release\n");
+  const releaseSource = await Deno.readTextFile(`${fixture.root}/.data/releases/${sha}/src/release.ts`);
+  assert.match(releaseSource, new RegExp(`RELEASE_GIT_SHA = "${sha}"`));
+  const receipt = JSON.parse(await Deno.readTextFile(`${fixture.root}/.data/releases/${sha}/.uos-release.json`));
+  assert.equal(receipt.git_sha, sha);
+  assert.match(receipt.source_archive_sha256, /^[0-9a-f]{64}$/);
+  const calls = (await Deno.readTextFile(`${fixture.root}/commands.log`)).trim().split("\n");
+  const ingress = calls.filter((call) => call.startsWith("sudo "));
+  assert.deepEqual(ingress, INGRESS_COMMANDS);
+  const archiveIndex = calls.findIndex((call) => call.startsWith("git archive "));
+  assert.ok(archiveIndex > calls.indexOf(INGRESS_COMMANDS[2]), "ingress validation and reload must precede the immutable archive");
+  assert.ok(calls.findIndex((call) => call.startsWith("tar ")) > archiveIndex);
+  assert.match(run.stdout, /"ingress_preflight":"caddy_config_valid"/);
+  assert.match(run.stdout, /"caddy_ingress":"reloaded"/);
+  assert.doesNotMatch(run.stdout, /systemd_daemon_reload|health_verified|public_health_verified/);
+  console.log(JSON.stringify({ ingress_fixture: "published_before_scoped_selector_refusal", git_sha: sha, exit_code: run.code, commands: calls }));
+};
+
+Deno.test({
+  name: "VPS deployment validates and reloads ingress before publishing the candidate",
+  ignore: ingressFixtureIgnored,
+  fn: async () => {
+    const fixture = await createFixture({ branch: "development", tracking: "match", relocate: true });
+    try {
+      const options = await prepareIngressFixture(fixture);
+      const sha = await runFixtureGit(fixture.root, fixture.env, ["rev-parse", "HEAD"]);
+      await assertPublishedIngressFixture(fixture, sha, await runDeployFixture(fixture, options));
+    } finally {
+      await fixture.dispose();
+    }
+  },
+});
+
+const ingressFailures = [
+  { label: "an unreadable config", marker: undefined, error: /not readable by the caddy user/, commandCount: 0 },
+  { label: "a stopped Caddy", marker: "no-caddy", error: /Caddy is not running/, commandCount: 1 },
+  { label: "a validation failure", marker: "invalid-caddy", error: /fixture validation refused/, commandCount: 2 },
+  { label: "a reload failure", marker: "reload-refused", error: /fixture reload refused/, commandCount: 3 },
+];
+
+for (const failure of ingressFailures) {
+  Deno.test({
+    name: `VPS ingress preflight preserves releases on ${failure.label} and permits a corrected same-SHA retry`,
+    ignore: ingressFixtureIgnored,
+    fn: async () => {
+      const fixture = await createFixture({ branch: "development", tracking: "match", relocate: true });
+      try {
+        const options = await prepareIngressFixture(fixture);
+        const sha = await runFixtureGit(fixture.root, fixture.env, ["rev-parse", "HEAD"]);
+        if (failure.marker === undefined) await Deno.chmod(`${fixture.root}/ops/Caddyfile`, 0o600);
+        else await Deno.writeTextFile(`${fixture.root}/${failure.marker}`, "synthetic ingress fault\n");
+        const run = await runDeployFixture(fixture, options);
+        assert.notStrictEqual(run.code, 0);
+        assert.match(run.stderr, failure.error);
+        assert.equal(await Deno.readLink(`${fixture.root}/.data/current`), `${fixture.root}/.data/releases/${PREVIOUS_RELEASE}`);
+        assert.deepEqual(
+          await readDirNames(`${fixture.root}/.data/releases`),
+          [PREVIOUS_RELEASE],
+          "preflight failure must create no archive, staging or release"
+        );
+        assert.deepEqual(await readDirNames(`${fixture.root}/.data`), ["current", "deploy.lock", "releases"]);
+        assert.equal(await Deno.readTextFile(`${fixture.root}/.data/releases/${PREVIOUS_RELEASE}/retained.txt`), "previous immutable release\n");
+        const calls = (await Deno.readTextFile(`${fixture.root}/commands.log`)).trim().split("\n");
+        assert.deepEqual(
+          calls.filter((call) => call.startsWith("sudo ")),
+          INGRESS_COMMANDS.slice(0, failure.commandCount)
+        );
+        assert.equal(
+          calls.some((call) => call.startsWith("git archive ") || call.startsWith("tar ")),
+          false
+        );
+        console.log(JSON.stringify({ ingress_fixture: "preflight_failed", fault: failure.label, git_sha: sha, exit_code: run.code, commands: calls }));
+        // Only the injected fault changes between runs; candidate and fakes stay
+        // byte-identical, and the previous namespace must not block this SHA.
+        if (failure.marker === undefined) {
+          await Deno.remove(`${fixture.root}/ops/Caddyfile`);
+          await Deno.writeTextFile(`${fixture.root}/ops/Caddyfile`, CADDY_FIXTURE_CONFIG, { mode: 0o604 });
+        } else await Deno.remove(`${fixture.root}/${failure.marker}`);
+        await Deno.writeTextFile(`${fixture.root}/commands.log`, "");
+        assert.equal(await runFixtureGit(fixture.root, fixture.env, ["rev-parse", "HEAD"]), sha);
+        await assertPublishedIngressFixture(fixture, sha, await runDeployFixture(fixture, options));
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  });
+}
 
 Deno.test({
   name: "VPS deployment rejects a non-canonical root before any Git subprocess runs",

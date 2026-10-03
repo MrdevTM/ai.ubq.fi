@@ -31,7 +31,7 @@ jobs:
       - run: deno task size:check
       - name: Deno test (vps deploy guards)
         run: |
-          deno test --frozen --allow-run=deno,git \
+          deno test --frozen --allow-run=deno,git,/bin/ln \
             --allow-read=ops,.cleanup-evidence/vps-deploy-guards-fixtures \
             --allow-write=.cleanup-evidence/vps-deploy-guards-fixtures \
             --allow-env=PATH tests/vps-deploy-guards.test.ts
