@@ -1491,8 +1491,11 @@ details[data-usage][open] summary[data-usage-title]::after {
     transition-duration: var(--duration-fast);
   }
 
-  [data-toast] {
+  [data-toaster] > [data-toast],
+  [data-toaster] > [data-toast][data-visible],
+  [data-toaster] > [data-toast][data-exiting] {
     transform: none;
+    transition: opacity var(--duration-fast) var(--ease-out);
   }
 
   [data-card]:hover,
