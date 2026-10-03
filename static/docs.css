@@ -117,6 +117,7 @@ body[data-page="docs"] [data-docs-content] a {
 
 body[data-page="docs"] [data-docs-content] pre[data-code] {
   max-width: 100%;
+  padding-top: 48px;
   overscroll-behavior-x: contain;
 }
 
@@ -185,6 +186,10 @@ body[data-page="docs"] [data-copy-code][data-copy-error] {
 }
 
 @media (pointer: coarse) {
+  body[data-page="docs"] [data-docs-content] pre[data-code] {
+    padding-top: calc(var(--control-height) + 16px);
+  }
+
   body[data-page="docs"] [data-copy-code] {
     width: var(--control-height);
     height: var(--control-height);
