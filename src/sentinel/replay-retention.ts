@@ -574,9 +574,10 @@ const finalizeClaimedVictim = async (
   row: SentinelReplayAccountingRow,
   kind: "evicted" | "expired",
   nowMs: number,
-  budgetBytes: number
+  budgetBytes: number,
+  maxChunkDeletes = EVICTION_MAX_CHUNK_DELETES
 ): Promise<Readonly<{ finalized: boolean; chunks: number }>> => {
-  const cleanup = await deleteChunkBatch(kv, row.capture_id, EVICTION_MAX_CHUNK_DELETES);
+  const cleanup = await deleteChunkBatch(kv, row.capture_id, maxChunkDeletes);
   const remaining = cleanup.remaining > 0 ? cleanup.remaining : await countChunks(kv, row.capture_id);
   if (remaining > 0) return { finalized: false, chunks: cleanup.deleted };
   const manifestKey = sentinelReplayManifestKey({
@@ -747,18 +748,16 @@ export const evictSentinelReplays = async (
   let bytes = 0;
   let chunks = 0;
   for (const victim of victims) {
+    const remainingDeletes = Math.max(0, (options.max_chunk_deletes ?? EVICTION_MAX_CHUNK_DELETES) - chunks);
+    if (remainingDeletes <= 0) break;
     const state = await readLedger(kv, budgetBytes);
     if (state.kind === "corrupt") break;
     const ledger = withBudget(state.ledger, budgetBytes);
     if (ledger.stored_bytes <= options.target_bytes) break;
-    const remainingDeletes = Math.max(1, (options.max_chunk_deletes ?? EVICTION_MAX_CHUNK_DELETES) - chunks);
     if (!(await claimVictim(kv, victim.key, victim.row, budgetBytes))) continue;
-    const result = await finalizeClaimedVictim(kv, victim.key, victim.row, "evicted", options.now_ms, budgetBytes);
+    const result = await finalizeClaimedVictim(kv, victim.key, victim.row, "evicted", options.now_ms, budgetBytes, remainingDeletes);
     chunks += result.chunks;
-    if (!result.finalized) {
-      if (remainingDeletes <= 0) break;
-      continue;
-    }
+    if (!result.finalized) continue;
     records += 1;
     bytes += victim.row.bytes;
   }
