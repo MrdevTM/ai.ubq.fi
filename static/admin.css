@@ -575,11 +575,6 @@ body[data-page="admin"] [data-capacity-legend-item="cached-input"] [data-capacit
   opacity: 0.35;
 }
 
-body[data-page="admin"] [data-capacity-legend-item="metered-refill"] [data-capacity-legend-swatch] {
-  border-top-color: var(--warning);
-  border-top-style: dashed;
-}
-
 body[data-page="admin"] [data-capacity-legend-item="optimal-spend"] [data-capacity-legend-swatch] {
   border-top-color: var(--muted-2);
   border-top-style: dashed;
@@ -769,12 +764,6 @@ body[data-page="admin"] [data-capacity-series] {
 body[data-page="admin"] [data-capacity-series="available-capacity"] {
   stroke: var(--accent);
   stroke-width: 2;
-}
-
-body[data-page="admin"] [data-capacity-series="metered-refill"] {
-  stroke: var(--warning);
-  stroke-dasharray: 6 4;
-  stroke-width: 1.5;
 }
 
 body[data-page="admin"] [data-capacity-cache-bucket] {
@@ -1165,54 +1154,6 @@ body[data-page="admin"] [data-provider-details] > summary:focus-visible {
 
 body[data-page="admin"] [data-provider-details][open] > :not(summary) {
   margin-block: 12px;
-}
-
-/* ── Analytics: quota forecast ──────────────────────────────────────────── */
-
-body[data-page="admin"] [data-quota-runway-summary] {
-  margin: 0 0 10px;
-}
-
-body[data-page="admin"] [data-quota-runway-summary] p {
-  margin: 0;
-}
-
-body[data-page="admin"] [data-quota-runway-list] {
-  display: grid;
-  gap: 8px;
-}
-
-body[data-page="admin"] [data-quota-runway-row] {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-}
-
-body[data-page="admin"] [data-quota-runway-row] [data-quota-runway-heading] {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-body[data-page="admin"] [data-quota-runway-row] [data-quota-runway-heading] [data-muted] {
-  font-size: 11px;
-}
-
-body[data-page="admin"] [data-quota-runway-row] [data-quota-runway-details] {
-  text-align: right;
-  min-width: 0;
-}
-
-body[data-page="admin"] [data-quota-runway-row] [data-quota-runway-details] p {
-  margin: 0;
-  overflow-wrap: anywhere;
-  font-variant-numeric: tabular-nums;
 }
 
 /* ── Defaults: metered quota and paid fallback ──────────────────────────── */
@@ -2257,15 +2198,6 @@ body[data-page="admin"] [data-provider-subscription-name] {
 }
 
 @media (max-width: 560px) {
-  body[data-page="admin"] [data-quota-runway-row] {
-    align-items: start;
-    flex-direction: column;
-  }
-
-  body[data-page="admin"] [data-quota-runway-row] [data-quota-runway-details] {
-    text-align: left;
-  }
-
   body[data-page="admin"] [data-capacity-list] {
     grid-template-columns: 1fr;
   }
