@@ -54,8 +54,8 @@ export const PROVIDER_PRESENTATION: Readonly<Record<SelectableProviderId, Provid
   deepseek: {
     label: "DeepSeek",
     tier: "direct",
-    detail: "Official DeepSeek key, served on Chat Completions only.",
-    endpoints: ["/v1/chat/completions"],
+    detail: "Official DeepSeek key, served on Chat Completions upstream and Responses through the gateway's translation.",
+    endpoints: ["/v1/chat/completions", "/v1/responses"],
     health_key: "deepseek",
   },
   cerebras: {
