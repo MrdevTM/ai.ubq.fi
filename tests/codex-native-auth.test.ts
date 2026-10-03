@@ -6,8 +6,11 @@ import { nativeCodexCredentialGeneration, setNativeCodexAuthHooksForTest } from 
 import { selectCodexRoutingAccountsStrong } from "../src/codex/account-routing.ts";
 import { parseCodexAuthPoolSnapshot } from "../src/codex/routing-evaluation.ts";
 import type { CodexAuthState } from "../src/types.ts";
+import { config } from "../src/config.ts";
 
 const HOME = "/synthetic/uos268";
+const DEFAULT_HOME = "/synthetic/uos792";
+const nativeEnvironment = { os: "darwin" as const, getEnv: (name: string): string | undefined => (name === "CODEX_HOME" ? HOME : undefined) };
 const jwt = (claims: Record<string, unknown>): string =>
   `header.${btoa(JSON.stringify(claims)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_")}.signature`;
 const auth = (accountId: string, generation: number): CodexAuthState => ({
@@ -29,7 +32,11 @@ const fixture = async (
     setDocument: (value: unknown) => void;
     refreshes: () => number;
     directOauthCalls: () => number;
-  }) => Promise<void>
+    refreshHomes: () => string[];
+    setEnvironment: (value: Record<string, string | undefined>) => void;
+    setOs: (value: typeof Deno.build.os) => void;
+  }) => Promise<void>,
+  environment: Record<string, string | undefined> = { CODEX_HOME: HOME, HOME: DEFAULT_HOME }
 ): Promise<void> => {
   const first = auth("shared", 1);
   const sibling = auth("uploaded", 2);
@@ -37,6 +44,10 @@ const fixture = async (
   let source: unknown = document(first);
   let refreshes = 0;
   let directOauthCalls = 0;
+  const refreshHomes: string[] = [];
+  let os: typeof Deno.build.os = "darwin";
+  const priorDeploy = config.isDeploy;
+  (config as { isDeploy: boolean }).isDeploy = false;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = () => {
     directOauthCalls += 1;
@@ -45,13 +56,17 @@ const fixture = async (
   setKvForTest(kv as unknown as Deno.Kv);
   resetCodexAuthCacheForTest();
   setNativeCodexAuthHooksForTest({
-    codexHome: HOME,
+    get os() {
+      return os;
+    },
+    getEnv: (name) => environment[name],
     readAuth: () => {
       if (source instanceof Error) return Promise.reject(source);
       return Promise.resolve(source);
     },
-    refresh: () => {
+    refresh: (home) => {
       refreshes += 1;
+      refreshHomes.push(home);
       source = document(auth("shared", 3));
       return Promise.resolve();
     },
@@ -66,12 +81,20 @@ const fixture = async (
       },
       refreshes: () => refreshes,
       directOauthCalls: () => directOauthCalls,
+      refreshHomes: () => refreshHomes,
+      setEnvironment: (value) => {
+        environment = value;
+      },
+      setOs: (value) => {
+        os = value;
+      },
     });
   } finally {
     globalThis.fetch = originalFetch;
     setNativeCodexAuthHooksForTest(null);
     setKvForTest(null);
     resetCodexAuthCacheForTest();
+    (config as { isDeploy: boolean }).isDeploy = priorDeploy;
   }
 };
 
@@ -85,6 +108,64 @@ Deno.test("native ownership binds only the equal CLI account and survives cache 
     assert.deepEqual((await getAuthPoolEntry(true)).pool, parseCodexAuthPool(kv.auth));
   });
 });
+
+for (const [name, environment, expectedHome] of [
+  ["CODEX_HOME override", { CODEX_HOME: HOME, HOME: DEFAULT_HOME }, HOME],
+  ["CODEX_HOME without HOME", { CODEX_HOME: HOME }, HOME],
+  ["HOME default", { HOME: DEFAULT_HOME }, `${DEFAULT_HOME}/.codex`],
+  ["empty CODEX_HOME", { CODEX_HOME: "", HOME: DEFAULT_HOME }, `${DEFAULT_HOME}/.codex`],
+] as const) {
+  Deno.test(`native resolver ${name} binds and refreshes the same credential owner`, async () => {
+    await fixture(async ({ kv, first, sibling, refreshHomes, directOauthCalls }) => {
+      const entry = await getAuthPoolEntry(true);
+      const owner = entry.pool.accounts[0].native_owner;
+      assert.equal(owner?.codex_home, expectedHome);
+      assert.equal(owner.generation_hash, await nativeCodexCredentialGeneration(first));
+      const next = await refreshAuthCoordinated({ ...entry, auth: entry.pool.accounts[0] });
+      assert.equal(next.native_owner?.codex_home, expectedHome);
+      assert.equal(next.native_owner.generation_hash, await nativeCodexCredentialGeneration(next));
+      assert.notEqual(next.refresh_token, first.refresh_token);
+      assert.deepEqual(refreshHomes(), [expectedHome]);
+      assert.deepEqual(kv.auth.accounts[1], sibling);
+      assert.equal(directOauthCalls(), 0);
+    }, environment);
+  });
+}
+
+for (const guard of ["platform", "deployment"] as const) {
+  Deno.test(`native resolver preserves its ${guard} guard despite CODEX_HOME`, async () => {
+    await fixture(async ({ first, kv, refreshes, directOauthCalls, setOs }) => {
+      if (guard === "platform") setOs("linux");
+      else (config as { isDeploy: boolean }).isDeploy = true;
+      const entry = await getAuthPoolEntry(true);
+      assert.equal(entry.pool.accounts[0].native_owner, undefined);
+      const owner = { ...first, native_owner: { codex_home: HOME, generation_hash: await nativeCodexCredentialGeneration(first) } };
+      const snapshot = structuredClone(kv.auth);
+      await assert.rejects(refreshAuthStateless(owner), { code: "codex_auth_owner_unavailable", status: 503 });
+      assert.equal(refreshes(), 0);
+      assert.equal(directOauthCalls(), 0);
+      assert.deepEqual(kv.auth, snapshot);
+    });
+  });
+}
+
+for (const [name, environment] of [
+  ["changed custom home", { CODEX_HOME: "/synthetic/foreign", HOME: DEFAULT_HOME }],
+  ["removed custom home", { HOME: DEFAULT_HOME }],
+  ["missing environment", {}],
+] as const) {
+  Deno.test(`an established custom native owner refuses ${name} without direct OAuth`, async () => {
+    await fixture(async ({ kv, setEnvironment, refreshes, directOauthCalls }) => {
+      const entry = await getAuthPoolEntry(true);
+      const snapshot = structuredClone(kv.auth);
+      setEnvironment(environment);
+      await assert.rejects(refreshAuthCoordinated({ ...entry, auth: entry.pool.accounts[0] }), { code: "codex_auth_owner_unavailable", status: 503 });
+      assert.equal(refreshes(), 0);
+      assert.equal(directOauthCalls(), 0);
+      assert.deepEqual(kv.auth, snapshot);
+    });
+  });
+}
 
 Deno.test("native refresh adopts its persisted generation while preserving an uploaded sibling", async () => {
   await fixture(async ({ kv, first, sibling, refreshes }) => {
@@ -184,7 +265,7 @@ for (const failure of ["missing", "account-mismatch", "rollback"] as const) {
 Deno.test("successful native RPC without persisted progress remains a failed refresh", async () => {
   await fixture(async ({ first }) => {
     const entry = await getAuthPoolEntry(true);
-    setNativeCodexAuthHooksForTest({ codexHome: HOME, readAuth: () => Promise.resolve(document(first)), refresh: () => Promise.resolve() });
+    setNativeCodexAuthHooksForTest({ ...nativeEnvironment, readAuth: () => Promise.resolve(document(first)), refresh: () => Promise.resolve() });
     await assert.rejects(refreshAuthCoordinated({ ...entry, auth: entry.pool.accounts[0] }), /did not persist/);
   });
 });
@@ -193,7 +274,7 @@ Deno.test("native daemon failure never activates a direct refresh fallback", asy
   await fixture(async ({ first }) => {
     const entry = await getAuthPoolEntry(true);
     setNativeCodexAuthHooksForTest({
-      codexHome: HOME,
+      ...nativeEnvironment,
       readAuth: () => Promise.resolve(document(first)),
       refresh: () => Promise.reject(new Error("synthetic absent daemon")),
     });
@@ -225,12 +306,12 @@ Deno.test("native generation CAS retries preserve a concurrent unrelated-account
     const entry = await getAuthPoolEntry(true);
     const replacement = auth("uploaded", 5);
     setNativeCodexAuthHooksForTest({
-      codexHome: HOME,
+      ...nativeEnvironment,
       readAuth: () => Promise.resolve(document(first)),
       refresh: () => {
         kv.auth = { accounts: [kv.auth.accounts[0], replacement], updated_at_ms: Date.now() };
         kv.authVersion += 1;
-        setNativeCodexAuthHooksForTest({ codexHome: HOME, readAuth: () => Promise.resolve(document(auth("shared", 3))) });
+        setNativeCodexAuthHooksForTest({ ...nativeEnvironment, readAuth: () => Promise.resolve(document(auth("shared", 3))) });
         return Promise.resolve();
       },
     });

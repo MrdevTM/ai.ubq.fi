@@ -16,6 +16,8 @@ import { requestNativeCodexRefresh } from "./native-auth-transport.ts";
 
 type NativeAuthHooks = {
   codexHome?: string;
+  os?: typeof Deno.build.os;
+  getEnv?: (name: string) => string | undefined;
   readAuth?: () => Promise<unknown>;
   refresh?: (home: string, email: string, accountId?: string) => Promise<void>;
 };
@@ -28,9 +30,12 @@ export const setNativeCodexAuthHooksForTest = (value: NativeAuthHooks | null): v
 
 const nativeHome = (): string | null => {
   if (hooks?.codexHome) return hooks.codexHome;
-  if (Deno.build.os !== "darwin" || config.isDeploy) return null;
+  if ((hooks?.os ?? Deno.build.os) !== "darwin" || config.isDeploy) return null;
   try {
-    const home = Deno.env.get("HOME");
+    const getEnv = hooks?.getEnv ?? ((name: string) => Deno.env.get(name));
+    const codexHome = getEnv("CODEX_HOME");
+    if (codexHome) return codexHome;
+    const home = getEnv("HOME");
     return home ? `${home}/.codex` : null;
   } catch {
     return null;
