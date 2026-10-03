@@ -8,6 +8,7 @@
 // the cached public list refreshes.
 
 import { readBoundedResponseBody } from "../bounded-response-body.ts";
+import { ApiKeyQuotaDispatchError } from "../api-key-policy.ts";
 import { markChatSemanticOutput } from "../chat/stream-translation.ts";
 import { json, openaiError } from "../http.ts";
 import { BUFFERED_INFERENCE_DEADLINE_MS } from "../inference-deadline.ts";
@@ -70,6 +71,7 @@ const dispatchUpstream = async (attempt: () => Promise<Response>, requestSignal:
   try {
     upstream = await attempt();
   } catch (error) {
+    if (error instanceof ApiKeyQuotaDispatchError) throw error;
     return { response: dispatchFailure(error), providerRequestId: null };
   }
   const providerRequestId = providerRequestIdFromResponse(upstream);
