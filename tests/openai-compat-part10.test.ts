@@ -1,6 +1,7 @@
 // openai-compat suite, part 10 of 12: tests moved out of tests/openai-compat.test.ts.
 
 import assert from "node:assert/strict";
+import { deepSeekChatBodyDiagnostic } from "../src/upstream-wire.ts";
 import {
   DEEPSEEK_CHAT_COMPLETIONS_URL,
   DEEPSEEK_FLASH_MODEL,
@@ -485,6 +486,63 @@ Deno.test("openai: DeepSeek official Chat Completions adapter streams natively a
       const telemetry = getResponseTelemetry(response);
       assert.equal(telemetry?.failureKind, "upstream_http_error");
       assert.deepEqual(telemetry.attemptedProviders, ["deepseek"]);
+    });
+
+    await t.step("logs the bounded diagnostic of the serialized projected dispatch body", async () => {
+      const privateMarker = "private-diagnostic-payload";
+      const privateMessages = [
+        { role: "developer", content: privateMarker },
+        { role: "user", content: privateMarker },
+        {
+          role: "assistant",
+          content: null,
+          reasoning_content: privateMarker,
+          tool_calls: [{ id: privateMarker, type: "function", function: { name: privateMarker, arguments: privateMarker } }],
+        },
+        { role: "tool", tool_call_id: privateMarker, content: privateMarker },
+      ];
+      for (const testCase of [
+        { model: DEEPSEEK_V4_FLASH_MODEL, reasoning_effort: "ultra", max_completion_tokens: 321, stream: false },
+        { model: DEEPSEEK_FLASH_MODEL, reasoning_effort: "none", stream: true },
+      ]) {
+        const logs: unknown[][] = [];
+        const originalConsoleWarn = console.warn;
+        let wireBody: Record<string, unknown> | null = null;
+        console.warn = (...args: unknown[]) => {
+          logs.push(args);
+        };
+        try {
+          const response = await withFetchMock(
+            (_url, bodyText) => {
+              wireBody = JSON.parse(String(bodyText)) as Record<string, unknown>;
+              return Response.json({ error: { message: "Synthetic provider failure", code: "invalid_request" } }, { status: 400 });
+            },
+            () =>
+              handleChatCompletions(
+                request({
+                  ...testCase,
+                  messages: privateMessages,
+                  tools: [{ type: "function", function: { name: privateMarker, description: privateMarker, parameters: { type: "object" } } }],
+                })
+              )
+          );
+          assert.equal(response.status, 400);
+          await response.json();
+        } finally {
+          console.warn = originalConsoleWarn;
+        }
+        assert.ok(wireBody);
+        const diagnosticLogs = logs.filter((entry) => entry[0] === "[ai.ubq.fi] deepseek_upstream_error");
+        assert.equal(diagnosticLogs.length, 1);
+        const diagnostic = JSON.parse(String(diagnosticLogs[0][1])) as { request: Record<string, unknown> };
+        assert.deepEqual(diagnostic.request, deepSeekChatBodyDiagnostic(wireBody));
+        assert.equal(diagnostic.request.model, DEEPSEEK_FLASH_MODEL);
+        assert.equal(diagnostic.request.max_tokens, testCase.max_completion_tokens ?? null);
+        assert.equal(diagnostic.request.reasoning_effort, testCase.reasoning_effort === "ultra" ? "max" : "none");
+        assert.equal((diagnostic.request.messages as { role: string }[])[0].role, "system");
+        assert.doesNotMatch(JSON.stringify(logs), new RegExp(`${privateMarker}|${fakeApiKey}`));
+      }
+      assert.equal(privateMessages[0].role, "developer");
     });
 
     await t.step("keeps the generic error when the upstream failure body is not JSON", async () => {
