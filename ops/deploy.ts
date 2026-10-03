@@ -150,6 +150,9 @@ async function deploy(): Promise<void> {
     // Capture the candidate only after the lock: a deployment that waited for it
     // must not release a revision from before the wait.
     const sha = await assertDeployableCheckout();
+    // Refuse ingress faults before publishing or selecting an immutable release,
+    // so correcting the fault can retry this same revision.
+    await ensureCaddyIngressReady();
     const release = `.data/releases/${sha}`;
     try {
       await Deno.stat(release);
@@ -171,7 +174,6 @@ async function deploy(): Promise<void> {
     const next = `.data/current-${crypto.randomUUID()}`;
     await Deno.symlink(`releases/${sha}`, next);
     await Deno.rename(next, ".data/current");
-    await ensureCaddyIngressReady();
     // Repository-owned unit files are linked from `/etc/systemd/system`, so the
     // checkout update above changes their content, but systemd keeps the
     // previously loaded definition until `daemon-reload`. Reload before the
