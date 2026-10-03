@@ -10,6 +10,17 @@
  */
 
 import assert from "node:assert/strict";
+import {
+  SENTINEL_REPLAY_MAX_UPSTREAM_ATTEMPTS,
+  SENTINEL_REPLAY_MAX_UPSTREAM_BYTES,
+  SENTINEL_REPLAY_MAX_UPSTREAM_CHUNKS,
+  SENTINEL_REPLAY_UPSTREAM_FILE_MAX_BYTES,
+} from "../src/sentinel/replay-limits.ts";
+import {
+  SENTINEL_UPSTREAM_MAX_HEADER_VALUE_CHARS,
+  SENTINEL_UPSTREAM_MAX_TIMING_MS,
+  SENTINEL_UPSTREAM_SAFE_RESPONSE_HEADER_NAMES,
+} from "../src/sentinel/upstream-capture.ts";
 
 const REPO_ROOT = Deno.cwd();
 // Scratch lives under .data/, which git, Prettier and ESLint already ignore. A
@@ -108,7 +119,7 @@ type FixtureAttempt = Readonly<{
   terminal: FixtureTerminal;
 }>;
 type FixtureTrace = Readonly<{
-  version: 1;
+  version: 1 | 2;
   attempts: readonly FixtureAttempt[];
   attempts_truncated: boolean;
   bytes_truncated: boolean;
@@ -464,6 +475,99 @@ Deno.test("fixed consumer replays a complete recorded codex stream through the b
     assert.equal(result.stdout, markers(DEFAULT_IDS));
     assert.equal(result.stderr, "");
   });
+});
+
+Deno.test("fixed consumer accepts maximal padded timed v2 framing and rejects each exceeded shared bound", async () => {
+  const chunkBytes = SENTINEL_REPLAY_MAX_UPSTREAM_BYTES / SENTINEL_REPLAY_MAX_UPSTREAM_CHUNKS;
+  const chunksPerAttempt = SENTINEL_REPLAY_MAX_UPSTREAM_CHUNKS / SENTINEL_REPLAY_MAX_UPSTREAM_ATTEMPTS;
+  assert.equal(chunkBytes % 3, 1, "every separately encoded chunk must require base64 padding");
+  const headers = Object.fromEntries(SENTINEL_UPSTREAM_SAFE_RESPONSE_HEADER_NAMES.map((name) => [name, "x".repeat(SENTINEL_UPSTREAM_MAX_HEADER_VALUE_CHARS)]));
+  const startedAtMs = Number.MAX_SAFE_INTEGER - SENTINEL_UPSTREAM_MAX_TIMING_MS;
+  const timedAttempts = Array.from({ length: SENTINEL_REPLAY_MAX_UPSTREAM_ATTEMPTS }, (_value, attemptIndex) => {
+    const finalAttempt = attemptIndex === SENTINEL_REPLAY_MAX_UPSTREAM_ATTEMPTS - 1;
+    const chunks = Array.from({ length: chunksPerAttempt }, (_chunk, chunkIndex) => {
+      if (!finalAttempt) return " ".repeat(chunkBytes);
+      let event = "";
+      if (chunkIndex === 0) event = created("resp_maximal") + delta("resp_maximal", "hello");
+      if (chunkIndex === chunksPerAttempt - 1) event = completed("resp_maximal", "hello");
+      return `${event}: ${"x".repeat(chunkBytes - event.length - 4)}\n\n`;
+    });
+    return {
+      ...attempt("chatgpt_codex", chunks, "eof", { status: finalAttempt ? 200 : 500, content_type: finalAttempt ? "text/event-stream" : "application/json" }),
+      headers,
+      headers_truncated: false,
+      chunk_times_ms: chunks.map(() => SENTINEL_UPSTREAM_MAX_TIMING_MS),
+      started_at_ms: startedAtMs,
+      headers_at_ms: startedAtMs + 1,
+      ended_at_ms: Number.MAX_SAFE_INTEGER,
+    };
+  });
+  const fixture: FixtureTrace = { ...trace(timedAttempts), version: 2 };
+  const encodedChunks = timedAttempts.flatMap((entry) => entry.chunks_base64);
+  assert.equal(encodedChunks.length, SENTINEL_REPLAY_MAX_UPSTREAM_CHUNKS);
+  assert.equal(
+    encodedChunks.every((chunk) => chunk.endsWith("==")),
+    true,
+    "each chunk is padded individually"
+  );
+  assert.equal(
+    encodedChunks.reduce((bytes, chunk) => bytes + atob(chunk).length, 0),
+    SENTINEL_REPLAY_MAX_UPSTREAM_BYTES
+  );
+  const serialized = JSON.stringify(fixture);
+  assert.ok(serialized.length < SENTINEL_REPLAY_UPSTREAM_FILE_MAX_BYTES, "maximal v2 fields fit the imported file bound");
+  // JSON permits trailing whitespace: exercise the exact shared file boundary
+  // without changing the decoded trace, rather than copying an old size formula.
+  const boundaryFile = serialized.padEnd(SENTINEL_REPLAY_UPSTREAM_FILE_MAX_BYTES, " ");
+  assert.equal(new TextEncoder().encode(boundaryFile).byteLength, SENTINEL_REPLAY_UPSTREAM_FILE_MAX_BYTES);
+  const filesFor = (content: string): readonly CaseFile[] =>
+    replayCase({ trace: fixture, stream: true, report: true }).map((file) => (file.path === "fixtures/upstream.json" ? { ...file, content } : file));
+  await withCase(filesFor(boundaryFile), async (dir) => {
+    const result = await runFixedConsumer(dir);
+    assert.equal(result.code, 0, "the real CLI must accept all decoded, chunk, attempt and file limits together");
+    assert.equal(result.stdout.endsWith(markers(DEFAULT_IDS)), true);
+    assert.equal(result.stderr, "");
+    const report = replayReport(result);
+    assert.equal(report.attempts, SENTINEL_REPLAY_MAX_UPSTREAM_ATTEMPTS);
+    assert.deepEqual(
+      report.attempt_statuses,
+      timedAttempts.map((entry) => entry.status)
+    );
+    assert.equal(report.outcome, "completed");
+  });
+  const firstAttempt = timedAttempts.at(0);
+  assert.ok(firstAttempt);
+  const firstChunk = firstAttempt.chunks_base64.at(0);
+  assert.ok(firstChunk);
+  const oversizedBytes = {
+    ...fixture,
+    attempts: [{ ...firstAttempt, chunks_base64: [btoa(`${atob(firstChunk)}x`), ...firstAttempt.chunks_base64.slice(1)] }, ...timedAttempts.slice(1)],
+  };
+  const oversizedChunks = {
+    ...fixture,
+    attempts: [
+      {
+        ...firstAttempt,
+        chunks_base64: [...firstAttempt.chunks_base64, btoa("")],
+        chunk_times_ms: [...firstAttempt.chunk_times_ms, SENTINEL_UPSTREAM_MAX_TIMING_MS],
+      },
+      ...timedAttempts.slice(1),
+    ],
+  };
+  const oversizedAttempts = {
+    ...fixture,
+    attempts: [...timedAttempts, { ...firstAttempt, chunks_base64: [], chunk_times_ms: [] }],
+  };
+  for (const [label, content] of [
+    ["decoded byte bound plus one", JSON.stringify(oversizedBytes)],
+    ["chunk bound plus one", JSON.stringify(oversizedChunks)],
+    ["attempt bound plus one", JSON.stringify(oversizedAttempts)],
+    ["shared file bound plus one", `${boundaryFile} `],
+  ] as const) {
+    await withCase(filesFor(content), async (dir) => {
+      assertUnavailableWithReport(await runFixedConsumer(dir), label);
+    });
+  }
 });
 
 Deno.test("fixed consumer preserves trusted marker order and emits no extra output", async () => {
