@@ -6552,6 +6552,7 @@ const VIEW_HASHES = {
   kernel: "kernel",
   pubkeys: "pubkeys",
   defaults: "defaults",
+  models: "models",
   analytics: "analytics",
   providers: "providers",
   errors: "errors",
