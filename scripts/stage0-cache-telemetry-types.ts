@@ -24,7 +24,7 @@ export const INFERENCE_PROVIDER_VALUES = ["chatgpt_codex", "metered", "surplus"]
 export const INFERENCE_PROVIDERS = new Set(INFERENCE_PROVIDER_VALUES);
 export const PROMPT_CACHE_MODE_VALUES = ["implicit", "explicit", "legacy_retention", "unspecified"] as const;
 export const PROMPT_CACHE_MODES = new Set(PROMPT_CACHE_MODE_VALUES);
-export const ACTIVE_TRANSITION_REASON_VALUES = ["quota_exhausted", "credential_invalid", "account_removed_or_replaced"] as const;
+export const ACTIVE_TRANSITION_REASON_VALUES = ["quota_exhausted", "credential_invalid", "account_removed_or_replaced", "model_unavailable"] as const;
 /** `none` is only the report bucket for a null wire reason, never a wire value. */
 export const ACTIVE_TRANSITION_REASON_KEYS = ["none", ...ACTIVE_TRANSITION_REASON_VALUES] as const;
 export const ACTIVE_TRANSITION_REASONS = new Set(ACTIVE_TRANSITION_REASON_VALUES);
@@ -47,7 +47,7 @@ export type TerminalRoute = "responses" | "chat.completions" | "embeddings" | "e
 export type InferenceRoute = "responses" | "chat.completions";
 export type InferenceTerminalOutcome = (typeof INFERENCE_TERMINAL_OUTCOMES)[number];
 export type PromptCacheMode = "implicit" | "explicit" | "legacy_retention" | "unspecified";
-export type ActiveTransitionReason = "quota_exhausted" | "credential_invalid" | "account_removed_or_replaced" | null;
+export type ActiveTransitionReason = (typeof ACTIVE_TRANSITION_REASON_VALUES)[number] | null;
 export type StreamTerminalType = "response.completed" | "response.failed" | "response.incomplete" | "error" | "eof" | "cancelled" | "deadline";
 
 export type ReleaseIdentity = Readonly<{

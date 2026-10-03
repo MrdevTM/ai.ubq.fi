@@ -27,14 +27,14 @@ call. This document is the mapping from each retired job to the event that repla
   overwrites that bucket's point instead of adding one.
 - **Maintenance never delays a user request.** Every hook is fired fire-and-forget, and the reconciliation sweep is
   gate-guarded, so a sweep with nothing due costs one KV read.
-- **Reconciliation has a manual path.** Reading a key's paid-fallback ledger settles everything due, so an operator can
-  always force the billing picture to converge without waiting for traffic.
+- **Reconciliation has a manual path.** Reading a key's paid-fallback ledger schedules best-effort reconciliation of due
+  work without awaiting it; the response can still contain unreconciled rows.
 
 ## What an operator should expect
 
-- Capacity history and the paid-fallback ledger converge on the next request or the next admin read: a normal capacity
-  read is at most one 30-second freshness window behind (`PROVIDER_CAPACITY_READ_FRESH_MS`), while the durable capacity
-  history bucket remains fifteen minutes, and billing converges on the next paid-fallback terminal event.
-  `?refresh=live` on the capacity endpoint still forces an immediate probe.
+- Capacity history converges on the next request or the next admin read: a normal capacity read is at most one 30-second
+  freshness window behind (`PROVIDER_CAPACITY_READ_FRESH_MS`), while the durable capacity history bucket remains fifteen
+  minutes. Paid-fallback terminal events and ledger reads schedule best-effort reconciliation; a ledger read can return
+  before settlement. `?refresh=live` on the capacity endpoint still forces an immediate probe.
 - On a busy gateway the events arrive continuously, so cadence is effectively the same as the retired jobs were, without
   the idle-time work.
