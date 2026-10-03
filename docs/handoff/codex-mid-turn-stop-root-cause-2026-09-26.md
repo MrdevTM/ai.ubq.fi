@@ -17,8 +17,10 @@ What stands after all of them:
    GPT turns against 79 DeepSeek, including the owner's reported stray ESC or stop-button interruptions. Filtering these
    is necessary for describing completed predecessors, but a completed status does not make a continuation reply a
    validated failure label.
-4. **Nothing in this repository was changed, deployed, or pushed while preparing this document.** The gateway patch
-   described below is falsified by backtesting; see "Backtest result" and "Proposed patch surface — withdrawn".
+4. **Nothing in this repository was changed, deployed, or pushed while preparing the original investigation.** The
+   proposed gateway patch remains withdrawn. Its acknowledgement-labelled backtest does not establish detection
+   accuracy, and the independent prohibition on hidden inference remains; see "Backtest result" and "Proposed patch
+   surface — withdrawn".
 
 What does _not_ stand, and should not be reused:
 
@@ -31,12 +33,13 @@ What does _not_ stand, and should not be reused:
 **Metric correction:** the retained historical rounds below used acknowledgement or continuation replies as failure
 labels without independently verifying unfinished authorized work. Their raw counts, arithmetic and experimental
 provenance are preserved, but their stop-rate comparisons and rate-dependent negative or causal conclusions are
-unvalidated pending a separate correction. Independent source observations remain distinct from those conclusions; no
-experiment or corpus recount was performed for this correction.
+inconclusive and re-testable with independently validated task-completion outcomes. The conclusions below now carry that
+qualification. Independent source observations remain distinct from those conclusions; no experiment or corpus recount
+was performed for these corrections.
 
 Scope: why Codex turns appear to stop before the task is finished, how that interacts with the DeepSeek tiers served by
-this gateway, why DeepSeek Harness (DSH) never exhibits the symptom against the same gateway and the same model, and
-where a scoped LithosAI `-ultra` patch would live if one were warranted.
+this gateway, whether DeepSeek Harness (DSH) differs against the same gateway and the same model, and where a scoped
+LithosAI `-ultra` patch would live if one were warranted.
 
 ## Symptom
 
@@ -52,6 +55,10 @@ independently validating unfinished authorized work.
 
 Thirteen rounds were run against the same corpus. Listed in order, because the sequence matters: most rounds corrected
 an earlier one.
+
+The ledger records what each historical round claimed at the time. Its reply-derived outcome claims and negative results
+are superseded by the metric correction and qualified hypothesis status below; it is not a list of validated failure
+conclusions.
 
 | Round | Claim                                                                               | Outcome                                                                                                |
 | ----- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -163,11 +170,12 @@ These appear in Codex logs and were each raised and then ruled out as the cause 
 ## Backtest result
 
 The detector in "Proposed patch surface" was implemented and scored against every `task_complete` in the 182 Codex
-rollouts. Ground truth for a stop is the owner's recorded acknowledgement: an ack-only user message (`ok`, `okay`, `k`,
-or an `ok`-prefixed follow-up) whose preceding turn ended the same way the reported symptom does.
+rollouts. The historical run used the owner's acknowledgement as a positive label: an ack-only user message (`ok`,
+`okay`, `k`, or an `ok`-prefixed follow-up). These labels are not task-completion ground truth, and the retained
+"correctly" and "incorrectly" table captions describe agreement with those historical labels only.
 
-Note that this run pooled all models, which the section below shows is methodologically wrong; the detector fails on the
-Ultra-only subset in the same way and for the same structural reason, so the conclusion is unaffected.
+This run pooled models. Its pooled and Ultra-only scores cannot establish detector performance on unfinished authorized
+work without validated outcome labels.
 
 |                                    | count     |
 | ---------------------------------- | --------- |
@@ -177,16 +185,19 @@ Ultra-only subset in the same way and for the same structural reason, so the con
 | **Detector fires, incorrectly**    | **2,534** |
 | Detector misses                    | 0         |
 
-Precision 1.8%. Recall 100%. Baseline for always predicting a stop 1.7%.
+Historical acknowledgement-label precision 1.8%. Recall 100%. Baseline for always predicting an acknowledgement 1.7%.
+These are not validated failure-detection scores.
 
-The rule has no discriminating power. It fires on 2,534 turns the owner never had to resume, because ending on a
-text-only assistant item is the ordinary shape of every completed turn — a final answer is text with no tool call. The
-46 real failures are not separable by this structure from the 2,534 legitimate completions.
+The detector fired on 2,534 turns without the selected acknowledgement and on all 46 labelled positives. Neither group
+is independently validated as finished or unfinished. The source observation that legitimate final answers can contain
+text with no tool call survives, but these scores do not establish that no structural detector can distinguish task
+outcomes.
 
-Had this shipped, the gateway would have force-continued every normal answer on the route.
+Had this shipped, the rule could have force-continued legitimate final answers; its actual false-positive incidence is
+unvalidated.
 
-This is the same failure mode as the historical gateway recheck retired in `be89f4919`, which had to delegate the
-decision to the model because no deterministic structural predicate exists.
+The historical gateway recheck was retired in `be89f4919` because hidden inference was forbidden. That independent
+policy remains; its retirement does not prove that no deterministic predicate can exist.
 
 ## Refuted hypothesis: fragmented tool calls were dropped in translation
 
@@ -199,10 +210,11 @@ DSH does merge them, in `@deepseek-ai/dsh-llm-deepseek` `translate()`, accumulat
 This gateway does the same in `src/deepseek/responses-stream.ts`, `mergeToolCallDelta()`, keyed by `raw.index` with
 `existing.arguments += fn.arguments`. Fragmented calls are accumulated and announced at the terminal, not dropped.
 
-Both clients therefore assemble identical tool calls, and the translation loses nothing. The two loops are also
-byte-identical at the deciding line (`if (toolCalls.length === 0) return { kind: "completed" }`).
+The inspected paths use the same fragment-accumulation mechanism; this source comparison does not exclude every
+translation or gateway defect. The two loops are also byte-identical at the deciding line
+(`if (toolCalls.length === 0) return { kind: "completed" }`).
 
-No structural feature tested separates the failure class:
+Historical feature comparisons against acknowledgement labels, not validated failure outcomes:
 
 | Feature                                 | Positive | Negative    | Verdict              |
 | --------------------------------------- | -------- | ----------- | -------------------- |
@@ -212,7 +224,8 @@ No structural feature tested separates the failure class:
 | Reasoning tokens (p50)                  | 219,407  | 251,387     | overlapping          |
 | Tool calls present in turn              | 42/46 ≥1 | —           | not a separator      |
 
-Zero of the 46 stopping turns are distinguishable from a legitimate completion by any structural signal examined.
+The comparisons cover 46 acknowledgement-labelled turns. Whether these features distinguish unfinished authorized work
+remains inconclusive and re-testable with validated outcomes.
 
 ## Measured incidence, and why the earlier corpus was misleading
 
@@ -230,15 +243,16 @@ The apparent post-reminder improvement is a model-mix artifact, not an effect. B
 `deepseek-flash`; Ultra appears only afterwards. Isolated to Ultra, the rate is 2.21% — statistically indistinguishable
 from the 2.22% measured before the reminder existed.
 
-This independently reproduces the decision record's own finding that "the reminder alone is insufficient" (`be89f4919`,
-discussing PR #395).
+This acknowledgement-frequency comparison does not independently reproduce the decision record's finding that "the
+reminder alone is insufficient" (`be89f4919`, discussing PR #395). Any independently validated reproduction in that
+record stands on its own evidence; reminder efficacy cannot be decided from these reply counts.
 
-Consequence for any future candidate: the Ultra-only population is **181 turns across 43 sessions, with 4 acknowledged
-stops**. That is too thin to validate a detector, and it means an acceptable fix must be argued from mechanism rather
-than measured on this sample. Any further backtest must filter to Ultra turns; pooling models silently mixes a ~2%
-population with a ~0.8% one and produces a trend that does not exist.
+The Ultra-only population is **181 turns across 43 sessions, with 4 acknowledgement-labelled positives**.
+Task-completion labels are missing regardless of sample size. The recorded ~2% and ~0.8% reply-frequency populations
+also show why model mix must be controlled in a future validated comparison; they do not establish efficacy or its
+absence.
 
-## A prompt-side mechanism already exists, and it is measurable but not sufficient
+## A prompt-side mechanism already exists; efficacy here is inconclusive
 
 The gateway already injects a continuation reminder server-side. `src/deepseek/chat-projection.ts` appends:
 
@@ -254,10 +268,10 @@ every model: `appendContinuationInstruction` runs only when the request carries 
 `tool_choice !== "none"`, so non-agent traffic and hard no-tools requests are untouched. Introduced in `74f32ff43`,
 deployed as `e04f67ff` (PR #395).
 
-So the "unsophisticated prompt-side fix" the owner rejected is not hypothetical — it is already live on this route, and
-it did not remove the symptom. That is a stronger statement than the earlier reasoning that a prompt is merely
-suggestive: this one is applied server-side, scoped to tool-bearing Ultra requests, and the measured failure rate on
-that population is unchanged.
+The source and recorded deployment establish that the reminder existed on this route with the stated tool-bearing scope.
+The acknowledgement-derived comparison does not establish that it removed the symptom, failed to remove it, or left a
+failure rate unchanged. Its efficacy is inconclusive here and may be re-tested with independently validated
+unfinished-authorized-work outcomes.
 
 ## The terminating rule is about the response, not the text item — corrected again
 
@@ -523,7 +537,8 @@ looked like a candidate cause. Tested within DeepSeek only:
 | Threads without reasoning items | 2,178 | 41   | 1.88% |
 | Threads with reasoning items    | 869   | 11   | 1.27% |
 
-p = 0.28. The apparent effect was the model-family split re-encoded, not a cause. Reasoning presence is not implicated.
+p = 0.28 on acknowledgement labels. This does not exclude reasoning-item presence as a factor in premature stops; the
+hypothesis remains inconclusive and re-testable with validated task outcomes.
 
 ## The symptom has a start date, and it is not attributable to a version
 
@@ -544,19 +559,20 @@ It behaves like something introduced, not like a constant property of the tiers.
 Zero of 319 DeepSeek turns before 2026-09-19 are acknowledged; the behavior appears on 09-19 and persists. The onset is
 real and the pre-onset corpus is clean.
 
-### It is the model, not the client version — and round 9's version hypothesis is refuted
+### Historical client-version comparison — inconclusive after metric retraction
 
 Round 9 noted that CLI 0.155.1 is exactly the version in use from 09-19 and proposed a Codex 0.155 change as a
-candidate. Comparing families _within_ each version refutes that, because the direction reverses:
+candidate. The historical acknowledgement ordering reverses when families are compared within each version:
 
 | CLI version | DeepSeek         | GPT family    | Direction           |
 | ----------- | ---------------- | ------------- | ------------------- |
 | 0.154.0     | 0/154 (0.00%)    | 4/714 (0.56%) | DeepSeek **lower**  |
 | 0.155.1     | 41/2,362 (1.74%) | 0/158 (0.00%) | DeepSeek **higher** |
 
-No client version can produce a reversal of that kind. Version is neither necessary nor sufficient.
+The reversal does not exclude a client-version effect on unfinished authorized work. These are acknowledgement
+frequencies with unmatched task outcomes, so the version hypothesis is inconclusive and re-testable.
 
-The post-onset breakdown holds the version fixed and varies the model — the comparison that isolates the variable:
+The recorded breakdown holds version fixed and varies model, but it does not isolate a cause of premature stops:
 
 | Model            | CLI version | Window      | Turns | Acks | Rate  |
 | ---------------- | ----------- | ----------- | ----- | ---- | ----- |
@@ -564,15 +580,17 @@ The post-onset breakdown holds the version fixed and varies the model — the co
 | `gpt-6-astra`    | 0.155.1     | after 09-19 | 88    | 0    | 0.00% |
 | `gpt-5.6-luna`   | 0.155.1     | after 09-19 | 24    | 0    | 0.00% |
 
-Same client version, same gateway, same period, and only the DeepSeek tier stalls. And the reverse control, holding the
-period fixed at 09-16 to 09-18 where both families ran 0.154.0:
+Same client version, gateway and period, with acknowledgements recorded only for DeepSeek in these rows. This does not
+establish which turns stalled. The reverse comparison holds the period fixed at 09-16 to 09-18 where both families ran
+0.154.0:
 
 | Family     | CLI version | Window         | Turns | Acks |
 | ---------- | ----------- | -------------- | ----- | ---- |
 | DeepSeek   | 0.154.0     | 09-16 to 09-18 | 154   | 0    |
 | GPT family | 0.154.0     | 09-16 to 09-18 | 45    | 0    |
 
-Both null before the onset. So the pre-onset DeepSeek corpus is genuinely clean rather than merely small.
+Both acknowledgement counts are zero before the reported boundary. This does not validate either population as free of
+premature stops.
 
 The GPT acknowledgements on 0.154.0 come from 09-10 to 09-12, when DeepSeek was not running at all, which is why the
 naive version table in the previous section appears to favour DeepSeek. Restricting to the window where both families
@@ -616,7 +634,7 @@ This is the fifth measurement in this investigation whose apparent effect revers
 control, and the ratio-correction pattern is worth noting on its own: DeepSeek shows about 5 requests per turn against 1
 for the GPT family, which is a real difference in turn length and would have been easy to mistake for the defect.
 
-### The prompt itself was tested, and it is not a factor either
+### Historical prompt-length comparison — inconclusive
 
 The user-visible prompt is the one input the investigation had never examined. Threads that stall do have a somewhat
 longer longest-prompt than clean threads (median 271 characters against 182, p90 2,693 against 1,720, over 32 stalled
@@ -631,9 +649,10 @@ Tested within DeepSeek only, splitting threads at a 500-character longest prompt
 
 Fisher p = 0.74. The cells are too small — 6 and 16 stalled threads — for the apparent twofold difference to mean
 anything, and the first prompt of a thread shows no difference at all (median 112 against 128 characters). Recorded as
-tested and inconclusive rather than as a weak positive; a larger DeepSeek corpus would be needed to settle it.
+tested and inconclusive rather than as a weak positive. A future comparison needs validated task outcomes as well as
+sufficient samples; more acknowledgement-labelled turns alone would not settle it.
 
-### Holding turn length constant: the stall rate does not depend on it
+### Historical turn-length comparison — inconclusive
 
 Round 12 noted that any between-family comparison must hold turn length constant, because the families differ on it by
 about five times. Doing that within DeepSeek, by exact upstream request count:
@@ -661,9 +680,9 @@ Fisher p = 0.78. The zero-stall run from 7 to 30 requests is a gap in a sparse t
 35 requests, and the GPT family shows 0/858 at every length. Any statement that stalls are specific to short turns would
 have been reading a table rather than testing a hypothesis, which is the same error as the round-11 bare-response rate.
 
-Turn length is therefore not a factor, and stalls are spread across all lengths at roughly the same rate. Combined with
-the DSH control, the onset, and the model specificity, the description of the defect is now: roughly 2 to 3% of DeepSeek
-turns end before the work is done, at any turn length, in any session shape, with no distinguishing response feature.
+The recorded roughly 2 to 3% frequencies concern acknowledgement labels, not validated premature stops. The turn-length
+hypothesis remains inconclusive and re-testable; combining it with the retracted DSH control, onset and model
+attribution does not establish a cause or failure incidence.
 
 ### A separate real finding: DeepSeek turns are much longer per turn
 
@@ -709,27 +728,27 @@ The one thing the item stream does confirm, which was previously argued from sou
 never a special kind. Responses end in `function_call`, `message`, or very rarely `reasoning`, and every completed turn
 in `thread_items` ends on an agent message. The terminal kind carries no information, now measured rather than inferred.
 
-### The `phase` field looked like a separator and is not one
+### Historical `phase` comparison — detection performance unvalidated
 
 `agentMessage` items carry a `phase` field (`commentary` or `final_answer`) that had not been tested. For the DeepSeek
 tiers it looked decisive: every one of the 236 stalled agent messages lacks a phase, against 92.2% of the 10,530
 non-stalled ones. Fisher p = 1.3e-08, and the odds ratio is unbounded in this sample.
 
-It is a dead end, and the reason is worth recording because it is the same trap that consumed the earlier text-shape
-features. Precision rather than sensitivity is what decides whether a feature can be used:
+The historical precision calculation uses acknowledgement-derived labels. It records agreement with those labels, not
+validated detection performance:
 
 | DeepSeek message | Stalled | Total | Precision |
 | ---------------- | ------- | ----- | --------- |
 | Without a phase  | 236     | 9,944 | **2.37%** |
 | With a phase     | 0       | 822   | 0.00%     |
 
-The base rate is about 2.2%, so a phase-less message is 2.37% likely to be stalled against 2.2% for any message. The
-feature is worthless as a detector even though the association is statistically strong, because 97.6% of phase-less
-messages are ordinary completions. GPT-family messages carry a phase 97.9% of the time, so the field also encodes the
-provider rather than the behavior.
+The historical labelled base rate is about 2.2%, with 2.37% labelled positives among phase-less messages; 97.6% lack the
+positive label. These percentages do not validate which messages stalled or finished. GPT-family messages carry a phase
+97.9% of the time in the recorded sample, a population difference that must be considered in any future validated
+detector comparison.
 
-This is the fourth feature to show a real association and no usable precision, after response shape, item type, and
-token counts. Any future candidate should be reported with precision at the observed base rate, not with p alone.
+The association does not settle detection ability. Any future candidate needs precision against independently validated
+outcomes and their observed base rate, not p alone.
 
 ### The version/date confound cannot be broken with this corpus
 
@@ -741,9 +760,9 @@ The boundary is clean on the model side and absent on the control side:
 | GPT family, full history        | 10/12,975 (0.08%) | 0/171 (0.00%)    | unchanged                   |
 | GPT family, 09-16 to 09-24 only | 0/65 (0.00%)      | 0/171 (0.00%)    | unchanged inside the window |
 
-The third row is the important control: GPT-family threads ran under both versions inside the same calendar window as
-the DeepSeek onset, and neither side shows an acknowledgement. The 0.155 upgrade therefore did not produce this behavior
-for the GPT family, so whatever 0.155 changed, it interacts with the DeepSeek tiers specifically.
+The third row records GPT-family threads under both versions inside the same calendar window, with no acknowledgement on
+either side. This does not establish whether the 0.155 upgrade affected unfinished authorized work for either family.
+The version/date hypothesis remains inconclusive on these labels.
 
 That still does not separate version from date, because for DeepSeek the two move together with only three exceptions:
 
@@ -758,6 +777,10 @@ effect are therefore indistinguishable here, and the corpus cannot supply the mi
 
 ### DSH is the control that rules out the gateway, and it has no onset
 
+**Withdrawn causal conclusion:** the owner identified these DSH sessions as gateway-debugging work, so this is not a
+matched task control. The historical series below is preserved, but it cannot exclude the gateway, upstream or client as
+a cause, and the source observations show both loops use the same no-tool-call termination rule.
+
 DSH runs against the same `:7999` gateway and the same model, so if the 2026-09-19 onset were produced by the gateway or
 the upstream, DSH would show it too. DSH has continuous session coverage across the date: 1,385 sessions from 2026-08-14
 to 2026-09-26, with 47 turns recorded on 09-19 itself.
@@ -769,8 +792,9 @@ Measuring the DSH analogue of a text-only turn — a turn containing no `tool/ca
 | Before 2026-09-19 | 114        | 2,005       | 5.69% |
 | 2026-09-19 onward | 60         | 951         | 6.31% |
 
-Flat. No discontinuity, and the rate is an order of magnitude higher than the Codex endpoint in both windows, which is
-the expected consequence of DSH's loop closing turns differently rather than the two being comparable quantities.
+The recorded bare-turn frequencies show no discontinuity, but they are not matched task-outcome frequencies and are not
+comparable to Codex acknowledgement labels. The inspected loops use the same no-tool-call termination rule; different
+loop logic cannot be inferred from these counts.
 
 The combination is what matters:
 
@@ -780,12 +804,12 @@ The combination is what matters:
 | Codex, GPT family           | steady ~0.2% background across July to September | no onset         | steady        |
 | DSH, same gateway and model | 5.69%                                            | 6.31%            | no onset      |
 
-A gateway-side or upstream-side change would move the DSH series and, if model-specific, would move only its DeepSeek
-portion. It moves neither. A change confined to the Codex client is the remaining explanation consistent with all three
-series, and it is the only one.
+The historical inference that only a Codex-client change could explain these series is withdrawn. Debugging-task
+populations and reply-derived labels do not provide the matched task-completion control needed to exclude gateway,
+upstream or client causes.
 
-This supersedes the round-8 note that the cause "has to be either what the request asks for or what the upstream
-returns". The upstream is now excluded by measurement, leaving the request the Codex client builds.
+Neither this series nor the round-8 alternatives establish a cause. The request the Codex client builds remains a
+candidate for a future validated experiment, alongside other unexcluded causes.
 
 ### The GPT baseline also clarifies what the symptom is not
 
@@ -960,21 +984,21 @@ the reply-frequency population but does not resolve the remaining authorization-
 
 ## Root cause
 
-> **Superseded by the correction above.** This section asserted a false-complete mechanism on the strength of the
-> acknowledgement rate. That rate is now known to be a normal conversational event — 94.7% of the turns it counts
-> completed real work — so no root cause has been established. The section is retained because its mechanical account of
-> how Codex closes a turn is accurate and worth keeping.
+> **Superseded by the metric correction above.** This section asserted a false-complete mechanism from acknowledgement
+> frequency. The recorded 94.7% contained tool actions, which establishes activity but neither task completion nor
+> incompletion. No root cause is established from these labels; the inspected no-tool-call termination rule remains an
+> independent source fact.
 
-Codex closes a turn when a model response contains no tool call. DeepSeek tiers under this route emit an intent line
-without a tool call more often than the OpenAI models Codex was designed against. The two facts were believed to combine
-into a false-complete: the client believes the model chose to stop, when the model intended to continue.
+Codex closes a turn when a model response contains no tool call. The historical interpretation combined that source rule
+with an unvalidated model-frequency claim to infer a false completion. The rule alone does not establish whether the
+model intended to continue or whether authorized work remained.
 
 What remains verified independently of the metric: a response containing no tool call does end the turn, and the
 decision unit is the response rather than the text block. What is not established is that DeepSeek reaches that state
 more often in a way that constitutes a defect.
 
-The claim that this is a client-side continuation-policy difference rather than a gateway defect does hold, and every
-gateway probe returned healthy, fully-formed responses:
+The recorded gateway probes returned healthy, fully-formed responses. These limited successes do not establish a
+client-side cause or exclude a gateway defect:
 
 | Probe                          | Result                                            |
 | ------------------------------ | ------------------------------------------------- |
@@ -983,36 +1007,42 @@ gateway probe returned healthy, fully-formed responses:
 | Responses, long streaming turn | `response.completed`, 694 text deltas             |
 | Reasoning effort none/high/max | 0 / 5225 / 8912 reasoning tokens, all `completed` |
 
-Reasoning effort behaves exactly as documented and is not implicated.
+The probes recorded different reasoning-token counts at the tested efforts. They do not exclude reasoning effort as a
+factor in the reported premature stops.
 
-## Why a gateway patch was considered, and why it is refuted
+## Why a gateway patch was considered, and why it remains withdrawn
 
 The reasoning was that the gateway already rewrites this route in both directions, so it could supply the continuation
 signal the client does not ask for.
 
-**That reasoning does not survive the backtest.** A gateway continuation requires deciding "work remains", and the only
-input available is the response shape. That shape is identical for a false completion and for every one of the 2,534
-legitimate completions, so a gateway rule would fire on normal answers. Making the decision instead by asking the model
-is inference, and this repository already retired exactly that construction in `be89f4919` ("retire hidden DeepSeek
-continuation inference") on the grounds that invisible extra inference is never permitted.
+**The backtest does not validate that reasoning.** A continuation requires evidence that authorized work remains, and
+the historical 2,534 negative labels do not establish legitimate completions. A no-tool-call final answer can be
+legitimate, so response shape alone cannot be assumed to justify continuation. Asking the model through hidden extra
+inference is independently forbidden: this repository retired that construction in `be89f4919` ("retire hidden DeepSeek
+continuation inference").
 
 Both candidate mechanisms below are therefore withdrawn:
 
-1. ~~Keep-alive / non-terminal framing~~ — cannot distinguish a false completion from a final answer.
-2. ~~Server-side continuation~~ — requires either a detector that scores 1.8% or unconsented hidden inference.
+1. ~~Keep-alive / non-terminal framing~~ — no validated unfinished-work detector was established here.
+2. ~~Server-side continuation~~ — the historical detector's 1.8% acknowledgement-label precision is not task-outcome
+   accuracy, and unconsented hidden inference remains forbidden.
 
-The gateway is not the right lever. Note also that the route already carries scoped custom patching for LithosAI, so a
-patch there would be technically easy and would still be wrong.
+No gateway fix is established by this investigation, and no layer is excluded solely by these backtests. Existing scoped
+LithosAI patching does not justify a continuation change without validated outcomes and the existing authorization
+safeguards.
 
 ## Proposed patch surface — withdrawn
 
-Falsified by the backtest above. Retained only to record what was considered and why it fails.
+Withdrawn, with the historical proposal retained for provenance. The backtest used unvalidated acknowledgement labels;
+any future detector evaluation needs independently validated task outcomes, and this proposal does not authorize hidden
+inference.
 
 A new module (working name `src/provider/lithos-continuation.ts`) would have owned the detector and the injection, gated
 to `deepseek-ai/DeepSeek-V4.1-Flash-ultra`, in the scoped-patch style this route already uses (`src/provider/lithos.ts`,
 `lithos-handlers.ts`, `lithos-rate-limits.ts`, `lithos-streams.ts`).
 
-The detector below is the one that scores 1.8% precision. It is logically unsound, not merely untuned:
+The detector below recorded 1.8% precision against acknowledgement labels. The historical "false positives" comment
+describes those labels, not verified task outcomes:
 
 ```
 stop_is_false_complete(response) :=      # REFUTED — 1.8% precision, 2,534 false positives
@@ -1022,17 +1052,19 @@ stop_is_false_complete(response) :=      # REFUTED — 1.8% precision, 2,534 fal
   AND the turn's continuation budget is unexhausted
 ```
 
-The first two clauses match every legitimate final answer. No value of the remaining clauses repairs that.
+The first two clauses can match a legitimate final answer. Their presence alone does not establish unfinished work;
+whether additional signals can discriminate outcomes remains unvalidated.
 
 ## Acceptance criteria — withdrawn with the patch
 
-These applied to the gateway continuation and are void now that the detector is refuted. Retained for the record: any
-future candidate, gateway-side or client-side, must meet them before it is relied on.
+These are the withdrawn proposal's historical criteria. Its labelled backtest cannot validate them. Any future
+evaluation needs independently labelled finished and unfinished authorized tasks before it can measure false positives;
+the historical criteria and numbers below are retained, not promoted to validated acceptance evidence.
 
 - A DeepSeek Ultra turn whose intent-only response would have ended the turn instead continues and reaches a tool call.
-- **Zero false positives on the 2,534 legitimate completions in the backtest corpus.** This is the criterion the
-  withdrawn detector failed, and it is the one that matters: a continuation that fires on a normal answer is worse than
-  the symptom.
+- **Historical criterion: zero false positives on the 2,534 presumed legitimate completions in the backtest corpus.**
+  Those completion labels are unvalidated, so this corpus cannot establish whether a candidate meets the criterion. A
+  legitimate final answer must remain a valid outcome.
 - Non-Ultra tiers, other providers, and the Chat Completions path are byte-identical to current behavior.
 - `deno task test` passes, with new coverage and a recorded-upstream fixture replayed through `scripts/replay.ts`.
 - A decision entry is appended to `docs/provider-decision-journal.md` (behavior) or `docs/DECISIONS.md` (policy),
@@ -1040,89 +1072,101 @@ future candidate, gateway-side or client-side, must meet them before it is relie
 
 ## Reversal risk and residual gap
 
-Reversal risk, as measured rather than predicted: the withdrawn detector's risk was not hypothetical. At 1.8% precision
-it would have converted 2,534 legitimate completions into extra round trips for every 46 real stops it caught. The
-measured ratio is the reason the patch is withdrawn rather than tuned.
+The historical 1.8% precision, 2,534 negative labels and 46 positive labels do not measure the risk of continuing
+finished tasks or missing unfinished ones. That risk remains unvalidated. The proposal stays withdrawn because no
+task-outcome evidence supports it, and the independent prohibition on hidden inference remains.
 
-Residual gap: the symptom is not fixed by this document, and no fix is currently proposed that satisfies both the
-deterministic rule and the no-false-positive requirement. Five rounds of candidates have been refuted against the logs,
-each time by the same arithmetic: every response-shape feature that matches the failures also matches thousands of
-legitimate completions, because ending on text with no tool call is the normal shape of a finished turn.
+Residual gap: the symptom is not fixed by this document. The five rounds of historical candidate comparisons used
+reply-derived labels, so they do not establish failure-detection accuracy or refute every candidate. Source observations
+still show that legitimate final answers can contain text without a tool call.
 
-What the backtests establish is the constraint an acceptable answer must satisfy: it must not infer "unfinished" from
-the response, because that signal is not present in the response, in the turn record, or in the item types. The two
-directions still open are changing the request the model receives, and referencing state the owner authorized in
-advance. Neither has been prototyped.
+The missing requirement is independently validated evidence of unfinished authorized work. The backtests do not prove
+that such a signal is absent from every response, turn record or item type. The recorded directions of changing the
+request or referencing prior authorized state remain unevaluated here; neither has been prototyped by this
+investigation.
 
 ## Unresolved
 
 The position after thirteen rounds, stated as plainly as the evidence allows:
 
-**Established.** Codex ends a turn when a whole response carries no tool call. Every tier served by this gateway reaches
-that state routinely, and a text-only response is normal rather than exceptional. The owner's report of turns ending
-mid-task is real, and on the cleanest metric available — a continuation instruction after a turn that completed normally
-— the GPT family does it about 1.6× as often as the DeepSeek tiers (0.578% against 0.361%), with the weakest GPT tiers
-worst. That difference is not statistically significant at this sample size, so it should be read as a direction
-supported by the data rather than a confirmed effect.
+**Established independently of reply labels.** The inspected client loops end a turn when the response carries no tool
+call, and the recorded item streams contain ordinary text-only responses. The recorded continuation-message frequency
+after completed predecessors is about 1.6× higher for GPT than DeepSeek (0.578% against 0.361%). As corrected above,
+those frequencies establish no premature-stop rate or model ranking.
 
-**Not established.** Why any turn stops short. No response-shape, item-type, token, duration, wording, `phase`,
-reasoning, effort, turn-length, turn-shape, or prompt-length feature separates a turn that stopped short from one that
-finished, and no cap or limit is hit. If a mechanism exists, it is not visible in this corpus.
+**Not established.** Why reported turns stop short, whether any tested feature detects unfinished authorized work, or
+whether CLI version, reminder guidance, reasoning, effort or another factor affects it. The reply-derived labels cannot
+settle those questions. The recorded lack of explicit cap events is a log observation, not a universal exclusion of
+limits or gateway defects.
 
 **Ordered next steps.**
 
 1. **Locate the `k` continuation corpus.** There are zero bare `k` user messages in `~/.codex` across all 16,267 turns,
    any capitalisation, and zero in the DSH sessions. The owner reports using `k` as a shorter nudge, so it is stored
-   somewhere not yet identified. A `k`-only signal would remove the `ok` ambiguity that inverted the first twelve
-   rounds.
-2. **Filter `interrupted` in every future measurement.** Any metric built on the owner's next message must exclude turns
-   whose status is `interrupted` or `failed`. This is the single highest-value precaution recorded here.
+   somewhere not yet identified. A `k`-only reply would still require independently validated task-completion labels;
+   locating more replies alone would not settle a failure hypothesis.
+2. **Distinguish predecessor status in every future measurement.** A reply after an interrupted or failed turn must not
+   be counted as a completed-turn premature stop. A completed predecessor still needs independent evidence of unfinished
+   authorized work.
 3. **Establish an outcome measure before measuring anything else.** The corpus has no record of what a task required, so
    a turn that stopped short and a turn that correctly yielded are indistinguishable except through the owner's
    judgement. Either the owner marks a set of known-bad turns, or a forward-looking capture records intent before a turn
    and verifies completion after it. Without one of these, further rounds will keep producing strong statistics about
    conversation.
 
-Stated precisely, the following are now _established negative_ results and should not be re-tested:
+The retained observations and hypothesis status follow. Rate-dependent negatives are inconclusive and re-testable with
+independently validated outcomes; none is a do-not-retest instruction. Source facts stand on the recorded inspection,
+with their historical scope:
 
-- No response-shape, item-type, token, duration, or wording feature separates a stall from a legitimate completion.
-- Both client loops terminate on the same rule; DSH is not more tolerant of mid-turn text.
-- Fragmented tool calls are merged identically by DSH and by this gateway.
-- Every completed turn ends on an assistant message, so the terminal item kind carries no information.
-- The existing server-side continuation reminder is live, correctly scoped, and does not reduce the rate.
-- Reasoning-item presence is not implicated: within DeepSeek the contrast is 1.88% versus 1.27%, p = 0.28.
+- **Inconclusive:** whether response shape, item type, tokens, duration or wording separates unfinished authorized work
+  from a legitimate completion. The historical labels did not validate either outcome.
+- **Source observation:** both inspected client loops terminate on the same no-tool-call rule and tolerate text before
+  tool calls. This does not establish equal task-completion behavior.
+- **Source observation:** the inspected DSH and gateway paths accumulate fragmented tool calls by index. This does not
+  exclude all gateway or transport defects.
+- **Corpus observation:** every completed turn in the recorded sample ends on an assistant message. Its task-outcome
+  detection value is unvalidated.
+- **Source and deployment observation:** the continuation reminder existed with the recorded tool-bearing scope.
+  **Inconclusive and re-testable:** whether it reduces premature stops; acknowledgement frequencies cannot decide
+  efficacy.
+- **Inconclusive and re-testable:** reasoning-item presence. The recorded acknowledgement-label contrast is 1.88% versus
+  1.27%, p = 0.28, not a causal exclusion.
 - ~~The gateway and the upstream are not implicated: DSH, on the same gateway and model, shows 5.69% before 2026-09-19
   and 6.31% after.~~ **Withdrawn.** The owner confirmed the DSH sessions in question were gateway-debugging work, so the
   DSH series is not a control and this argument cannot be used. The gateway remains unexcluded by any measurement here.
 - ~~The symptom has an onset of 2026-09-19.~~ **Withdrawn.** The discontinuity was in how often the owner typed `ok`,
   not in failure rate, and it was a property of the corpus rather than of the system.
-- The specific gateway commit that matches the onset date and DeepSeek scope, `fbb0383a7`, changes only usage accounting
-  and cannot affect turn termination. The other commits in that window are usage, admin layout, and docs.
-- **The CLI version is not implicated**: on the same 0.155.1, `gpt-6-astra` is 0/88 and `gpt-5.6-luna` is 0/24 while
-  `deepseek-flash` is 41/2,362, and the family ordering reverses between 0.154.0 and 0.155.1.
-- **`thread_turns.status` must be used to filter**. `interrupted` marks an accidental owner-side stop (stray ESC or the
-  stop button) and is heavily concentrated in the GPT family: 1,354 GPT turns against 79 DeepSeek. Any metric built on
-  the owner's next message must exclude both `interrupted` and `failed` predecessors, or it will attribute the owner's
-  own mis-clicks to the model.
-- The `phase` field on `agentMessage` is not a usable detector: 236/236 stalled messages lack a phase, but so do 9,708
-  of 10,530 normal ones, giving 2.37% precision against a 2.2% base rate.
-- DeepSeek `reasoning` items carry no readable content (empty `content`, summary only) and are identical before and
-  after the onset, so they carry no signal for this question.
-- A text-only upstream response is not the defect. Reconstructed from the item stream, DeepSeek produces them at 10.75%
-  and the GPT family at 9.80%, so the rate is a normal property of both. Efficient is not the same as sufficient.
-- `reasoning_effort` is not the cause: in the post-09-19 window, DeepSeek at `effort=max` is 47/2,643 while the GPT
-  family at the same `effort=max` is 0/71.
-- Turn shape is not the cause. Reconstructing each turn as a sequence of responses that either carry a tool call or do
-  not, stalls appear in `CM`, `CCM`, `CCCM` and `M` shapes at comparable rates, and turns whose every response lacks a
-  tool call number 32 of 452. There is no shape that marks a stall.
-- No cap, limit, or truncation is hit. Searching every log line for cap, limit, exceed, maximum, token, budget, or
-  truncation finds only the standard span and HTTP lines; there is no cap-exceeded event on these turns.
-- Stalled turns do not do more work than normal ones. On a corrected count of upstream calls, stalled DeepSeek turns
-  make 4 (median) against 5 for normal DeepSeek turns.
-- Turn length does not predict a stop: DeepSeek turns at 4 upstream calls or fewer stop at 2.98% against 2.44% for
-  longer ones, p = 0.78. The apparent boundary in the raw table was a sparse cell, not an effect.
-- Prompt length is inconclusive rather than refuted: DeepSeek threads with a longest prompt over 500 characters show
-  24.00% against 11.59%, but on 25 and 138 threads, p = 0.74. First-prompt length shows no difference at all.
+- **Source observation:** the inspected `fbb0383a7` diff touches usage accounting, and the other inspected commits in
+  that window touch usage, admin layout and docs. This does not exclude all gateway causes.
+- **Inconclusive and re-testable:** CLI version. On 0.155.1 the recorded acknowledgement labels are `gpt-6-astra` 0/88,
+  `gpt-5.6-luna` 0/24 and `deepseek-flash` 41/2,362; ordering reverses between 0.154.0 and 0.155.1. Neither this
+  ordering nor a non-significant comparison excludes a version effect on unfinished work.
+- **Status observation:** the corpus records 1,354 interrupted GPT turns against 79 DeepSeek, including the owner's
+  reported accidental stops. Distinguish `interrupted` and `failed` from completed predecessors; status alone does not
+  establish interruption cause or task completion.
+- **Inconclusive and re-testable:** `phase` as a detector. The historical labels give 236/236 positives without a phase
+  and 9,708 of 10,530 negatives without one, with 2.37% label precision against a 2.2% labelled base rate. Task-outcome
+  detection performance is unvalidated.
+- **Corpus observation:** the inspected DeepSeek `reasoning` items have empty readable `content` and summary only,
+  unchanged across the reported boundary. This does not exclude reasoning as a factor in premature stops.
+- **Corpus observation:** reconstructed text-only response frequencies are 10.75% for DeepSeek and 9.80% for GPT. Their
+  presence is ordinary in this sample; whether a specific text-only response leaves authorized work unfinished is
+  unvalidated.
+- **Inconclusive and re-testable:** `reasoning_effort`. In the post-09-19 window the recorded acknowledgement-label
+  counts at `effort=max` are DeepSeek 47/2,643 and GPT 0/71. They do not establish or exclude a cause.
+- **Inconclusive and re-testable:** turn shape. Historical positives appear in `CM`, `CCM`, `CCCM` and `M`, with 32 of
+  452 turns containing no tool-bearing response. Those labels do not validate which shapes mark unfinished authorized
+  work.
+- **Log observation:** the recorded search for cap, limit, exceed, maximum, token, budget or truncation found standard
+  span and HTTP lines, with no explicit cap-exceeded event in those turns. It does not establish that no limit could
+  contribute to the symptom.
+- **Inconclusive and re-testable:** work count. The recorded acknowledgement-labelled DeepSeek groups have median
+  upstream-call counts of 4 versus 5; those groups are not validated stalled and completed tasks.
+- **Inconclusive and re-testable:** turn length. At 4 upstream calls or fewer the acknowledgement-labelled frequency is
+  2.98%, versus 2.44% for longer turns, p = 0.78. This does not exclude an effect on actual premature stops.
+- **Inconclusive and re-testable:** prompt length. The recorded over-500-character comparison is 24.00% versus 11.59% on
+  25 and 138 threads, p = 0.74, with no observed first-prompt difference. Task-outcome labels remain unvalidated
+  regardless of sample size.
 
 ### The contam in `ok`, recorded so it is not reintroduced
 
@@ -1131,17 +1175,17 @@ nudges a turn to continue. DeepSeek's turns end on a message that announces the 
 nudge; the GPT family ends on flatter text that invites `ok` as an acknowledgement. Counting `ok` therefore measured how
 each family ends a turn rather than how often it stops short, and it produced a 22× contrast in the wrong direction.
 
-Enumerating every short user message in the corpus gives the better signal: **`proceed`**, 226 occurrences against 62
-for `ok`, and unlike `ok` it is unambiguous. The owner also confirmed that a `proceed` often follows an **accidental**
-interruption from a stray ESC or a mis-clicked stop button, which is why `thread_turns.status` must be used to filter.
+The recorded enumeration found **`proceed`**, 226 occurrences against 62 for `ok`. It can authorize a new step or
+recover from the owner's reported accidental interruption, so it remains a continuation-message signal rather than a
+validated unfinished-work outcome. Predecessor status and task-completion evidence are both required.
 
 And the following methodological traps, each of which produced a wrong answer in these rounds:
 
 - A 22× model contrast appeared from comparing interactive DeepSeek against a control dominated by
   `originator = '(none)'` headless threads. Unmatched controls fabricate model effects when the families sit in
   different client populations.
-- Retracting that comparison by matching on `originator` over-corrected: it shrank the control to 246 turns and hid a
-  real effect behind p = 0.43. Restricting on "has any user message" is the right cut.
+- Matching on `originator` shrank the historical control to 246 turns, with p = 0.43. Neither that comparison nor
+  restriction to "has any user message" validates task completion or establishes a real failure effect.
 - Pooling models mixes populations with different base rates and produces trends that do not exist.
 
 Method note: the four parsing errors made across these rounds are recorded under "Reproduction artifacts", because each
