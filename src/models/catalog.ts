@@ -429,17 +429,11 @@ export const handlePublicModelCatalog = async (): Promise<Response> => {
   const catalogKv = await getKv();
   const catalogWhitelist = catalogKv ? await loadCodexModelsWhitelist(catalogKv) : null;
   const selected = filterCatalogEntriesByProviderSelection(catalog.models, selection);
-  // OpenRouter's entries follow the upstream's own catalogue, which refreshes
-  // on its TTL; the operator whitelist curates every other entry as before.
-  const openRouterEntries = isProviderEnabled("openrouter", selection)
-    ? selected.filter((entry) => entry.providers.some((provider) => provider.id === "openrouter"))
-    : [];
-  const openRouterIds = new Set(openRouterEntries.map((entry) => entry.id));
-  const curated = filterWhitelistedModelMap(
-    selected.filter((entry) => !openRouterIds.has(entry.id)),
-    catalogWhitelist
-  );
-  const data = [...curated, ...openRouterEntries].sort((left, right) => left.id.localeCompare(right.id));
+  // The public page advertises the operator's enabled set and nothing else, so
+  // the whitelist curates every row here, OpenRouter's dynamic entries included.
+  // An absent or empty whitelist stays no filter at all, exactly as it does on
+  // the Codex-native catalog.
+  const data = filterWhitelistedModelMap(selected, catalogWhitelist).sort((left, right) => left.id.localeCompare(right.id));
   return json(200, {
     object: "uos.model_catalog",
     data,

@@ -119,6 +119,18 @@ Reversal risk: widening the drop to every reasoning item without `encrypted_cont
 client can legitimately replay; matching ids by a loose `resp_` substring would rewrite genuine ids, so only the
 producer's exact `<kind>_...` shapes are recognized.
 
+## Public models use the enabled set for every provider - 2026-10-02
+
+Apply the operator whitelist to every `/uos/models/catalog` row, including OpenRouter.
+
+`/models` renders this feed. An empty or absent whitelist keeps the existing no-filter behavior.
+
+Admin discovery, `/v1/models`, and `/uos/models/capabilities` retain their existing contracts.
+
+Reason: disabled OpenRouter rows were appended after filtering and appeared on the public page.
+
+Reversal risk: bypassing the filter again makes disabled models visible.
+
 ## The Codex-native catalog honors the operator whitelist for every assembled provider - 2026-10-02
 
 On 2026-10-02 the user's intent is that the enabled-model policy, the operator's model whitelist, controls what a Codex
