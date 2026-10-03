@@ -158,7 +158,7 @@ export const fetchOpenRouterSystemOne = async (input: {
   const dispatch = input.hooks?.beforeDispatch ? await input.hooks.beforeDispatch() : undefined;
   if (signal.aborted) {
     await dispatch?.cancelBeforeTransport();
-    throw new DOMException("Aborted", "AbortError");
+    throw new OpenRouterError("openrouter_upstream_unreachable", 502);
   }
   dispatch?.markTransportStarted();
   input.hooks?.onDispatch?.();
