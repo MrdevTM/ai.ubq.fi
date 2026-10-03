@@ -6727,6 +6727,7 @@ const renderErrorsRetention = (payload) => {
   const retention = payload?.retention;
   if (
     retention?.state === "ok" &&
+    retention.accounting_complete === true && !retention.accounting_error &&
     [retention.stored_bytes, retention.reserved_bytes, retention.budget_bytes, retention.records].every((value) =>
       typeof value === "number" && Number.isFinite(value) && value >= 0
     ) && Number.isFinite(retention.stored_bytes + retention.reserved_bytes)
