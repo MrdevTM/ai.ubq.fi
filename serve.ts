@@ -5,8 +5,9 @@ import { getKv } from "./src/kv.ts";
 import { migrateLegacyCodexResetOptOut } from "./src/codex/reset-settings.ts";
 import { configureAdminAuthForListener, configureAdminAuthPeerForRequest, parseServeRuntimeOptions } from "./src/auth/local-admin.ts";
 import { ensureLocalDevelopmentApiKey } from "./src/auth/local-development-key.ts";
-import { closeOptionalPromptCacheAnalytics, optionalPromptCacheAnalyticsSnapshot } from "./src/cache/prompt-analytics.ts";
+import { closeOptionalPromptCacheAnalytics, optionalPromptCacheAnalyticsSnapshot, prunePromptCacheAnalytics } from "./src/cache/prompt-analytics.ts";
 import { createServeHandler } from "./src/handler/serve-handler.ts";
+import { reconcileDuePaidFallbacksV3 } from "./src/paid-fallback/ledger-backfill.ts";
 
 /**
  * Bounded optional-telemetry shutdown for both launchers.
@@ -56,8 +57,66 @@ export const shutdownOptionalTelemetry = async (): Promise<void> => {
   }
 };
 
+const MAC_BILLING_MAINTENANCE_INTERVAL_MS = 60_000;
+const MAC_ANALYTICS_PRUNE_INTERVAL_MS = 60 * 60_000;
+
 /**
- * No scheduled work runs in this process. Everything the deploy crons used to do
+ * The Mac has its own KV database, so it cannot rely on the VPS scheduler or
+ * on event-driven maintenance when the database is otherwise idle. This is
+ * opt-in from `scripts/serve-mac.ts`; the VPS launcher never calls it.
+ */
+export const startMacMaintenance = (kv: Deno.Kv): (() => Promise<void>) => {
+  let stopped = false;
+  let reconciliation: Promise<void> | null = null;
+  let pruning: Promise<void> | null = null;
+  let stopPromise: Promise<void> | null = null;
+
+  const reconcile = (): void => {
+    if (stopped || reconciliation) return;
+    reconciliation = (async () => {
+      try {
+        await reconcileDuePaidFallbacksV3(Date.now(), kv);
+      } catch (error) {
+        console.error("[ai.ubq.fi] Mac paid fallback reconciliation failed:", error instanceof Error ? error.message : String(error));
+      } finally {
+        reconciliation = null;
+      }
+    })();
+  };
+
+  const prune = (): void => {
+    if (stopped || pruning) return;
+    pruning = (async () => {
+      try {
+        const result = await prunePromptCacheAnalytics({ kv });
+        if (result.status === "unavailable") {
+          console.warn("[ai.ubq.fi] prompt_cache_analytics", JSON.stringify({ status: "prune_unavailable" }));
+        }
+      } catch {
+        console.warn("[ai.ubq.fi] prompt_cache_analytics", JSON.stringify({ status: "prune_failed" }));
+      } finally {
+        pruning = null;
+      }
+    })();
+  };
+
+  reconcile();
+  prune();
+  const reconciliationTimer = setInterval(reconcile, MAC_BILLING_MAINTENANCE_INTERVAL_MS);
+  const pruningTimer = setInterval(prune, MAC_ANALYTICS_PRUNE_INTERVAL_MS);
+
+  return (): Promise<void> => {
+    if (stopPromise) return stopPromise;
+    stopped = true;
+    clearInterval(reconciliationTimer);
+    clearInterval(pruningTimer);
+    stopPromise = Promise.all([reconciliation ?? Promise.resolve(), pruning ?? Promise.resolve()]).then(() => {});
+    return stopPromise;
+  };
+};
+
+/**
+ * No scheduled work starts in this shared handler. Everything the deploy crons used to do
  * now happens because an event happened, and the mapping is deliberate:
  *
  * - "reconcile pending metered billing" (every minute) -> a paid-fallback request
@@ -71,11 +130,12 @@ export const shutdownOptionalTelemetry = async (): Promise<void> => {
  * - "prune prompt cache analytics" (hourly) -> the first analytics write in a new
  *   bucket (`src/prompt_cache_analytics.ts`).
  *
- * Consequences are intentional: with no traffic and no operator, nothing runs.
+ * Consequences are intentional for the shared handler: with no traffic and no operator, nothing runs.
  * Durable state (pending reconciliation markers, capacity buckets, retained
  * analytics) waits for the next event instead of a timer, and `deno.json` no
  * longer enables the `cron` unstable feature, so `Deno.cron` does not exist here.
- * See `docs/event-driven-maintenance.md`.
+ * The Mac launcher is the one explicit exception: it starts the local billing
+ * and analytics maintenance above against its own KV.
  */
 const serveHandler = createServeHandler();
 
