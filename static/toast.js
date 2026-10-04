@@ -105,7 +105,7 @@ const showToast = (options = {}) => {
     globalThis.setTimeout(() => toastEl.dataset.visible = "", 0);
   }
 
-    let timerId = 0;
+  let timerId = 0;
   let deadline = 0;
   let remainingTime = 0;
   const clearTimer = () => {

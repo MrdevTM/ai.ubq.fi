@@ -35,7 +35,9 @@ class ToastElement {
   querySelectorAll(selector: string): ToastElement[] {
     if (++this._queries > 100) throw new Error("Toast eviction did not converge");
     assert.ok(selector === "[data-toast]" || selector === "[data-toast]:not([data-exiting])");
-    return this.children.filter((child) => "toast" in child.dataset && (selector === "[data-toast]" || !("exiting" in child.dataset)));
+    return this.children.filter((child) =>
+      "toast" in child.dataset && (selector === "[data-toast]" || !("exiting" in child.dataset))
+    );
   }
 
   querySelector(selector: string): ToastElement | null {
@@ -66,9 +68,13 @@ Deno.test("a synchronous toast burst keeps three active notifications while olde
     },
   };
 
-  const originals = new Map(Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const originals = new Map(
+    Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
+  );
   try {
-    for (const [name, value] of Object.entries(replacements)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    for (const [name, value] of Object.entries(replacements)) {
+      Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    }
     // The query budget makes a non-converging synchronous loop fail instead of hanging the test runner.
     for (let i = 1; i <= 6; i++) toast.info(String(i), { duration: 0 });
 
@@ -77,11 +83,11 @@ Deno.test("a synchronous toast burst keeps three active notifications while olde
     assert.deepEqual(
       host.querySelectorAll("[data-toast]:not([data-exiting])").map((element) => element.children[0].textContent),
       ["4", "5", "6"],
-      "the oldest active notifications are evicted first"
+      "the oldest active notifications are evicted first",
     );
     assert.deepEqual(
       timers.map((timer) => timer.delay),
-      [160, 160, 160]
+      [160, 160, 160],
     );
     for (const timer of timers) timer.callback();
     assert.equal(host.children.length, 3, "exit timers remove the evicted nodes");
@@ -128,10 +134,14 @@ Deno.test("loading toasts persist beyond normal durations and remain dismissible
     }
     now = until;
   };
-  const originals = new Map(Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const originals = new Map(
+    Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
+  );
   const originalNow = Date.now;
   try {
-    for (const [name, value] of Object.entries(replacements)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    for (const [name, value] of Object.entries(replacements)) {
+      Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    }
     Date.now = () => now;
     const loading = toast.loading("Sending", { onDismiss: () => dismissals++ });
     const host = body.children[0];
@@ -223,10 +233,14 @@ Deno.test("hovering pauses the notification without consuming its remaining life
     }
     now = until;
   };
-  const originals = new Map(Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const originals = new Map(
+    Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
+  );
   const originalNow = Date.now;
   try {
-    for (const [name, value] of Object.entries(replacements)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    for (const [name, value] of Object.entries(replacements)) {
+      Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    }
     Date.now = () => now;
 
     toast.success("Hover test", { duration: 3500, onDismiss: () => dismissals++ });
