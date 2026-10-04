@@ -105,8 +105,9 @@ const showToast = (options = {}) => {
     globalThis.setTimeout(() => toastEl.dataset.visible = "", 0);
   }
 
-  let timerId = 0;
+    let timerId = 0;
   let deadline = 0;
+  let remainingTime = 0;
   const clearTimer = () => {
     if (timerId) {
       globalThis.clearTimeout(timerId);
@@ -115,16 +116,18 @@ const showToast = (options = {}) => {
   };
   const startTimer = (remaining) => {
     clearTimer();
+    remainingTime = remaining;
     deadline = Date.now() + remaining;
     timerId = globalThis.setTimeout(() => dismissToastEl(toastEl, options.onDismiss), remaining);
   };
   toastEl.addEventListener("mouseenter", () => {
     if (!Number.isFinite(duration) || duration <= 0) return;
+    remainingTime = Math.max(0, deadline - Date.now());
     clearTimer();
   });
   toastEl.addEventListener("mouseleave", () => {
     if (!Number.isFinite(duration) || duration <= 0) return;
-    startTimer(Math.max(0, deadline - Date.now()));
+    startTimer(remainingTime);
   });
   if (Number.isFinite(duration) && duration > 0) startTimer(duration);
 

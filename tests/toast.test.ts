@@ -189,3 +189,76 @@ Deno.test("loading toasts persist beyond normal durations and remain dismissible
     }
   }
 });
+
+Deno.test("hovering pauses the notification without consuming its remaining lifetime", () => {
+  const body = new ToastElement(true);
+  const timers = new Map<number, { callback: () => void; deadline: number }>();
+  let now = 0;
+  let nextTimerId = 0;
+  let dismissals = 0;
+  const replacements = {
+    document: {
+      body,
+      createElement: () => new ToastElement(),
+      createElementNS: () => new ToastElement(),
+    },
+    requestAnimationFrame: (callback: () => void) => {
+      callback();
+    },
+    setTimeout: (callback: () => void, delay: number) => {
+      const id = ++nextTimerId;
+      timers.set(id, { callback, deadline: now + delay });
+      return id;
+    },
+    clearTimeout: (id: number) => timers.delete(id),
+  };
+  const advance = (milliseconds: number) => {
+    const until = now + milliseconds;
+    while (timers.size > 0) {
+      const next = [...timers].sort((a, b) => a[1].deadline - b[1].deadline)[0];
+      if (next[1].deadline > until) break;
+      now = next[1].deadline;
+      timers.delete(next[0]);
+      next[1].callback();
+    }
+    now = until;
+  };
+  const originals = new Map(Object.keys(replacements).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const originalNow = Date.now;
+  try {
+    for (const [name, value] of Object.entries(replacements)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+    Date.now = () => now;
+
+    toast.success("Hover test", { duration: 3500, onDismiss: () => dismissals++ });
+    const host = body.children[0];
+    const toastEl = host.children[0];
+
+    advance(1000);
+    assert.equal(toastEl.dataset.exiting, undefined);
+
+    toastEl.listeners.get("mouseenter")?.();
+
+    advance(5000);
+    assert.equal(toastEl.dataset.exiting, undefined, "toast survives while hovered even after original deadline");
+    assert.equal(dismissals, 0);
+
+    toastEl.listeners.get("mouseleave")?.();
+
+    advance(2499);
+    assert.equal(toastEl.dataset.exiting, undefined, "toast is still active with 1ms remaining");
+    assert.equal(dismissals, 0);
+
+    advance(1);
+    assert.equal(toastEl.dataset.exiting, "", "toast begins exit after full remaining duration elapses");
+    advance(160);
+    assert.equal(toastEl.isConnected, false);
+    assert.equal(dismissals, 1);
+  } finally {
+    body.children[0]?.remove();
+    Date.now = originalNow;
+    for (const [name, original] of originals) {
+      if (original) Object.defineProperty(globalThis, name, original);
+      else Reflect.deleteProperty(globalThis, name);
+    }
+  }
+});
